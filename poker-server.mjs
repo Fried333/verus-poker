@@ -10,7 +10,7 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { readFileSync, existsSync } from 'fs';
 import { join, extname } from 'path';
-import { playerInit, dealerShuffle, cashierShuffle, verifyGame } from './protocol.mjs';
+import { playerInit, dealerShuffle, cashierShuffle, decodeCard, verifyGame } from './protocol.mjs';
 import { createEngine } from './poker-engine.mjs';
 import { evaluateHand, cardToString } from './hand-eval.mjs';
 import { FOLD, CHECK, CALL, RAISE, ALL_IN, SHOWDOWN, SETTLED } from './game.mjs';
@@ -68,15 +68,18 @@ function broadcastState() {
     // Find this client in the engine's player list
     const ep = g.players.find(p => p.id === c.id);
     if (ep) {
+      // Only reveal cards at showdown if 2+ players remain (not fold-win)
+      const nonFolded = g.players.filter(p => !p.folded).length;
+      const showCards = (g.phase === 'showdown' || g.phase === 'settled') && nonFolded > 1;
       seats.push({
         id: ep.id, name: ep.id, seat: c.seat,
         playing: ep.folded ? 0 : 1, empty: false,
         chips: Math.round(ep.chips), bet: ep.bet || 0,
         folded: ep.folded, allIn: ep.allIn,
-        holeCards: (g.phase === 'showdown' || g.phase === 'settled')
+        holeCards: showCards
           ? ep.holeCards.map(c => typeof c === 'number' ? cardToString(c) : c)
           : (ep.holeCards.length > 0 ? ['??', '??'] : []),
-        holeCardNames: (g.phase === 'showdown' || g.phase === 'settled')
+        holeCardNames: showCards
           ? ep.holeCards.map(c => typeof c === 'number' ? cardToString(c) : c)
           : (ep.holeCards.length > 0 ? ['??', '??'] : [])
       });
@@ -105,8 +108,14 @@ function broadcastState() {
 
   for (const [ws, info] of clients) {
     if (ws.readyState !== 1 || info.seat === undefined) continue;
+    // Personalize: only show this client their own hole cards (others get ??)
+    const personalSeats = seats.map(s => {
+      if (s.empty || s.seat === info.seat) return s;
+      if (g.phase === 'showdown' || g.phase === 'settled') return s; // Reveal all at showdown
+      return { ...s, holeCards: s.holeCards.length > 0 ? ['??','??'] : [], holeCardNames: s.holeCardNames.length > 0 ? ['??','??'] : [] };
+    });
     sendTo(ws, {
-      method: 'seats', seats,
+      method: 'seats', seats: personalSeats,
       dealerSeat: clientDealer,
       sbSeat: clientSB,
       bbSeat: clientBB,
@@ -140,9 +149,12 @@ function createIO() {
       }
       if (event === 'turn') {
         const g = engine.game;
+        const turnClientSeat = mapSeat(data.seat);
+        const turnPlayerId = data.player;
+        console.log('[TURN] engine=' + data.seat + ' client=' + turnClientSeat + ' name=' + turnPlayerId);
         broadcast({
           method: 'betting', action: 'round_betting',
-          playerid: mapSeat(data.seat), pot: data.pot,
+          playerid: turnClientSeat, turnPlayer: turnPlayerId, pot: data.pot,
           toCall: data.toCall, minRaiseTo: data.minRaise,
           turnTimeout: 15, turnStart: Date.now(),
           possibilities: data.validActions.map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined),
@@ -244,15 +256,24 @@ async function runHand() {
   // Set dealer from server-tracked position (persists across hands)
   engine.game.dealerSeat = serverDealerIdx % numPlayers;
 
-  // Deal hole cards
+  // Cryptographic card decode: reverse all blinding layers to get card index
+  function decodeCardAtPosition(playerIdx, position) {
+    const encryptedCard = cashierData.finalDecks[playerIdx][position];
+    const b_ij = cashierData.b[playerIdx][position];
+    const e_i = dealerData.e[playerIdx];
+    const d = dealerData.d;
+    const p_i = playerData[playerIdx].sessionKey;
+    const initialDeck = playerData[playerIdx].initialDeck;
+    return decodeCard(encryptedCard, b_ij, e_i, d, p_i, initialDeck);
+  }
+
+  // Deal hole cards using full cryptographic unblinding
   let cardPos = 0;
   for (let i = 0; i < numPlayers; i++) {
     const cards = [];
     for (let c = 0; c < 2; c++) {
-      const cp = cashierData.sigma_Cashier[cardPos];
-      const dp = dealerData.sigma_Dealer[cp];
-      const pp = playerData[i].permutation[dp];
-      cards.push(pp % 52);
+      const idx = decodeCardAtPosition(i, cardPos);
+      cards.push(idx % 52);
       cardPos++;
     }
     engine.game.players[i].holeCards = cards;
@@ -263,15 +284,23 @@ async function runHand() {
     async initDeck(n) { revealPos = numPlayers * 2; return {}; },
     async revealCard() {
       if (revealPos >= numCards) return revealPos % 52;
-      const cp = cashierData.sigma_Cashier[revealPos];
-      const dp = (cp !== undefined) ? dealerData.sigma_Dealer[cp] : revealPos;
-      const pp = (dp !== undefined) ? playerData[0].permutation[dp] : revealPos;
+      // Community cards: use player 0's deck (all players share same community cards)
+      const idx = decodeCardAtPosition(0, revealPos);
       revealPos++;
-      return (pp !== undefined ? pp : revealPos) % 52;
+      return idx % 52;
     }
   };
 
   await engine.playHand(crypto);
+
+  // Post-hand verification (Algorithm 4) — replay all shuffle stages
+  const verification = verifyGame(playerData, dealerData, cashierData, numCards);
+  if (verification.valid) {
+    console.log('[VERIFY] Hand ' + handCount + ' VERIFIED — all shuffle stages match');
+  } else {
+    console.log('[VERIFY] Hand ' + handCount + ' FAILED: ' + verification.errors.join(', '));
+  }
+  broadcast({ method: 'verification', hand: handCount, valid: verification.valid, errors: verification.errors });
 
   // Update client chips
   for (const p of engine.game.players) {
@@ -318,7 +347,10 @@ function handleMessage(ws, raw) {
       const seated = [...clients.values()].filter(c => c.seat !== undefined);
       if (seated.length >= MAX_PLAYERS) return;
       if (seated.find(c => c.id === id)) return;
-      const seat = seated.length;
+      // Find first unused seat number
+      const usedSeats = new Set(seated.map(c => c.seat));
+      let seat = 0;
+      while (usedSeats.has(seat)) seat++;
       const waitForNext = handInProgress;
       clients.set(ws, { id, seat, chips: 200, waitingForNext: waitForNext });
       // Pangea protocol: send backend_status, table_info, info
@@ -359,13 +391,20 @@ function handleMessage(ws, raw) {
     case 'reload': {
       if (!info || info.seat === undefined) return;
       if ((info.chips || 0) > 0) { sendTo(ws, { method: 'error', error: 'You still have chips' }); return; }
-      if (handInProgress) { sendTo(ws, { method: 'error', error: 'Wait for current hand to finish' }); return; }
       info.chips = 200;
-      info.sittingOut = false;
+      info.sittingOut = true;  // Stay sitting out until they click Sit In
       sendTo(ws, { method: 'reloaded', chips: 200 });
-      console.log('[RELOAD] ' + info.id + ' reloaded to 200 chips');
+      console.log('[RELOAD] ' + info.id + ' reloaded to 200 chips (waiting for sit-in)');
       broadcastState();
-      // Check if we can start a hand now
+      break;
+    }
+    case 'sitin': {
+      if (!info || info.seat === undefined) return;
+      if ((info.chips || 0) <= 0) { sendTo(ws, { method: 'error', error: 'Reload first' }); return; }
+      info.sittingOut = false;
+      sendTo(ws, { method: 'satin' });
+      console.log('[SIT IN] ' + info.id + ' is back in');
+      broadcastState();
       const active = [...clients.values()].filter(c => c.seat !== undefined && (c.chips || 0) > 0 && !c.sittingOut);
       if (active.length >= 2 && !handInProgress) {
         if (startTimer) clearTimeout(startTimer);
@@ -388,11 +427,14 @@ const server = createServer((req, res) => {
     const numPlayers = Math.min(9, Math.max(2, parseInt(params.get('players')) || 4));
     const allNames = ['Alice','Bob','Charlie','Dave','Eve','Frank','Grace','Heidi','Ivan'];
     const names = allNames.slice(0, numPlayers);
-    const cols = numPlayers <= 2 ? 2 : numPlayers <= 4 ? 2 : 3;
-    const rows = Math.ceil(numPlayers / cols);
-    res.writeHead(200, { 'Content-Type': 'text/html' });
+    const perPage = 2;
+    const cols = 1;
+    const rows = perPage;
+    res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store', 'Pragma': 'no-cache' });
     res.end(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Verus Poker — ${numPlayers} Players</title>
+<link rel="preload" href="/cards.bebfd660.svg" as="image">
+<link rel="preload" href="/bg-red.44d92640.svg" as="image">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#111}
@@ -400,7 +442,7 @@ body{background:#111}
 .hdr h1{color:#ffd700;font-size:1em}
 .hdr a{color:#4caf50;font-size:0.8em;text-decoration:none;padding:2px 8px;border:1px solid #4caf50;border-radius:3px}
 .hdr a:hover{background:#4caf50;color:#000}
-.g{display:grid;grid-template-columns:repeat(${cols},1fr);grid-template-rows:repeat(${rows},1fr);gap:2px;padding:2px;height:calc(100vh - 30px)}
+.g{display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:calc((100vh - 30px) / ${Math.ceil(numPlayers / 2)});gap:2px;padding:2px;height:calc(100vh - 30px);overflow:hidden}
 .f{position:relative;border:1px solid #333;border-radius:3px;overflow:hidden}
 .f .l{position:absolute;top:2px;left:5px;z-index:10;background:rgba(0,0,0,0.8);color:#4caf50;padding:1px 6px;border-radius:2px;font-size:0.7em;font-weight:bold;font-family:system-ui}
 .f iframe{width:100%;height:100%;border:none}
@@ -413,11 +455,10 @@ body{background:#111}
 <script>
 const names=${JSON.stringify(names)};
 const grid=document.getElementById('grid');
-const delay = names.length > 6 ? 800 : names.length > 3 ? 1200 : 2000;
+const delay=names.length>6?800:names.length>3?1200:2000;
 names.forEach((n,i)=>{
   setTimeout(()=>{
-    const f=document.createElement('div');
-    f.className='f';
+    const f=document.createElement('div');f.className='f';
     f.innerHTML='<div class="l">'+n+'</div><iframe src="/play?name='+n+'"></iframe>';
     grid.appendChild(f);
   },i*delay);
@@ -428,15 +469,16 @@ names.forEach((n,i)=>{
 
   // Player page — serve our vanilla poker client
   if (url === '/play') {
+    const noCacheHeaders = { 'Content-Type': 'text/html', 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' };
     const clientPath = join(import.meta.url.replace('file://', '').replace('/poker-server.mjs', ''), 'public', 'poker.html');
     if (existsSync(clientPath)) {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.writeHead(200, noCacheHeaders);
       res.end(readFileSync(clientPath));
     } else {
       // Fallback: try relative to cwd
       const fallback = join(process.cwd(), 'public', 'poker.html');
       if (existsSync(fallback)) {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.writeHead(200, noCacheHeaders);
         res.end(readFileSync(fallback));
       } else {
         res.writeHead(404);
@@ -453,7 +495,12 @@ names.forEach((n,i)=>{
 
   if (filePath) {
     const ext = extname(filePath);
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    const headers = { 'Content-Type': MIME[ext] || 'application/octet-stream' };
+    // Cache static assets (SVGs, PNGs, fonts, audio) for 1 hour
+    if (['.svg','.png','.jpg','.ttf','.woff2','.mp3'].includes(ext)) {
+      headers['Cache-Control'] = 'public, max-age=3600';
+    }
+    res.writeHead(200, headers);
     res.end(readFileSync(filePath));
   } else {
     res.writeHead(404);
@@ -468,12 +515,20 @@ wss.on('connection', ws => {
   ws.on('close', () => {
     const info = clients.get(ws);
     clients.delete(ws);
-    if ([...clients.values()].filter(c => c.seat !== undefined).length === 0) {
+    const seated = [...clients.values()].filter(c => c.seat !== undefined);
+    if (seated.length === 0) {
       engine = null; handInProgress = false; pendingAction = null;
+      if (startTimer) { clearTimeout(startTimer); startTimer = null; }
+      serverDealerIdx = 0;
+      console.log('[RESET] All players left — game reset');
     }
     if (pendingAction && info && pendingAction.playerId === info.id) {
       pendingAction.resolve({ action: 'fold' });
       pendingAction = null;
+    }
+    // If hand in progress but not enough active players left, abort
+    if (handInProgress && seated.filter(c => (c.chips||0) > 0 && !c.sittingOut).length < 2) {
+      if (pendingAction) { pendingAction.resolve(null); pendingAction = null; }
     }
   });
 });

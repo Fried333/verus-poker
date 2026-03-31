@@ -24,27 +24,36 @@ body {
   height: 100vh;
   overflow: hidden;
   user-select: none;
+  display: flex;
+  flex-direction: column;
 }
 
-/* ══════ TABLE ══════ */
+/* ══════ LAYOUT ══════ */
 #table-area {
-  width: 100%;
-  height: 100vh;
+  flex: 1;
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
+  min-height: 0;
 }
 #felt {
   position: relative;
-  width: 94%;
-  max-width: 800px;
-  aspect-ratio: 2 / 1;
+  width: 96%;
+  max-width: 900px;
+  aspect-ratio: 2.2 / 1;
   background: radial-gradient(ellipse at 50% 50%, var(--felt-light), var(--felt) 60%, var(--felt-dark));
   border: 6px solid var(--wood);
   border-radius: 50%;
   box-shadow: inset 0 0 40px rgba(0,0,0,0.4), 0 4px 20px rgba(0,0,0,0.6);
+}
+#bottom-bar {
+  display: flex;
+  align-items: center;
+  background: #0a1a0a;
+  padding: 4px 10px;
+  margin-top: -8px;
 }
 
 /* ══════ BOARD ══════ */
@@ -61,12 +70,7 @@ body {
   height: 70px;
   border-radius: 5px;
   overflow: hidden;
-  box-shadow: 1px 2px 6px rgba(0,0,0,0.5);
-  background: rgba(255,255,255,0.06);
-  border: 1px dashed rgba(255,255,255,0.15);
-  transition: all 0.3s ease;
-}
-.board-card.dealt {
+  box-shadow: 2px 3px 8px rgba(0,0,0,0.5);
   background: #fff;
   border: 1px solid #ccc;
 }
@@ -79,9 +83,9 @@ body {
   position: absolute;
   top: 50%;
   left: 50%;
-  transform: translate(-50%, 20px);
+  transform: translate(-50%, -85px);
   color: var(--gold);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: bold;
   text-shadow: 0 1px 3px rgba(0,0,0,0.8);
 }
@@ -101,8 +105,10 @@ body {
   text-align: center;
   transform: translate(-50%, -50%);
   transition: all 0.3s ease;
+  z-index: 10;
 }
 .seat-label {
+  position: relative;
   background: rgba(0,0,0,0.7);
   border: 2px solid rgba(255,255,255,0.15);
   border-radius: 6px;
@@ -124,12 +130,26 @@ body {
   font-size: 11px;
   white-space: nowrap;
 }
+.seat-role {
+  position: absolute;
+  top: -10px;
+  left: -10px;
+  font-size: 10px;
+  font-weight: bold;
+  padding: 2px 5px;
+  border-radius: 3px;
+  z-index: 2;
+  line-height: 1.2;
+}
+.role-d { background: #fff; color: #000; }
+.role-sb { background: #aaa; color: #000; }
+.role-bb { background: #ffd700; color: #000; }
 .seat-chips {
   color: #ccc;
   font-size: 11px;
   font-weight: bold;
 }
-.seat.winner .seat-box {
+.seat.winner .seat-label {
   border-color: var(--gold);
   box-shadow: 0 0 20px rgba(255,215,0,0.7), 0 0 40px rgba(255,215,0,0.3);
   animation: winPulse 0.6s ease-in-out 3;
@@ -303,28 +323,22 @@ body {
 
 /* ══════ CONTROLS ══════ */
 #controls {
-  position: absolute;
-  bottom: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: rgba(0,0,0,0.7);
-  padding: 5px 14px;
+  margin-left: auto;
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-end;
   gap: 6px;
-  flex-wrap: wrap;
-  min-height: 36px;
-  border-radius: 8px;
-  backdrop-filter: blur(3px);
-  z-index: 80;
+  flex-wrap: nowrap;
+  padding: 4px;
+  min-width: 200px;
+  text-align: right;
 }
 #controls button {
-  padding: 6px 16px;
-  font-size: 13px;
+  padding: 10px 20px;
+  font-size: 15px;
   font-weight: bold;
   border: none;
-  border-radius: 5px;
+  border-radius: 4px;
   cursor: pointer;
   transition: transform 0.1s, opacity 0.2s;
 }
@@ -336,48 +350,23 @@ body {
 .btn-raise { background: #e65100; color: #fff; }
 .btn-allin { background: #6a1b9a; color: #fff; }
 #raise-input {
-  padding: 5px;
-  width: 60px;
-  border-radius: 4px;
+  padding: 3px;
+  width: 45px;
+  border-radius: 3px;
   border: 1px solid #555;
   background: #222;
   color: #fff;
   text-align: center;
-  font-size: 13px;
+  font-size: 11px;
 }
-.wait-text { color: var(--text-dim); font-size: 12px; }
+.wait-text { color: var(--text-dim); font-size: 14px; }
 
-/* ══════ TURN TIMER ══════ */
-#timer-bar {
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  height: 4px;
-  background: #4caf50;
-  z-index: 50;
-}
-#timer-bar.warn { background: #ff9800; }
-#timer-bar.danger { background: #f44336; }
-#timer-count {
-  position: absolute;
-  top: -18px;
-  right: 8px;
-  font-size: 13px;
-  font-weight: bold;
-  color: #4caf50;
-  font-family: monospace;
-  z-index: 51;
-}
-#timer-count.warn { color: #ff9800; }
-#timer-count.danger { color: #f44336; }
 
 /* ══════ COMMS LOG ══════ */
 #comms {
-  position: absolute;
-  bottom: 4px;
-  left: 4px;
-  width: 220px;
-  height: 60px;
+  width: 280px;
+  min-width: 280px;
+  max-height: 80px;
   overflow-y: auto;
   padding: 3px 6px;
   font-size: 10px;
@@ -406,12 +395,10 @@ body {
     <div id="hand-info"></div>
     <div id="winner-banner"><div class="wb-title"></div><div class="wb-detail"></div></div>
   </div>
-  <div id="controls">
-    <div id="timer-bar" style="width:0"></div>
-    <div id="timer-count"></div>
-    <span class="wait-text">Joining table...</span>
-  </div>
+</div>
+<div id="bottom-bar">
   <div id="comms"></div>
+  <div id="controls"><span class="wait-text">Joining table...</span></div>
 </div>
 
 <script>
@@ -485,6 +472,7 @@ function getPositions(total, mySeat) {
 let ws, seat = -1, myId = '', myCards = [], st = null;
 let winnerSeats = [], winAmount = 0, chipsBefore = {};
 let turnTimer = null, turnDeadline = 0, turnTotal = 0;
+let isBusted = false;
 const name = new URLSearchParams(location.search).get('name') || 'Player';
 
 // ══════════════════════════════════════
@@ -527,18 +515,36 @@ function handle(m) {
       break;
     case 'backend_status': break;
     case 'table_info': break;
-    case 'info': seat = m.playerid; break;
+    case 'info':
+      seat = m.playerid;
+      document.getElementById('controls').innerHTML = '<span class="wait-text">Waiting for players...</span>';
+      break;
     case 'seats':
       if (m.seats) {
+        const prevActions = st ? st.validActions : null;
+        const prevToCall = st ? st.toCall : 0;
+        const prevMinRaise = st ? st.minRaise : 0;
         st = st || {};
         st.players = m.seats;
         if (m.dealerSeat !== undefined) st.dealerSeat = m.dealerSeat;
         if (m.sbSeat !== undefined) st.sbSeat = m.sbSeat;
         if (m.bbSeat !== undefined) st.bbSeat = m.bbSeat;
-        if (m.phase) st.phase = m.phase;
+        if (m.phase) {
+          // Clear board when new hand starts
+          if ((m.phase === 'shuffling' || m.phase === 'preflop') && st.phase !== m.phase) {
+            renderBoard([]);
+          }
+          st.phase = m.phase;
+        }
         if (m.pot !== undefined) st.pot = m.pot;
         if (m.currentTurn !== undefined) st.currentTurn = m.currentTurn;
         if (m.handCount) st.handCount = m.handCount;
+        // Preserve validActions from round_betting — seats update shouldn't clear them
+        if (prevActions && prevActions.length > 0) {
+          st.validActions = prevActions;
+          st.toCall = prevToCall;
+          st.minRaise = prevMinRaise;
+        }
         render();
       }
       break;
@@ -550,12 +556,21 @@ function handle(m) {
     case 'comm_history': (m.log || []).forEach(c => log(c.type, c.msg)); break;
     case 'busted':
       log('system', 'You are out of chips!');
+      myCards = [];
+      isBusted = true;
       document.getElementById('controls').innerHTML =
         '<span class="wait-text" style="color:#ef5350">Out of chips!</span>' +
         '<button class="btn-call" onclick="doReload()" style="margin-left:10px">Reload 200</button>';
       break;
     case 'reloaded':
-      log('system', 'Reloaded to ' + m.chips + ' chips');
+      log('system', 'Reloaded to ' + m.chips + ' chips — click Sit In to play');
+      document.getElementById('controls').innerHTML =
+        '<span class="wait-text">' + m.chips + ' chips</span>' +
+        '<button class="btn-check" onclick="doSitIn()" style="margin-left:10px">Sit In</button>';
+      break;
+    case 'satin':
+      log('system', 'You are back in — next hand');
+      isBusted = false;
       document.getElementById('controls').innerHTML = '<span class="wait-text">Waiting for next hand...</span>';
       break;
     case 'waiting': log('system', 'Waiting for players (' + m.active + '/' + m.needed + ')'); break;
@@ -571,28 +586,22 @@ function startTurnTimer(seconds) {
   stopTurnTimer();
   turnTotal = seconds;
   turnDeadline = Date.now() + seconds * 1000;
-  const bar = document.getElementById('timer-bar');
-  const count = document.getElementById('timer-count');
-  bar.style.width = '100%';
   turnTimer = setInterval(() => {
     const remaining = Math.max(0, turnDeadline - Date.now());
     const secs = Math.ceil(remaining / 1000);
-    const pct = (remaining / (turnTotal * 1000)) * 100;
-    bar.style.width = pct + '%';
-    count.textContent = secs > 0 ? secs + 's' : '';
-    if (pct < 20) { bar.className = 'danger'; count.className = 'danger'; }
-    else if (pct < 40) { bar.className = 'warn'; count.className = 'warn'; }
-    else { bar.className = ''; count.className = ''; }
+    const cd = document.getElementById('felt-countdown');
+    if (cd) {
+      cd.textContent = secs + 's';
+      cd.style.color = secs <= 3 ? '#f44336' : secs <= 5 ? '#ff9800' : '#fff';
+    }
     if (remaining <= 0) stopTurnTimer();
   }, 200);
 }
 
 function stopTurnTimer() {
   if (turnTimer) { clearInterval(turnTimer); turnTimer = null; }
-  document.getElementById('timer-bar').style.width = '0';
-  document.getElementById('timer-bar').className = '';
-  document.getElementById('timer-count').textContent = '';
-  document.getElementById('timer-count').className = '';
+  const cd = document.getElementById('felt-countdown');
+  if (cd) cd.textContent = '';
 }
 
 function pName(seatIdx) {
@@ -611,18 +620,51 @@ function handleBetting(m) {
         st.toCall = m.toCall;
         st.minRaise = m.minRaiseTo;
         st.validActions = (m.possibilities || []).map(p => ({0:'fold',1:'check',2:'call',3:'raise',7:'allin'})[p]).filter(Boolean);
-        if (m.player_funds && st.players) {
-          m.player_funds.forEach((f, i) => { if (st.players[i]) st.players[i].chips = f; });
-        }
       }
-      startTurnTimer(m.turnTimeout || 60);
+      startTurnTimer(m.turnTimeout || 15);
+      // Match by name (reliable) OR seat (fallback) — but not if busted
+      const isMyTurnNow = !isBusted && (m.turnPlayer === name || m.playerid === seat);
+      if (isMyTurnNow) {
+        const va = st ? st.validActions : [];
+        const el = document.getElementById('controls');
+        const me = st && st.players ? st.players.find(p => p.seat === seat) : null;
+        const myChips = me ? me.chips : 200;
+        const callAmt = Math.min(st ? st.toCall||0 : 0, myChips);
+        const minR = st ? st.minRaise || 2 : 2;
+        const maxR = Math.max(minR, myChips - (st ? st.toCall||0 : 0));
+        let html = '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">';
+        // Raise slider row (above buttons)
+        if (va.includes('raise')) {
+          html += '<div style="display:flex;align-items:center;gap:4px">';
+          html += '<input id="raise-slider" type="range" min="'+minR+'" max="'+maxR+'" value="'+minR+'" step="1" oninput="document.getElementById(\'raise-input\').value=this.value" style="width:140px;accent-color:#e65100">';
+          html += '<input id="raise-input" type="number" min="'+minR+'" max="'+maxR+'" value="'+minR+'" step="1" oninput="if(document.getElementById(\'raise-slider\'))document.getElementById(\'raise-slider\').value=this.value" style="width:50px;padding:2px;border-radius:3px;border:1px solid #555;background:#222;color:#fff;text-align:center;font-size:12px">';
+          html += '</div>';
+        }
+        // Button row
+        html += '<div style="display:flex;gap:6px;align-items:center">';
+        if (va.includes('fold')) html += '<button class="btn-fold" onclick="act(\'fold\')">Fold</button>';
+        if (va.includes('check')) html += '<button class="btn-check" onclick="act(\'check\')">Check</button>';
+        if (va.includes('call')) html += '<button class="btn-call" onclick="act(\'call\')">Call ' + callAmt + '</button>';
+        if (va.includes('raise')) html += '<button class="btn-raise" onclick="doRaise()">' + ((st&&st.toCall) ? 'Raise' : 'Bet') + '</button>';
+        if (va.includes('allin')) html += '<button class="btn-allin" onclick="act(\'allin\')">All In</button>';
+        html += '</div></div>';
+        if (el) el.innerHTML = html;
+      }
       render();
       break;
-    case 'fold': stopTurnTimer(); log('betting', pName(m.playerid) + (m.timeout ? ' TIMED OUT (fold)' : ' folds')); if (st && st.players[m.playerid]) st.players[m.playerid].playing = 0; render(); break;
-    case 'check': stopTurnTimer(); log('betting', pName(m.playerid) + (m.timeout ? ' TIMED OUT (check)' : ' checks')); render(); break;
-    case 'call': stopTurnTimer(); log('betting', pName(m.playerid) + ' calls ' + (m.bet_amount || m.amount || '')); render(); break;
-    case 'raise': stopTurnTimer(); log('betting', pName(m.playerid) + ' raises ' + (m.bet_amount || m.amount || '')); render(); break;
-    case 'allin': stopTurnTimer(); log('betting', pName(m.playerid) + ' ALL IN ' + (m.bet_amount || m.amount || '')); render(); break;
+    case 'fold': case 'check': case 'call': case 'raise': case 'allin': {
+      stopTurnTimer();
+      // Clear buttons — but not if we're busted (preserve Reload/Sit In)
+      if (!isBusted) document.getElementById('controls').innerHTML = '<span class="wait-text">...</span>';
+      const act = m.action;
+      if (act === 'fold') { log('betting', pName(m.playerid) + (m.timeout ? ' TIMED OUT' : ' folds')); if (st && st.players[m.playerid]) st.players[m.playerid].playing = 0; }
+      else if (act === 'check') log('betting', pName(m.playerid) + (m.timeout ? ' TIMED OUT' : ' checks'));
+      else if (act === 'call') log('betting', pName(m.playerid) + ' calls ' + (m.bet_amount || m.amount || ''));
+      else if (act === 'raise') log('betting', pName(m.playerid) + ' raises ' + (m.bet_amount || m.amount || ''));
+      else if (act === 'allin') log('betting', pName(m.playerid) + ' ALL IN ' + (m.bet_amount || m.amount || ''));
+      render();
+      break;
+    }
   }
 }
 
@@ -678,10 +720,11 @@ function handleFinalInfo(m) {
 function renderBoard(cards) {
   const el = document.getElementById('board');
   el.innerHTML = '';
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < cards.length; i++) {
+    if (!cards[i]) continue;
     const div = document.createElement('div');
-    div.className = 'board-card' + (cards[i] ? ' dealt' : '');
-    if (cards[i]) div.innerHTML = cardHTML(cards[i], 50, 70);
+    div.className = 'board-card dealt';
+    div.innerHTML = cardHTML(cards[i], 50, 70);
     el.appendChild(div);
   }
 }
@@ -717,11 +760,11 @@ function render() {
 
     let cardsHtml = '';
     if (isMe && myCards.length > 0) {
-      // Show my own cards at my seat position
+      cardsHtml += '<span id="felt-countdown" style="font-weight:bold;font-size:14px;color:#fff;margin-right:4px"></span>';
       for (const c of myCards) {
         cardsHtml += '<div class="seat-card">' + cardHTML(c) + '</div>';
       }
-    } else if (!isMe && p.holeCardNames) {
+    } else if (!isMe && p.holeCardNames && !p.folded) {
       for (const c of p.holeCardNames) {
         if (c === '??' || !c) {
           cardsHtml += '<div class="seat-card card-back"></div>';
@@ -739,19 +782,35 @@ function render() {
       else if (delta < 0) deltaHtml = '<div class="seat-delta lose">' + delta + '</div>';
     }
 
-    el.innerHTML =
-      '<div class="seat-label">' +
-        '<div class="seat-name">' + (p.id || p.name || 'Seat ' + (p.seat+1)) + '</div>' +
-        '<div class="seat-chips">' + (p.chips !== undefined ? p.chips : '') + '</div>' +
-        deltaHtml +
-      '</div>' +
-      (cardsHtml ? '<div class="seat-cards">' + cardsHtml + '</div>' : '');
+    // Dealer button only
+    let roleTag = '';
+    if (p.seat === st.dealerSeat) roleTag = '<span class="seat-role role-d">D</span>';
+
+    if (isMe) {
+      // Own seat: cards on top, name below
+      el.innerHTML =
+        (cardsHtml ? '<div class="seat-cards">' + cardsHtml + '</div>' : '') +
+        '<div class="seat-label">' +
+          '<div class="seat-name">' + roleTag + (p.id || p.name || 'Seat ' + (p.seat+1)) + '</div>' +
+          '<div class="seat-chips">' + (p.chips !== undefined ? p.chips : '') + '</div>' +
+          deltaHtml +
+        '</div>';
+    } else {
+      // Others: name on top, cards below
+      el.innerHTML =
+        '<div class="seat-label">' +
+          '<div class="seat-name">' + roleTag + (p.id || p.name || 'Seat ' + (p.seat+1)) + '</div>' +
+          '<div class="seat-chips">' + (p.chips !== undefined ? p.chips : '') + '</div>' +
+          deltaHtml +
+        '</div>' +
+        (cardsHtml ? '<div class="seat-cards">' + cardsHtml + '</div>' : '');
+    }
     felt.appendChild(el);
 
     // Bet chip
     if (p.bet > 0) {
-      const bx = pos.x + (cx - pos.x) * 0.35;
-      const by = pos.y + (cy - pos.y) * 0.35;
+      const bx = pos.x + (cx - pos.x) * 0.6;
+      const by = pos.y + (cy - pos.y) * 0.6;
       const bet = document.createElement('div');
       bet.className = 'bet-marker';
       bet.style.left = bx + '%';
@@ -760,22 +819,7 @@ function render() {
       felt.appendChild(bet);
     }
 
-    // Position markers (D, SB, BB) — placed between player and center, offset to avoid overlap
-    function placeMarker(label, cssClass, offsetAngle) {
-      const dist = 0.28;
-      const mx = pos.x + (cx - pos.x) * dist + offsetAngle;
-      const my = pos.y + (cy - pos.y) * dist;
-      const mk = document.createElement('div');
-      mk.className = 'dealer-btn';
-      mk.style.left = mx + '%';
-      mk.style.top = my + '%';
-      mk.innerHTML = '<div class="' + cssClass + '">' + label + '</div>';
-      felt.appendChild(mk);
-    }
-
-    if (p.seat === st.dealerSeat) placeMarker('D', 'dealer-btn-label', 0);
-    if (p.seat === st.sbSeat && st.sbSeat >= 0) placeMarker('SB', 'sb-label', 3);
-    if (p.seat === st.bbSeat && st.bbSeat >= 0) placeMarker('BB', 'bb-label', 6);
+    // D/SB/BB shown in name label above
 
     pIdx++;
   }
@@ -793,56 +837,47 @@ function render() {
 
 function renderControls() {
   const el = document.getElementById('controls');
+  if (!el) return;
   if (!st) return;
 
-  // Don't overwrite reload button when busted
-  const me = st.players ? st.players.find(p => p.seat === seat) : null;
-  if (me && me.chips <= 0 && el.innerHTML.includes('Reload')) return;
+  // Don't overwrite anything when busted (Reload/Sit In buttons) or when action buttons showing
+  if (isBusted) return;
+  if (el.querySelector('button')) return;
 
-  const va = st.validActions || [];
-  const isMyTurn = st.currentTurn === seat && va.length > 0;
-
-  if (isMyTurn) {
-    let html = '';
-    if (va.includes('fold')) html += '<button class="btn-fold" onclick="act(\'fold\')">Fold</button>';
-    if (va.includes('check')) html += '<button class="btn-check" onclick="act(\'check\')">Check</button>';
-    const me = st.players ? st.players.find(p => p.seat === seat) : null;
-    const myChips = me ? me.chips : Infinity;
-    const callAmt = Math.min(st.toCall || 0, myChips);
-    if (va.includes('call')) html += '<button class="btn-call" onclick="act(\'call\')">Call ' + (callAmt || '') + '</button>';
-    if (va.includes('raise')) {
-      const label = (st.toCall || 0) > 0 ? 'Raise' : 'Bet';
-      html += '<input id="raise-input" type="number" step="1" value="' + (st.minRaise || 2) + '">';
-      html += '<button class="btn-raise" onclick="doRaise()">' + label + '</button>';
-    }
-    if (va.includes('allin')) html += '<button class="btn-allin" onclick="act(\'allin\')">All In</button>';
-    el.innerHTML = html;
-  } else if (st.phase === 'showdown' || st.phase === 'settled') {
-    el.innerHTML = '<span class="wait-text">Next hand starting...</span>';
-  } else if (st.currentTurn >= 0 && st.players && st.players[st.currentTurn]) {
-    el.innerHTML = '<span class="wait-text">Waiting for ' + (st.players[st.currentTurn].id || 'player') + '...</span>';
-  } else {
-    const seated = st.players ? st.players.filter(p => !p.empty).length : 0;
-    el.innerHTML = '<span class="wait-text">Waiting for players (' + seated + '/' + EXPECTED + ')...</span>';
+  let html = '';
+  if (st.phase === 'showdown' || st.phase === 'settled') {
+    html = '<span class="wait-text">Next hand...</span>';
+  } else if (st.currentTurn >= 0 && st.currentTurn !== seat) {
+    const tp = st.players ? st.players.find(p => p.seat === st.currentTurn) : null;
+    html = '<span class="wait-text">Waiting: ' + (tp ? tp.id : '...') + '</span>';
+  } else if (st.currentTurn < 0) {
+    html = '<span class="wait-text">' + (st.phase || '...') + '</span>';
   }
+  // Don't overwrite with empty/waiting if controls already has something meaningful
+  if (html) el.innerHTML = html;
 }
 
 function act(action) {
   ws.send(JSON.stringify({ action }));
   st.validActions = [];
   stopTurnTimer();
-  renderControls();
+  document.getElementById('controls').innerHTML = '<span class="wait-text">...</span>';
 }
 
 function doRaise() {
   const input = document.getElementById('raise-input');
   ws.send(JSON.stringify({ action: 'raise', amount: parseFloat(input.value) }));
   st.validActions = [];
-  renderControls();
+  stopTurnTimer();
+  document.getElementById('controls').innerHTML = '<span class="wait-text">...</span>';
 }
 
 function doReload() {
   ws.send(JSON.stringify({ action: 'reload' }));
+}
+
+function doSitIn() {
+  ws.send(JSON.stringify({ action: 'sitin' }));
 }
 
 function log(type, msg) {

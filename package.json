@@ -10,7 +10,13 @@
     "test:watch": "vitest",
     "dev": "tsx src/server/index.ts"
   },
-  "keywords": ["poker", "verus", "blockchain", "mental-poker", "p2p"],
+  "keywords": [
+    "poker",
+    "verus",
+    "blockchain",
+    "mental-poker",
+    "p2p"
+  ],
   "author": "",
   "license": "MIT"
 }

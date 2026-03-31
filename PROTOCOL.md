@@ -85,13 +85,26 @@ Every game action is written to a VerusID's contentmultimap using VDXF keys. Eac
 ## Cryptographic Protocol
 
 ### Primitives
-| Primitive | Role |
-|-----------|------|
-| Curve25519 scalar multiplication | Hides scalars p_i, d, e_i, b_ij in blinding |
-| Shamir Secret Sharing (SSS) | Distributes b_ij shares, ensures threshold security |
-| SHA-256 Hash | Binds secrets in commitments, prevents tampering |
-| ECIES | Encrypts SSS shares for secure distribution |
-| M_C-of-N_C Multisig | Secures all funds in escrow, gates settlement |
+| Primitive | Implementation | Role |
+|-----------|---------------|------|
+| Curve25519 (`curve25519()`) | C: curve25519-donna.c | Initial keypair generation only |
+| Field projection (`xoverz_donna()`) | C: curve25519-donna.c:863 | Projects EC point → 255-bit field element (one-time bridge) |
+| Field multiply (`fmul_donna()`) | C: curve25519-donna.c / JS: `(a * b) % (2^255-19)` | **ALL blinding/unblinding operations** |
+| Shamir Secret Sharing (SSS) | C: poker-crypto.c | Distributes b_ij shares, ensures threshold security |
+| SHA-256 Hash | Standard | Binds secrets in commitments, prevents tampering |
+| M_C-of-N_C Multisig | Verus native | Secures all funds in escrow, gates settlement |
+
+### Key Insight: Field Elements, Not Curve Points (Confirmed by Dev 2026-03-31)
+
+Cards are represented as **field elements** in the 255-bit prime field (p = 2^255 - 19), NOT as elliptic curve points. The `curve25519()` function generates an initial curve point, but `xoverz_donna()` immediately projects it down to a scalar field element. From that point on, **all blinding operations use `fmul_donna()` — simple modular multiplication.**
+
+Why this matters:
+- EC point multiplication `[k]P` is computationally heavy (~1ms per op)
+- Field multiplication `a × b mod p` is fast (~0.001ms per op, ~1000× faster)
+- Modular multiplication is **commutative**: `A × B mod p = B × A mod p`
+- This commutativity is what makes the multi-party blinding/unblinding protocol work
+
+**JS equivalence confirmed by dev:** `(a * b) % (2n ** 255n - 19n)` in BigInt is mathematically identical to `fmul_donna()` in C. The JS implementation in `mental-poker.mjs` is correct for all blinding operations. No WASM needed for the shuffle protocol — only for initial keypair generation.
 
 ### Three-Stage Shuffle and Blind
 
@@ -104,9 +117,9 @@ Every game action is written to a VerusID's contentmultimap using VDXF keys. Eac
 **Stage I — Player (P_i → Dealer):**
 1. Player generates random nonce r_ik for each card k
 2. Computes scalar h_ik = H(r_ik || "card_k_string")
-3. Computes point P_ik = h_ik · G (public deck point)
-4. Generates secret permutation σ_i
-5. Permutes and blinds deck: D_1,i = {p_i · P_i,σ_i^(-1)(j) | j=1..Z}
+3. Computes field element via `xoverz_donna(h_ik, basepoint)` → P_ik
+4. Generates secret permutation σ_i and blinding scalar p_i
+5. Permutes and blinds deck: D_1,i = {`fmul(p_i, P_i[σ_i^(-1)(j)])` | j=1..Z}
 6. Commits H(p_i || σ_i) to Verus ID
 7. Sends (D_1,i, P_i) to Dealer
 
@@ -115,24 +128,25 @@ Every game action is written to a VerusID's contentmultimap using VDXF keys. Eac
 9. Generates global scalar d, global permutation σ_Dealer
 10. For each player i: generates secret player-specific scalar e_i
 11. Permutes: D'_1,i = {D_1,i[σ_Dealer(j)] | j=1..Z}
-12. Blinds with d: D''_1,i = {d · P' | P' ∈ D'_1,i}
-13. Blinds with e_i: D_2,i = {e_i · P'' | P'' ∈ D''_1,i}
+12. Blinds with d: D''_1,i = {`fmul(d, P')` | P' ∈ D'_1,i}
+13. Blinds with e_i: D_2,i = {`fmul(e_i, P'')` | P'' ∈ D''_1,i}
 14. Commits H(d || σ_Dealer || e_1 || ... || e_N) to Verus ID
-15. Publishes {E_1, ..., E_N} where E_i = e_i · G
-16. Sends {D_2,1, ..., D_2,N} to Cashier committee
+15. Sends {D_2,1, ..., D_2,N} to Cashier committee
+    (C code: `deckgen_vendor` uses `tmp[i] = fmul_donna(..., randcards[i].priv)`)
 
 **Stage III — Cashier Committee (Cashier → P_i):**
-17. Receives dealer-blinded decks
-18. Generates global permutation σ_Cashier
-19. For each player i, each card position j:
+16. Receives dealer-blinded decks
+17. Generates global permutation σ_Cashier
+18. For each player i, each card position j:
     - Generates secret blinding scalar b_ij
-    - Blinds: C_ij = b_ij · D'_2,i (after permuting)
+    - Blinds: C_ij = `fmul(b_ij, D'_2,i[j])` (after permuting)
     - Computes (M,N) SSS shares {s_ijk} of b_ij
-    - Encrypts s_ijk for each player P_k using ECIES
-20. Commits H(σ_Cashier || {b_ij}) to Verus ID
-21. Sends final deck D_3,i = {C_i1, ..., C_iZ} to each player
+    - Encrypts s_ijk for each player P_k
+19. Commits H(σ_Cashier || {b_ij}) to Verus ID
+20. Sends final deck D_3,i = {C_i1, ..., C_iZ} to each player
+    (C code: `p2p_bvv_init` uses `blindedcards[i] = fmul_donna(finalcards[...], blindings[i])`)
 
-**Result:** Player i holds deck D_3,i where each card C_ij = (b_ij · e_i · d · p_i) · P_i,k with k = σ_i^(-1)(σ_Dealer^(-1)(σ_Cashier^(-1)(j))). No single party knows the final card-to-position mapping.
+**Result:** Player i holds deck D_3,i where each card C_ij = fmul(b_ij, fmul(e_i, fmul(d, fmul(p_i, P_i,k)))) with k = σ_i^(-1)(σ_Dealer^(-1)(σ_Cashier^(-1)(j))). No single party knows the final card-to-position mapping. All operations are field multiplications.
 
 ### Card Reveal (Private — Hole Cards)
 
@@ -163,61 +177,93 @@ For community cards, the Cashier and Dealer release b_ij and e_i publicly via Ve
 
 ## Betting and Fund Management
 
-### Deposit
+### Deposit (Once per Session)
 Before playing, each player sends:
 - V_deposit (buy-in amount) to Cashier committee's M_C-of-N_C multisig address
 - V_stake (good-behavior bond) to the same multisig
 - Must retain CHIPS in wallet for TX fees (~0.025 CHIPS per 50 hands)
 
-### Virtual Betting
+Funds remain locked in multisig for the entire session. Players cannot withdraw without cashier signatures.
+
+### Virtual Betting (During Play)
 During the game, bets are NOT actual transactions. A player commits a "bet" (e.g., "bet 2 CHIPS") as data to their Verus ID contentmultimap under the `poker.player.action` VDXF key.
 
-The Dealer (and other players) validate virtual bets by checking the player's committed data against their available deposit balance held by the Cashier.
+The session manager tracks running balances in memory. The Dealer (and other players) validate virtual bets by checking the player's committed data against their available balance.
+
+### Session-Based Settlement
+Unlike per-hand settlement, funds only move on-chain when a player cashes out or the table closes:
+
+- **During play:** No on-chain fund transfers between hands. Only virtual balance tracking.
+- **Per-hand verification:** After each hand, cashier nodes verify the hand was fair using on-chain data (see Verification section). This is cryptographic proof, not fund transfer.
+- **Cash-out:** Player requests withdrawal → Cashier verifies ALL hands since deposit → Signs one payout TX for final balance.
+- **Table close:** All remaining balances settled in a single batch TX.
+
+**Why session-based is safe:**
+- All funds locked in M-of-N multisig — ragequitters can't steal
+- Per-hand verification catches cheating immediately (hand is voided, stake slashed)
+- Fewer TX fees (one settlement vs one per hand)
+- Faster gameplay (no payout confirmation delays between hands)
+
+**Ragequit handling:**
+- Loser disconnects: their remaining balance stays in multisig. They can claim it later or it's released after timeout.
+- Winner disconnects: same — funds wait in multisig.
+- Neither party can take money without cashier signatures.
 
 ### Gated Settlement
 The Cashier committee will NOT sign any settlement transaction until:
-1. The game (hand) is finished
-2. Post-game verification (Algorithm 4) has been completed by M_C nodes
-3. Verification passed — no cheating detected
+1. ALL hands in the session have been verified via on-chain replay
+2. Post-game verification (Algorithm 4) passed for every hand
+3. No cheating detected in any hand
 
 ---
 
-## Post-Game Verification and Settlement
+## Post-Hand Verification (On-Chain Replay)
 
-This is the core of the protocol's security. After each hand:
+This is the core of the protocol's security. After each hand, verification happens using data already on-chain.
+
+### Data Source: contentmultimap
+All verification data is read directly from the blockchain using `getidentitycontent()`. Each hand's data is stored as incremental identity updates — NOT accumulated into one blob (avoids size limits, per dev guidance).
+
+```
+getidentitycontent(tableId, handStartBlock, currentBlock, false, 0, vdxfKey)
+```
+
+The cashier tracks the starting block of each hand and reads forward incrementally.
 
 ### Phase 1: Secret Reveal
-ALL parties MUST reveal their full secret parameters:
-- Players reveal: {r_ik}, p_i, σ_i
-- Dealer reveals: d, {e_i}, σ_Dealer
-- Cashier reveals: {b_ij}, σ_Cashier
+After hand completes, ALL parties publish their secrets as identity updates:
+- Players reveal: {r_ik}, p_i, σ_i → written to player's VerusID
+- Dealer reveals: d, {e_i}, σ_Dealer → written to table VerusID
+- Cashier reveals: {b_ij}, σ_Cashier → written to cashier VerusID
 
-### Phase 2: Distributed Replay Verification
-Each Cashier node independently performs full-trace replay:
-1. Verify each player's nonces and initial deck D_0,i
-2. Re-compute D_1,i from Algorithm Stage I — check it matches published D_1,i
-3. Re-compute D_2,i from Algorithm Stage II — check it matches published D_2,i
-4. Re-compute D_3,i from Algorithm Stage III — check it matches published D_3,i
-5. If any check fails or any party failed to reveal secrets → VOTE_SLASH(CheaterParty)
-6. If all checks pass → VOTE_PAY(Winner, Amount)
+### Phase 2: On-Chain Replay Verification
+Each Cashier node reads the full hand from chain and replays independently:
+1. Read player decks from `poker.deck.player` VDXF key on player IDs
+2. Read dealer shuffle from `poker.deck.dealer` VDXF key on table ID
+3. Read cashier shuffle from `poker.deck.cashier` VDXF key on cashier ID
+4. Read revealed secrets from `poker.secrets` VDXF key on all IDs
+5. Re-compute Stage I: `fmul(p_i, P_i[σ_i^(-1)(j)])` for each card — must match published D_1,i
+6. Re-compute Stage II: `fmul(e_i, fmul(d, D'_1,i))` — must match published D_2,i
+7. Re-compute Stage III: `fmul(b_ij, D'_2,i[j])` — must match published D_3,i
+8. Verify betting actions match game rules (valid bets, correct turn order)
+9. Verify hand evaluation matches claimed winner
+10. If any check fails → mark hand as INVALID, identify cheating party
 
-### Phase 3: Gated Settlement (Multisig)
-Collect all Cashier node votes:
-- If ≥ M_C nodes vote SLASH:
-  - **Void Game**: discard the virtual pot
-  - **Refund**: return V_deposit to all honest players
-  - **Slash**: seize V_stake from the Cheater
-- If ≥ M_C nodes vote PAY:
-  - **Settle**: transfer V_deposit funds to Winner(s) per virtual pot
-  - **Pay rake**: dealer commission + cashier commission deducted from winner's payout
-  - **Return Stakes**: return V_stake to all honest parties
-- If no consensus: funds locked pending manual resolution
+### Phase 3: Settlement (At Cash-Out or Table Close)
+When a player cashes out, the Cashier checks ALL hands since their deposit:
+- If ALL hands verified → sign payout TX for player's final balance (minus rake)
+- If ANY hand has cheating detected:
+  - **Void cheated hand**: discard that hand's virtual pot
+  - **Slash**: seize V_stake from the cheater
+  - **Recalculate**: settle with corrected balances
+  - **Pay rake**: dealer + cashier commission from legitimate hands
 
 ### Why This Makes Cheating Unprofitable
 A rational adversary:
 - Cannot achieve M_C signatures to steal the pot (needs majority of cashier committee)
-- Is guaranteed to lose V_stake if caught cheating (full replay catches everything)
-- Gains zero from cheating (game is voided, deposits refunded)
+- Is guaranteed to lose V_stake if caught cheating (full replay catches everything — data is ON CHAIN)
+- Gains zero from cheating (cheated hands are voided, balances recalculated)
+- Cannot delete evidence — contentmultimap updates are permanently indexed via VDXF keys
 - The Nash Equilibrium is honest participation
 
 ---
@@ -366,24 +412,39 @@ Players need ~0.025 CHIPS beyond buy-in for their TX fees per 50 hands.
 
 ## Implementation Status
 
-### Built and Tested (JavaScript, zero dependencies)
-- `mental-poker.mjs` — sg777 field multiply protocol (32 tests pass)
+### Core Protocol (JavaScript, zero dependencies)
+- `mental-poker.mjs` — sg777 field multiply protocol, JS BigInt (32 tests pass). **Confirmed identical to C fmul_donna by dev.**
 - `mental-poker-sra.mjs` — SRA alternative (14 tests pass, kept as option)
-- `hand-eval.mjs` — Texas Hold'em hand evaluator
-- `game.mjs` — Game state machine (26 tests pass)
-- `poker-engine.mjs` — Game orchestrator (7 tests pass)
+- `protocol.mjs` — Paper's Algorithm 2,3,4: playerInit, dealerShuffle (with e_i), cashierShuffle (with SSS), decodeCard, verifyGame (10 tests pass)
+- `poker-crypto.c` — Standalone C crypto for WASM (969 lines, 7 tests pass)
 - `provably-fair.mjs` — Seed commit/reveal/verify (14 tests pass)
-- `verus-rpc.mjs` — Verus daemon RPC client (5 live tests pass)
-- `poker-crypto.c` — Standalone C crypto for WASM compilation (7 tests pass)
-- `session.mjs` — Multi-hand session manager (10 tests pass)
-- Full game simulation — 9 automated tests, 100 hands, chips conserved
 
-### Still Needed
-- Shamir secret sharing in JS (port from C gfshare.c)
-- Player-specific blinding factor (e_i) implementation
-- Post-game full-trace replay verification (Algorithm 4 from paper)
-- Cashier committee integration (multisig, voting, slashing)
+### Game Logic
+- `game.mjs` — Game state machine: blinds, betting, side pots, settlement (26 tests pass)
+- `hand-eval.mjs` — Texas Hold'em hand evaluator (all rankings)
+- `poker-engine.mjs` — Game orchestrator tying crypto + game + IO (7 tests pass)
+- `session.mjs` — Multi-hand session manager (10 tests pass)
+
+### Server & UI
+- `poker-server.mjs` — WebSocket server with full game protocol, seat management, name-based matching
+- `public/poker.html` — Vanilla HTML/JS poker client, PokerStars-style layout, SVG card sprites
+- Multiview page supporting 2/6/9 player tables
+
+### Chain Integration
+- `verus-rpc.mjs` — Verus daemon RPC client (5 live tests pass)
+- `chain-game.mjs` — On-chain game with identity updates per protocol phase
+- `escrow.mjs` — 2-of-2 multisig escrow from cashier nodes
+- `cashier-node.mjs` — Cashier node with processShuffle, verifyHand, watch
+- `full-game.mjs` — Complete end-to-end: deposit → play 10 hands → verify → settle (confirmed on CHIPS chain)
+
+### Tests
+- `test-stress.mjs` — 23 tests: chip conservation across 2/3/4/6/9 players, side pots, blind posting, dealer rotation
+- `test-e2e.mjs` — 15 E2E tests: join flow, check-check advancement, fold wins, all-in, timeouts, reload/sitin, multi-hand
+- 7 scenario tests passing: 6P check-call, 5-fold-to-BB, 1-raiser-5-callers, 2-allin-4-fold, 6P-random, heads-up-check, heads-up-allin
+
+### Next Steps
+- Wire real sg777 crypto into poker-server.mjs (replace mock shuffle with protocol.mjs)
+- contentmultimap communication layer (replacing WebSocket for on-chain play)
+- WASM compilation of xoverz_donna for browser-side keypair generation
 - V_stake staking mechanism
 - UTXO chaining for mempool-speed ordering (v2)
-- Proper contentmultimap communication layer (replacing z-memo prototype)
-- Web UI for players
