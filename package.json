@@ -1,0 +1,16 @@
+{
+  "name": "verus-poker",
+  "version": "0.1.0",
+  "description": "Decentralized P2P poker on Verus blockchain with SRA mental poker protocol",
+  "type": "module",
+  "main": "dist/server/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "tsx src/server/index.ts"
+  },
+  "keywords": ["poker", "verus", "blockchain", "mental-poker", "p2p"],
+  "author": "",
+  "license": "MIT"
+}

@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Verus Poker</title>
+<style>
+:root {
+  --felt: #1b5e20;
+  --felt-light: #2e7d32;
+  --felt-dark: #0d3d0d;
+  --wood: #4e342e;
+  --gold: #ffd700;
+  --red: #d32f2f;
+  --blue: #1565c0;
+  --text: #eee;
+  --text-dim: #888;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a1a0a;
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  height: 100vh;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ══════ TABLE ══════ */
+#table-area {
+  width: 100%;
+  height: 100vh;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+#felt {
+  position: relative;
+  width: 94%;
+  max-width: 800px;
+  aspect-ratio: 2 / 1;
+  background: radial-gradient(ellipse at 50% 50%, var(--felt-light), var(--felt) 60%, var(--felt-dark));
+  border: 6px solid var(--wood);
+  border-radius: 50%;
+  box-shadow: inset 0 0 40px rgba(0,0,0,0.4), 0 4px 20px rgba(0,0,0,0.6);
+}
+
+/* ══════ BOARD ══════ */
+#board {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -60%);
+  display: flex;
+  gap: 6px;
+}
+.board-card {
+  width: 50px;
+  height: 70px;
+  border-radius: 5px;
+  overflow: hidden;
+  box-shadow: 1px 2px 6px rgba(0,0,0,0.5);
+  background: rgba(255,255,255,0.06);
+  border: 1px dashed rgba(255,255,255,0.15);
+  transition: all 0.3s ease;
+}
+.board-card.dealt {
+  background: #fff;
+  border: 1px solid #ccc;
+}
+.board-card img, .board-card svg {
+  width: 100%;
+  height: 100%;
+}
+
+#pot-display {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, 20px);
+  color: var(--gold);
+  font-size: 14px;
+  font-weight: bold;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+}
+
+#hand-info {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, 40px);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+/* ══════ PLAYER SEATS ══════ */
+.seat {
+  position: absolute;
+  text-align: center;
+  transform: translate(-50%, -50%);
+  transition: all 0.3s ease;
+}
+.seat-label {
+  background: rgba(0,0,0,0.7);
+  border: 2px solid rgba(255,255,255,0.15);
+  border-radius: 6px;
+  padding: 2px 10px;
+  min-width: 70px;
+  margin-bottom: 3px;
+}
+.seat.active .seat-label {
+  border-color: var(--gold);
+  box-shadow: 0 0 10px rgba(255,215,0,0.4);
+}
+.seat.me .seat-label {
+  border-color: #4caf50;
+}
+.seat.folded { opacity: 0.3; }
+
+.seat-name {
+  font-weight: bold;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.seat-chips {
+  color: #ccc;
+  font-size: 11px;
+  font-weight: bold;
+}
+.seat.winner .seat-box {
+  border-color: var(--gold);
+  box-shadow: 0 0 20px rgba(255,215,0,0.7), 0 0 40px rgba(255,215,0,0.3);
+  animation: winPulse 0.6s ease-in-out 3;
+}
+@keyframes winPulse {
+  0%, 100% { box-shadow: 0 0 20px rgba(255,215,0,0.7); }
+  50% { box-shadow: 0 0 35px rgba(255,215,0,0.9), 0 0 60px rgba(255,215,0,0.4); }
+}
+.seat-delta {
+  font-size: 13px;
+  font-weight: bold;
+  margin-top: 2px;
+}
+.seat-delta.win { color: #4caf50; }
+.seat-delta.lose { color: #ef5350; }
+
+/* ══════ WINNER BANNER ══════ */
+#winner-banner {
+  display: none;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(0,0,0,0.85);
+  border: 2px solid var(--gold);
+  border-radius: 12px;
+  padding: 12px 28px;
+  z-index: 100;
+  text-align: center;
+  animation: bannerIn 0.3s ease-out;
+}
+@keyframes bannerIn {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.8); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+#winner-banner .wb-title {
+  color: var(--gold);
+  font-size: 18px;
+  font-weight: bold;
+}
+#winner-banner .wb-detail {
+  color: #ccc;
+  font-size: 13px;
+  margin-top: 4px;
+}
+.seat-cards {
+  display: flex;
+  gap: 4px;
+  justify-content: center;
+  margin-top: 2px;
+}
+.seat-card {
+  width: 50px;
+  height: 70px;
+  border-radius: 5px;
+  overflow: hidden;
+  box-shadow: 2px 3px 8px rgba(0,0,0,0.5);
+}
+.seat-card img {
+  width: 100%;
+  height: 100%;
+}
+.card-back {
+  background: linear-gradient(135deg, #8b1a1a, #c62828);
+  border: 1px solid #d32f2f;
+}
+
+/* ══════ TABLE MARKERS ══════ */
+.bet-marker {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.bet-chip {
+  background: var(--gold);
+  color: #000;
+  border: 2px solid #b8860b;
+  border-radius: 50%;
+  width: 26px;
+  height: 26px;
+  line-height: 22px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: bold;
+  box-shadow: 1px 1px 4px rgba(0,0,0,0.5);
+}
+.dealer-btn {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 5;
+}
+.dealer-btn-label {
+  background: #fff;
+  color: #000;
+  border: 2px solid #333;
+  border-radius: 50%;
+  width: 22px;
+  height: 22px;
+  line-height: 18px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: bold;
+  box-shadow: 1px 1px 4px rgba(0,0,0,0.5);
+}
+.sb-label {
+  background: #aaa;
+  color: #000;
+  border: 2px solid #666;
+  border-radius: 50%;
+  width: 22px;
+  height: 22px;
+  line-height: 18px;
+  text-align: center;
+  font-size: 9px;
+  font-weight: bold;
+  box-shadow: 1px 1px 4px rgba(0,0,0,0.5);
+}
+.bb-label {
+  background: #ffd700;
+  color: #000;
+  border: 2px solid #b8860b;
+  border-radius: 50%;
+  width: 22px;
+  height: 22px;
+  line-height: 18px;
+  text-align: center;
+  font-size: 9px;
+  font-weight: bold;
+  box-shadow: 1px 1px 4px rgba(0,0,0,0.5);
+}
+
+/* ══════ MY HAND ══════ */
+#my-hand {
+  display: none;  /* Cards shown at seat on felt */
+  padding: 4px 16px;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  border-top: 2px solid #4caf50;
+}
+#my-name {
+  font-weight: bold;
+  color: #4caf50;
+  font-size: 13px;
+  min-width: 80px;
+}
+#my-cards {
+  display: flex;
+  gap: 5px;
+}
+.my-card {
+  width: 50px;
+  height: 70px;
+  border-radius: 5px;
+  overflow: hidden;
+  border: 2px solid #4caf50;
+  box-shadow: 2px 3px 8px rgba(0,0,0,0.5);
+  transition: transform 0.2s;
+}
+.my-card:hover { transform: translateY(-4px); }
+.my-card img {
+  width: 100%;
+  height: 100%;
+}
+#my-chips {
+  color: var(--text-dim);
+  font-size: 12px;
+  min-width: 60px;
+}
+
+/* ══════ CONTROLS ══════ */
+#controls {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.7);
+  padding: 5px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-height: 36px;
+  border-radius: 8px;
+  backdrop-filter: blur(3px);
+  z-index: 80;
+}
+#controls button {
+  padding: 6px 16px;
+  font-size: 13px;
+  font-weight: bold;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: transform 0.1s, opacity 0.2s;
+}
+#controls button:hover { transform: scale(1.05); }
+#controls button:active { transform: scale(0.95); }
+.btn-fold { background: #c62828; color: #fff; }
+.btn-check { background: #2e7d32; color: #fff; }
+.btn-call { background: #1565c0; color: #fff; }
+.btn-raise { background: #e65100; color: #fff; }
+.btn-allin { background: #6a1b9a; color: #fff; }
+#raise-input {
+  padding: 5px;
+  width: 60px;
+  border-radius: 4px;
+  border: 1px solid #555;
+  background: #222;
+  color: #fff;
+  text-align: center;
+  font-size: 13px;
+}
+.wait-text { color: var(--text-dim); font-size: 12px; }
+
+/* ══════ TURN TIMER ══════ */
+#timer-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  height: 4px;
+  background: #4caf50;
+  z-index: 50;
+}
+#timer-bar.warn { background: #ff9800; }
+#timer-bar.danger { background: #f44336; }
+#timer-count {
+  position: absolute;
+  top: -18px;
+  right: 8px;
+  font-size: 13px;
+  font-weight: bold;
+  color: #4caf50;
+  font-family: monospace;
+  z-index: 51;
+}
+#timer-count.warn { color: #ff9800; }
+#timer-count.danger { color: #f44336; }
+
+/* ══════ COMMS LOG ══════ */
+#comms {
+  position: absolute;
+  bottom: 4px;
+  left: 4px;
+  width: 220px;
+  height: 60px;
+  overflow-y: auto;
+  padding: 3px 6px;
+  font-size: 10px;
+  font-family: 'Consolas', monospace;
+  background: rgba(0,0,0,0.6);
+  border-radius: 6px;
+  z-index: 70;
+}
+#comms div { padding: 1px 0; }
+.c-time { color: #444; margin-right: 6px; }
+.c-protocol { color: #4fc3f7; }
+.c-cards { color: #81c784; }
+.c-betting { color: #ffd54f; }
+.c-turn { color: #fff176; }
+.c-showdown { color: #ef5350; }
+.c-verify { color: #ce93d8; }
+.c-system { color: #90a4ae; }
+</style>
+</head>
+<body>
+
+<div id="table-area">
+  <div id="felt">
+    <div id="board"></div>
+    <div id="pot-display"></div>
+    <div id="hand-info"></div>
+    <div id="winner-banner"><div class="wb-title"></div><div class="wb-detail"></div></div>
+  </div>
+  <div id="controls">
+    <div id="timer-bar" style="width:0"></div>
+    <div id="timer-count"></div>
+    <span class="wait-text">Joining table...</span>
+  </div>
+  <div id="comms"></div>
+</div>
+
+<script>
+// ══════════════════════════════════════
+// CONFIG
+// ══════════════════════════════════════
+const CARD_SVG = '/cards.bebfd660.svg';
+const CARD_BACK = '/bg-red.44d92640.svg';
+const DEALER_SVG = '/dealer.b4af8c3d.svg';
+const EXPECTED = 9;
+
+// Card name mapping: our format (2c, Ah) matches SVG IDs
+// Except T → 10 in the SVG
+function svgCardId(name) {
+  if (!name || name === '??') return null;
+  return name.replace('T', '10');
+}
+
+// Card positions in sprite sheet (50x70 each, stacked vertically)
+// Order: 10c,10d,10h,10s,2c,2d,2h,2s,3c,...,Ac,Ad,Ah,As,Jc,...,Kc,...,Qc,...
+const CARD_ORDER = [
+  '10c','10d','10h','10s','2c','2d','2h','2s','3c','3d','3h','3s',
+  '4c','4d','4h','4s','5c','5d','5h','5s','6c','6d','6h','6s',
+  '7c','7d','7h','7s','8c','8d','8h','8s','9c','9d','9h','9s',
+  'Ac','Ad','Ah','As','Jc','Jd','Jh','Js','Kc','Kd','Kh','Ks',
+  'Qc','Qd','Qh','Qs'
+];
+const CARD_Y = {};
+CARD_ORDER.forEach((c, i) => CARD_Y[c] = i * 70);
+
+function cardHTML(name, width, height) {
+  const w = width || 50;
+  const h = height || 70;
+  const id = svgCardId(name);
+  if (!id || !CARD_Y.hasOwnProperty(id)) {
+    return '<img src="' + CARD_BACK + '" style="width:'+w+'px;height:'+h+'px" alt="?">';
+  }
+  // Scale sprite position: native card is 50x70, sprite is 50 wide
+  const scale = h / 70;
+  const yOffset = CARD_Y[id] * scale;
+  const bgSize = w + 'px auto';
+  return '<div style="width:'+w+'px;height:'+h+'px;background:url('+CARD_SVG+') 0 -'+yOffset+'px;background-size:'+bgSize+';border-radius:3px;overflow:hidden"></div>';
+}
+
+// Seat positions (% of felt) — arranged for "me" at bottom
+// Seat positions (% of felt) — "me" is always index 0 (bottom center)
+const POSITIONS = {
+  2: [{x:50,y:92},{x:50,y:8}],
+  3: [{x:50,y:92},{x:8,y:30},{x:92,y:30}],
+  4: [{x:50,y:92},{x:8,y:50},{x:50,y:8},{x:92,y:50}],
+  5: [{x:50,y:92},{x:8,y:55},{x:20,y:8},{x:80,y:8},{x:92,y:55}],
+  6: [{x:50,y:92},{x:5,y:60},{x:10,y:12},{x:50,y:8},{x:90,y:12},{x:95,y:60}],
+  7: [{x:50,y:92},{x:5,y:65},{x:5,y:25},{x:25,y:8},{x:75,y:8},{x:95,y:25},{x:95,y:65}],
+  8: [{x:50,y:92},{x:5,y:65},{x:5,y:25},{x:25,y:8},{x:50,y:8},{x:75,y:8},{x:95,y:25},{x:95,y:65}],
+  9: [{x:50,y:92},{x:15,y:80},{x:3,y:50},{x:10,y:15},{x:35,y:5},{x:65,y:5},{x:90,y:15},{x:97,y:50},{x:85,y:80}],
+};
+
+function getPositions(total, mySeat) {
+  const base = POSITIONS[total] || POSITIONS[4];
+  const pos = [];
+  for (let i = 0; i < total; i++) {
+    const offset = (i - mySeat + total) % total;
+    pos.push(base[offset] || base[0]);
+  }
+  return pos;
+}
+
+// ══════════════════════════════════════
+// STATE
+// ══════════════════════════════════════
+let ws, seat = -1, myId = '', myCards = [], st = null;
+let winnerSeats = [], winAmount = 0, chipsBefore = {};
+let turnTimer = null, turnDeadline = 0, turnTotal = 0;
+const name = new URLSearchParams(location.search).get('name') || 'Player';
+
+// ══════════════════════════════════════
+// WEBSOCKET
+// ══════════════════════════════════════
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host);
+  ws.onopen = () => ws.send(JSON.stringify({ action: 'join', name }));
+  ws.onmessage = e => { try { handle(JSON.parse(e.data)); } catch(x) { console.error(x); } };
+  ws.onclose = () => setTimeout(connect, 2000);
+}
+
+function handle(m) {
+  switch (m.event || m.method) {
+    case 'joined':
+      seat = m.seat; myId = m.id;
+      document.getElementById('my-name').textContent = m.id;
+      document.getElementById('my-chips').textContent = (m.chips || 200) + ' chips';
+      document.getElementById('controls').innerHTML = '<span class="wait-text">Waiting for players...</span>';
+      log('system', 'Seated at position ' + (m.seat + 1));
+      break;
+    case 'state': st = m; render(); break;
+    case 'hole_cards':
+    case 'deal':
+      if (m.deal) {
+        if (m.deal.holecards) {
+          myCards = m.deal.holecards;
+          // Snapshot chips at start of hand for delta display
+          if (st && st.players) st.players.forEach(p => { if (!p.empty) chipsBefore[p.seat] = p.chips; });
+          winnerSeats = [];
+          document.getElementById('winner-banner').style.display = 'none';
+          renderBoard([]);
+          render();
+        }
+        if (m.deal.board) renderBoard(m.deal.board);
+      } else if (m.cards) {
+        myCards = m.cards; render();
+      }
+      break;
+    case 'backend_status': break;
+    case 'table_info': break;
+    case 'info': seat = m.playerid; break;
+    case 'seats':
+      if (m.seats) {
+        st = st || {};
+        st.players = m.seats;
+        if (m.dealerSeat !== undefined) st.dealerSeat = m.dealerSeat;
+        if (m.sbSeat !== undefined) st.sbSeat = m.sbSeat;
+        if (m.bbSeat !== undefined) st.bbSeat = m.bbSeat;
+        if (m.phase) st.phase = m.phase;
+        if (m.pot !== undefined) st.pot = m.pot;
+        if (m.currentTurn !== undefined) st.currentTurn = m.currentTurn;
+        if (m.handCount) st.handCount = m.handCount;
+        render();
+      }
+      break;
+    case 'dealer': log('system', 'Dealer: seat ' + (m.playerid + 1)); break;
+    case 'blindsInfo': log('system', 'Blinds: ' + m.small_blind + '/' + m.big_blind); break;
+    case 'betting': handleBetting(m); break;
+    case 'finalInfo': handleFinalInfo(m); break;
+    case 'comm': log(m.type, m.msg); break;
+    case 'comm_history': (m.log || []).forEach(c => log(c.type, c.msg)); break;
+    case 'busted':
+      log('system', 'You are out of chips!');
+      document.getElementById('controls').innerHTML =
+        '<span class="wait-text" style="color:#ef5350">Out of chips!</span>' +
+        '<button class="btn-call" onclick="doReload()" style="margin-left:10px">Reload 200</button>';
+      break;
+    case 'reloaded':
+      log('system', 'Reloaded to ' + m.chips + ' chips');
+      document.getElementById('controls').innerHTML = '<span class="wait-text">Waiting for next hand...</span>';
+      break;
+    case 'waiting': log('system', 'Waiting for players (' + m.active + '/' + m.needed + ')'); break;
+    case 'waiting_next':
+      log('system', m.msg || 'Joining next hand');
+      document.getElementById('controls').innerHTML = '<span class="wait-text">Seated — joining next hand...</span>';
+      break;
+    case 'error': log('system', 'Error: ' + (m.error || m.message)); break;
+  }
+}
+
+function startTurnTimer(seconds) {
+  stopTurnTimer();
+  turnTotal = seconds;
+  turnDeadline = Date.now() + seconds * 1000;
+  const bar = document.getElementById('timer-bar');
+  const count = document.getElementById('timer-count');
+  bar.style.width = '100%';
+  turnTimer = setInterval(() => {
+    const remaining = Math.max(0, turnDeadline - Date.now());
+    const secs = Math.ceil(remaining / 1000);
+    const pct = (remaining / (turnTotal * 1000)) * 100;
+    bar.style.width = pct + '%';
+    count.textContent = secs > 0 ? secs + 's' : '';
+    if (pct < 20) { bar.className = 'danger'; count.className = 'danger'; }
+    else if (pct < 40) { bar.className = 'warn'; count.className = 'warn'; }
+    else { bar.className = ''; count.className = ''; }
+    if (remaining <= 0) stopTurnTimer();
+  }, 200);
+}
+
+function stopTurnTimer() {
+  if (turnTimer) { clearInterval(turnTimer); turnTimer = null; }
+  document.getElementById('timer-bar').style.width = '0';
+  document.getElementById('timer-bar').className = '';
+  document.getElementById('timer-count').textContent = '';
+  document.getElementById('timer-count').className = '';
+}
+
+function pName(seatIdx) {
+  if (st && st.players && st.players[seatIdx]) return st.players[seatIdx].id || ('Seat ' + (seatIdx+1));
+  return 'Seat ' + (seatIdx+1);
+}
+
+function handleBetting(m) {
+  switch (m.action) {
+    case 'small_blind_bet': log('betting', pName(m.playerid) + ' SB ' + m.amount); break;
+    case 'big_blind_bet': log('betting', pName(m.playerid) + ' BB ' + m.amount); break;
+    case 'round_betting':
+      if (st) {
+        st.currentTurn = m.playerid;
+        st.pot = m.pot;
+        st.toCall = m.toCall;
+        st.minRaise = m.minRaiseTo;
+        st.validActions = (m.possibilities || []).map(p => ({0:'fold',1:'check',2:'call',3:'raise',7:'allin'})[p]).filter(Boolean);
+        if (m.player_funds && st.players) {
+          m.player_funds.forEach((f, i) => { if (st.players[i]) st.players[i].chips = f; });
+        }
+      }
+      startTurnTimer(m.turnTimeout || 60);
+      render();
+      break;
+    case 'fold': stopTurnTimer(); log('betting', pName(m.playerid) + (m.timeout ? ' TIMED OUT (fold)' : ' folds')); if (st && st.players[m.playerid]) st.players[m.playerid].playing = 0; render(); break;
+    case 'check': stopTurnTimer(); log('betting', pName(m.playerid) + (m.timeout ? ' TIMED OUT (check)' : ' checks')); render(); break;
+    case 'call': stopTurnTimer(); log('betting', pName(m.playerid) + ' calls ' + (m.bet_amount || m.amount || '')); render(); break;
+    case 'raise': stopTurnTimer(); log('betting', pName(m.playerid) + ' raises ' + (m.bet_amount || m.amount || '')); render(); break;
+    case 'allin': stopTurnTimer(); log('betting', pName(m.playerid) + ' ALL IN ' + (m.bet_amount || m.amount || '')); render(); break;
+  }
+}
+
+function handleFinalInfo(m) {
+  stopTurnTimer();
+  log('showdown', '═══ SHOWDOWN ═══');
+  const cards = m.showInfo?.allHoleCardsInfo || {};
+  const board = m.showInfo?.boardCardInfo || [];
+  const hNames = m.handNames || {};
+  for (const [seatStr, h] of Object.entries(cards)) {
+    const s = Number(seatStr);
+    if (h && h[0]) {
+      const hn = hNames[s] ? ' — ' + hNames[s] : '';
+      log('showdown', pName(s) + ': ' + h.join(' ') + hn);
+    }
+  }
+
+  winnerSeats = m.winners || [];
+  winAmount = m.win_amount || 0;
+
+  // Show winner banner with hand name
+  const banner = document.getElementById('winner-banner');
+  if (winnerSeats.length > 0 && st && st.players) {
+    const names = winnerSeats.map(s => st.players[s] ? (st.players[s].id || 'Seat '+(s+1)) : 'Seat '+(s+1));
+    const winHand = winnerSeats.map(s => hNames[s]).filter(Boolean).join(', ');
+    banner.querySelector('.wb-title').textContent = names.join(' & ') + ' wins!';
+    banner.querySelector('.wb-detail').textContent = (winHand ? winHand + ' — ' : '') + '+' + winAmount + ' chips';
+    banner.style.display = 'block';
+  }
+
+  winnerSeats.forEach(w => {
+    const hn = hNames[w] ? ' with ' + hNames[w] : '';
+    log('showdown', '★ ' + pName(w) + ' WINS ' + winAmount + hn);
+  });
+  if (board.length) renderBoard(board);
+  render();
+
+  // Reset after delay
+  setTimeout(() => {
+    myCards = [];
+    winnerSeats = [];
+    winAmount = 0;
+    chipsBefore = {};
+    banner.style.display = 'none';
+    renderBoard([]);
+    render();
+  }, 5000);
+}
+
+// ══════════════════════════════════════
+// RENDER
+// ══════════════════════════════════════
+function renderBoard(cards) {
+  const el = document.getElementById('board');
+  el.innerHTML = '';
+  for (let i = 0; i < 5; i++) {
+    const div = document.createElement('div');
+    div.className = 'board-card' + (cards[i] ? ' dealt' : '');
+    if (cards[i]) div.innerHTML = cardHTML(cards[i], 50, 70);
+    el.appendChild(div);
+  }
+}
+
+function render() {
+  if (!st || !st.players) return;
+  const felt = document.getElementById('felt');
+  const np = st.players.filter(p => !p.empty).length;
+  const positions = getPositions(np, seat >= 0 ? seat : 0);
+  const cx = 50, cy = 45;
+
+  // Clear old seats/markers
+  felt.querySelectorAll('.seat,.bet-marker,.dealer-btn').forEach(e => e.remove());
+
+  // Pot
+  document.getElementById('pot-display').textContent = st.pot > 0 ? 'Pot: ' + st.pot : '';
+  document.getElementById('hand-info').textContent = st.phase || '';
+
+  // Players
+  let pIdx = 0;
+  for (const p of st.players) {
+    if (p.empty) continue;
+    const pos = positions[pIdx] || { x: 50, y: 50 };
+    const isMe = p.seat === seat;
+    const isActive = st.currentTurn === p.seat;
+    const isWinner = winnerSeats.includes(p.seat);
+
+    // Seat box
+    const el = document.createElement('div');
+    el.className = 'seat' + (isActive ? ' active' : '') + (p.playing === 0 ? ' folded' : '') + (isMe ? ' me' : '') + (isWinner ? ' winner' : '');
+    el.style.left = pos.x + '%';
+    el.style.top = pos.y + '%';
+
+    let cardsHtml = '';
+    if (isMe && myCards.length > 0) {
+      // Show my own cards at my seat position
+      for (const c of myCards) {
+        cardsHtml += '<div class="seat-card">' + cardHTML(c) + '</div>';
+      }
+    } else if (!isMe && p.holeCardNames) {
+      for (const c of p.holeCardNames) {
+        if (c === '??' || !c) {
+          cardsHtml += '<div class="seat-card card-back"></div>';
+        } else {
+          cardsHtml += '<div class="seat-card">' + cardHTML(c) + '</div>';
+        }
+      }
+    }
+
+    // Chip delta (show after showdown)
+    let deltaHtml = '';
+    if (winnerSeats.length > 0 && chipsBefore[p.seat] !== undefined) {
+      const delta = p.chips - chipsBefore[p.seat];
+      if (delta > 0) deltaHtml = '<div class="seat-delta win">+' + delta + '</div>';
+      else if (delta < 0) deltaHtml = '<div class="seat-delta lose">' + delta + '</div>';
+    }
+
+    el.innerHTML =
+      '<div class="seat-label">' +
+        '<div class="seat-name">' + (p.id || p.name || 'Seat ' + (p.seat+1)) + '</div>' +
+        '<div class="seat-chips">' + (p.chips !== undefined ? p.chips : '') + '</div>' +
+        deltaHtml +
+      '</div>' +
+      (cardsHtml ? '<div class="seat-cards">' + cardsHtml + '</div>' : '');
+    felt.appendChild(el);
+
+    // Bet chip
+    if (p.bet > 0) {
+      const bx = pos.x + (cx - pos.x) * 0.35;
+      const by = pos.y + (cy - pos.y) * 0.35;
+      const bet = document.createElement('div');
+      bet.className = 'bet-marker';
+      bet.style.left = bx + '%';
+      bet.style.top = by + '%';
+      bet.innerHTML = '<div class="bet-chip">' + p.bet + '</div>';
+      felt.appendChild(bet);
+    }
+
+    // Position markers (D, SB, BB) — placed between player and center, offset to avoid overlap
+    function placeMarker(label, cssClass, offsetAngle) {
+      const dist = 0.28;
+      const mx = pos.x + (cx - pos.x) * dist + offsetAngle;
+      const my = pos.y + (cy - pos.y) * dist;
+      const mk = document.createElement('div');
+      mk.className = 'dealer-btn';
+      mk.style.left = mx + '%';
+      mk.style.top = my + '%';
+      mk.innerHTML = '<div class="' + cssClass + '">' + label + '</div>';
+      felt.appendChild(mk);
+    }
+
+    if (p.seat === st.dealerSeat) placeMarker('D', 'dealer-btn-label', 0);
+    if (p.seat === st.sbSeat && st.sbSeat >= 0) placeMarker('SB', 'sb-label', 3);
+    if (p.seat === st.bbSeat && st.bbSeat >= 0) placeMarker('BB', 'bb-label', 6);
+
+    pIdx++;
+  }
+
+  // Cards now shown at seat on the felt — clear bottom bar cards
+  document.getElementById('my-cards').innerHTML = '';
+
+  // My chips
+  const me = st.players.find(p => p.seat === seat);
+  document.getElementById('my-chips').textContent = me ? me.chips + ' chips' : '';
+
+  // Controls
+  renderControls();
+}
+
+function renderControls() {
+  const el = document.getElementById('controls');
+  if (!st) return;
+
+  // Don't overwrite reload button when busted
+  const me = st.players ? st.players.find(p => p.seat === seat) : null;
+  if (me && me.chips <= 0 && el.innerHTML.includes('Reload')) return;
+
+  const va = st.validActions || [];
+  const isMyTurn = st.currentTurn === seat && va.length > 0;
+
+  if (isMyTurn) {
+    let html = '';
+    if (va.includes('fold')) html += '<button class="btn-fold" onclick="act(\'fold\')">Fold</button>';
+    if (va.includes('check')) html += '<button class="btn-check" onclick="act(\'check\')">Check</button>';
+    const me = st.players ? st.players.find(p => p.seat === seat) : null;
+    const myChips = me ? me.chips : Infinity;
+    const callAmt = Math.min(st.toCall || 0, myChips);
+    if (va.includes('call')) html += '<button class="btn-call" onclick="act(\'call\')">Call ' + (callAmt || '') + '</button>';
+    if (va.includes('raise')) {
+      const label = (st.toCall || 0) > 0 ? 'Raise' : 'Bet';
+      html += '<input id="raise-input" type="number" step="1" value="' + (st.minRaise || 2) + '">';
+      html += '<button class="btn-raise" onclick="doRaise()">' + label + '</button>';
+    }
+    if (va.includes('allin')) html += '<button class="btn-allin" onclick="act(\'allin\')">All In</button>';
+    el.innerHTML = html;
+  } else if (st.phase === 'showdown' || st.phase === 'settled') {
+    el.innerHTML = '<span class="wait-text">Next hand starting...</span>';
+  } else if (st.currentTurn >= 0 && st.players && st.players[st.currentTurn]) {
+    el.innerHTML = '<span class="wait-text">Waiting for ' + (st.players[st.currentTurn].id || 'player') + '...</span>';
+  } else {
+    const seated = st.players ? st.players.filter(p => !p.empty).length : 0;
+    el.innerHTML = '<span class="wait-text">Waiting for players (' + seated + '/' + EXPECTED + ')...</span>';
+  }
+}
+
+function act(action) {
+  ws.send(JSON.stringify({ action }));
+  st.validActions = [];
+  stopTurnTimer();
+  renderControls();
+}
+
+function doRaise() {
+  const input = document.getElementById('raise-input');
+  ws.send(JSON.stringify({ action: 'raise', amount: parseFloat(input.value) }));
+  st.validActions = [];
+  renderControls();
+}
+
+function doReload() {
+  ws.send(JSON.stringify({ action: 'reload' }));
+}
+
+function log(type, msg) {
+  const el = document.getElementById('comms');
+  const div = document.createElement('div');
+  div.className = 'c-' + (type || 'system');
+  const time = new Date().toTimeString().substring(0, 8);
+  div.innerHTML = '<span class="c-time">' + time + '</span>' + msg;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+
+// Init
+renderBoard([]);
+connect();
+</script>
+</body>
+</html>
