@@ -10,7 +10,7 @@
 import { createClient, VDXF_KEYS, gameKey, playerDeckKey } from './verus-rpc.mjs';
 
 const POLL_INTERVAL = 1500;
-const WRITE_GAP = 1500; // Min ms between writes to same identity
+const WRITE_GAP = 3000; // Min ms between writes to same identity (UTXO must confirm)
 
 /**
  * Serialize BigInt values for on-chain storage
@@ -39,13 +39,28 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     const idName = identityId.replace('.CHIPS@', '');
     const now = Date.now();
     const last = lastWrite.get(idName) || 0;
-    if (now - last < WRITE_GAP) {
-      await new Promise(r => setTimeout(r, WRITE_GAP - (now - last)));
+    const gap = now - last;
+    if (gap < WRITE_GAP) {
+      const wait = WRITE_GAP - gap;
+      console.log('[P2P] Waiting ' + (wait/1000).toFixed(1) + 's for ' + idName + ' UTXO...');
+      await new Promise(r => setTimeout(r, wait));
     }
     const serialized = serialize(data);
-    const result = await client.writeToIdentity(idName, vdxfKey, serialized);
-    lastWrite.set(idName, Date.now());
-    return result;
+    try {
+      const result = await client.writeToIdentity(idName, vdxfKey, serialized);
+      lastWrite.set(idName, Date.now());
+      return result;
+    } catch (e) {
+      if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
+        // UTXO conflict — wait longer and retry once
+        console.log('[P2P] UTXO conflict on ' + idName + ' — waiting 10s and retrying...');
+        await new Promise(r => setTimeout(r, 10000));
+        const result = await client.writeToIdentity(idName, vdxfKey, serialized);
+        lastWrite.set(idName, Date.now());
+        return result;
+      }
+      throw e;
+    }
   }
 
   // Cache VDXF ID lookups

@@ -8,16 +8,24 @@
 
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, createReadStream, statSync } from 'fs';
 import { join, extname, resolve } from 'path';
 import { playerInit, dealerShuffle, cashierShuffle, decodeCard, verifyGame } from './protocol.mjs';
 import { createEngine } from './poker-engine.mjs';
 import { evaluateHand, cardToString } from './hand-eval.mjs';
 import { FOLD, CHECK, CALL, RAISE, ALL_IN, SHOWDOWN, SETTLED } from './game.mjs';
 import { createChainLayer } from './chain-layer.mjs';
+import { createP2PLayer } from './p2p-layer.mjs';
+import { createP2PDealer } from './p2p-dealer.mjs';
+import { createClient } from './verus-rpc.mjs';
 
-const PORT = 3000;
+const PORT = parseInt(process.argv.find(a => a.startsWith('--port='))?.split('=')[1] || '3000');
 const USE_CHAIN = process.argv.includes('--chain');
+const USE_LOCAL = process.argv.includes('--local');
+const LOCAL_ROLE = process.argv.find(a => a.startsWith('--role='))?.split('=')[1] || 'dealer';
+const LOCAL_ID = process.argv.find(a => a.startsWith('--id='))?.split('=')[1] || 'poker-p1';
+const TABLE_ID = process.argv.find(a => a.startsWith('--table='))?.split('=')[1] || 'poker-table';
+let LOCAL_PLAYERS = (process.argv.find(a => a.startsWith('--players='))?.split('=')[1] || '').split(',').filter(Boolean);
 const STATIC_DIR = '/root/pangea-poker/dist';
 const MAX_PLAYERS = 9;
 const MIN_PLAYERS = 2;      // Start hand when this many are seated
@@ -450,8 +458,71 @@ function handleMessage(ws, raw) {
 const server = createServer((req, res) => {
   let url = new URL(req.url, 'http://localhost').pathname;
 
+  // In local P2P mode, redirect to /play with the correct player name
+  if (USE_LOCAL && (url === '/' || url === '/multi')) {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    if (!params.has('name')) {
+      res.writeHead(302, { 'Location': '/play?name=' + LOCAL_ID });
+      res.end();
+      return;
+    }
+    url = '/play';
+  }
+
+  // API: table info for lobby screen
+  if (url === '/api/table') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+
+    res.end(JSON.stringify({
+      table: TABLE_ID,
+      player: LOCAL_ID,
+      role: LOCAL_ROLE,
+      config: CONFIG,
+      buyin: 0.5,
+      dealer: USE_LOCAL ? (LOCAL_ROLE === 'dealer' ? LOCAL_ID : (LOCAL_PLAYERS[0] || 'unknown')) : 'server',
+      cashiers: ['poker-cn1', 'poker-cn2'],
+      multisig: 'bGWPJETwDveHzZxrtLepJHwD2hMg1qtaB8',
+      mode: USE_LOCAL ? 'p2p' : (USE_CHAIN ? 'chain' : 'virtual'),
+      session: p2pDealer ? p2pDealer.getGameId() : null
+    }));
+    return;
+  }
+
+  // API: deposit to multisig
+  if (url === '/api/deposit') {
+    if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', async () => {
+      try {
+        const { amount } = JSON.parse(body);
+        if (!RPC_CONFIG) throw new Error('No RPC config — CHIPS daemon not found');
+        const c = createClient(RPC_CONFIG);
+
+        // Get player address
+        const id = await c.getIdentity(LOCAL_ID + '.CHIPS@');
+        const addr = id.identity.primaryaddresses[0];
+
+        // Send to multisig
+        const multisig = 'bGWPJETwDveHzZxrtLepJHwD2hMg1qtaB8';
+        console.log('[DEPOSIT] ' + LOCAL_ID + ' sending ' + amount + ' CHIPS to multisig...');
+        const opid = await c.sendCurrency(addr, [{ address: multisig, amount }]);
+        const result = await c.waitForOperation(opid, 60000);
+        console.log('[DEPOSIT] TX: ' + result.txid);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, txid: result.txid }));
+      } catch (e) {
+        console.log('[DEPOSIT] Error: ' + e.message);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
   // Multi-view page — ?players=N (2-9, default 4)
-  if (url === '/multi' || url === '/') {
+  if (url === '/multi' || (url === '/' && !USE_LOCAL)) {
     const params = new URL(req.url, 'http://localhost').searchParams;
     const numPlayers = Math.min(9, Math.max(2, parseInt(params.get('players')) || 4));
     const allNames = ['Alice','Bob','Charlie','Dave','Eve','Frank','Grace','Heidi','Ivan'];
@@ -517,6 +588,22 @@ names.forEach((n,i)=>{
     return;
   }
 
+  // Bootstrap file — stream instead of readFileSync (too large for memory)
+  if (url === '/chips-bootstrap.tar.gz') {
+    const bsPath = '/root/chips-bootstrap.tar.gz';
+    if (existsSync(bsPath)) {
+      const stat = statSync(bsPath);
+      res.writeHead(200, {
+        'Content-Type': 'application/gzip',
+        'Content-Length': stat.size,
+        'Content-Disposition': 'attachment; filename="chips-bootstrap.tar.gz"'
+      });
+      createReadStream(bsPath).pipe(res);
+      return;
+    }
+    res.writeHead(404); res.end('Bootstrap not found'); return;
+  }
+
   // Static files — check pangea dist first, then local public/
   // Path traversal protection: resolve and verify path stays within allowed dirs
   const pangeaBase = resolve(STATIC_DIR);
@@ -575,7 +662,7 @@ wss.on('connection', (ws, req) => {
     clients.delete(ws);
     rateLimits.delete(ws);
     const seated = [...clients.values()].filter(c => c.seat !== undefined);
-    if (seated.length === 0) {
+    if (seated.length === 0 && !USE_LOCAL) {
       engine = null; handInProgress = false; pendingAction = null;
       if (startTimer) { clearTimeout(startTimer); startTimer = null; }
       serverDealerIdx = 0;
@@ -593,7 +680,7 @@ wss.on('connection', (ws, req) => {
 });
 
 // Initialize chain layer if --chain flag is set
-const chain = USE_CHAIN ? createChainLayer() : null;
+const chain = (USE_CHAIN && !USE_LOCAL) ? createChainLayer() : null;
 if (chain) {
   chain.init().then(ok => {
     if (ok) console.log('[CHAIN] On-chain mode enabled — deposits and settlement via CHIPS blockchain');
@@ -601,7 +688,387 @@ if (chain) {
   });
 }
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('Verus Poker at http://localhost:' + PORT);
-  console.log('Mode: ' + (USE_CHAIN ? 'ON-CHAIN (--chain)' : 'VIRTUAL (add --chain for real CHIPS)'));
-});
+// ════════════════════════════════════════
+// LOCAL P2P MODE (--local)
+// All game state via VerusID contentmultimap
+// ════════════════════════════════════════
+// Auto-detect CHIPS RPC config from local conf file
+function findRPCConfig() {
+  const paths = [
+    join(process.env.HOME || '', '.komodo/CHIPS/CHIPS.conf'),
+    join(process.env.HOME || '', '.verus/pbaas/f315367528394674d45277e369629605a1c3ce9f/f315367528394674d45277e369629605a1c3ce9f.conf'),
+  ];
+  for (const p of paths) {
+    if (existsSync(p)) {
+      const conf = readFileSync(p, 'utf8');
+      const get = key => (conf.match(new RegExp('^' + key + '=(.+)$', 'm')) || [])[1];
+      if (get('rpcuser') && get('rpcpassword')) {
+        return { host: get('rpchost') || '127.0.0.1', port: parseInt(get('rpcport') || '22778'), user: get('rpcuser'), pass: get('rpcpassword') };
+      }
+    }
+  }
+  return null;
+}
+const RPC_CONFIG = findRPCConfig();
+
+let p2pDealer = null;
+let p2pActionResolver = null; // Resolves when browser player acts
+
+if (USE_LOCAL) {
+  if (!RPC_CONFIG) { console.error('ERROR: CHIPS daemon config not found'); process.exit(1); }
+  const p2p = createP2PLayer(RPC_CONFIG, LOCAL_ID, TABLE_ID);
+
+  const KEYS = {
+    TABLE_CONFIG:  'chips.vrsc::poker.sg777z.t_table_info',
+    BETTING_STATE: 'chips.vrsc::poker.sg777z.t_betting_state',
+    BOARD_CARDS:   'chips.vrsc::poker.sg777z.t_board_cards',
+    CARD_BV:       'chips.vrsc::poker.sg777z.card_bv',
+    JOIN_REQUEST:  'chips.vrsc::poker.sg777z.p_join_request',
+    PLAYER_ACTION: 'chips.vrsc::poker.sg777z.p_betting_action',
+    SETTLEMENT:    'chips.vrsc::poker.sg777z.t_settlement_info',
+  };
+
+  let playerActed = false; // Shared flag — set when player submits action
+
+  // ── Shared: send seats state to browser ──
+  function p2pSendSeats(playerList, opts) {
+    const seats = playerList.map(p => ({
+      id: p.id, name: p.id, seat: p.seat,
+      playing: p.folded ? 0 : 1, empty: false,
+      chips: Math.round(p.chips || 0), bet: p.bet || 0,
+      folded: !!p.folded, allIn: !!p.allIn,
+      holeCards: p.holeCards || (p.id === LOCAL_ID ? [] : ['??', '??']),
+      holeCardNames: p.holeCards || (p.id === LOCAL_ID ? [] : ['??', '??'])
+    }));
+    const usedSeats = new Set(seats.map(s => s.seat));
+    for (let s = seats.length; s < 9; s++) {
+      if (!usedSeats.has(s)) seats.push({ id: '', name: '', seat: s, playing: 0, empty: true, chips: 0 });
+    }
+    seats.sort((a, b) => a.seat - b.seat);
+    const isShowdown = opts.phase === 'showdown' || opts.phase === 'settled';
+    for (const [ws, info] of clients) {
+      if (ws.readyState !== 1) continue;
+      const personalSeats = seats.map(s => {
+        if (s.empty || s.id === (info ? info.id : '') || isShowdown) return s;
+        return { ...s, holeCards: s.holeCards?.length > 0 ? ['??','??'] : [], holeCardNames: s.holeCardNames?.length > 0 ? ['??','??'] : [] };
+      });
+      sendTo(ws, {
+        method: 'seats', seats: personalSeats,
+        dealerSeat: opts.dealerSeat || 0, sbSeat: opts.sbSeat ?? 0, bbSeat: opts.bbSeat ?? 1,
+        phase: opts.phase || 'waiting', pot: opts.pot || 0,
+        currentTurn: opts.currentTurn ?? -1, handCount: opts.handCount || 0
+      });
+    }
+  }
+
+  // ── Shared: handleMessage override ──
+  const origHandleMessage = handleMessage;
+  handleMessage = function(ws, raw) {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    const method = msg.method || msg.action;
+
+    if (method === 'fold' || method === 'check' || method === 'call' || method === 'raise' || method === 'allin') {
+      if (LOCAL_ROLE === 'dealer' && p2pActionResolver) {
+        const resolver = p2pActionResolver;
+        p2pActionResolver = null;
+        resolver({ action: method, amount: msg.amount || 0 });
+      } else if (LOCAL_ROLE === 'player') {
+        playerActed = true;
+        const actionData = { action: method, amount: msg.amount || 0, player: LOCAL_ID, timestamp: Date.now() };
+        console.log('[P2P] Writing action: ' + method);
+        p2p.write(LOCAL_ID, KEYS.PLAYER_ACTION, actionData)
+          .then(() => console.log('[P2P] Action written'))
+          .catch(e => console.log('[P2P] Action write failed: ' + e.message));
+      }
+      const info = clients.get(ws);
+      broadcast({ method: 'betting', action: method, playerid: info ? info.seat : 0, bet_amount: msg.amount || 0 });
+      return;
+    }
+
+    if (method === 'join') {
+      clients.set(ws, { id: LOCAL_ID, seat: 0, chips: 200 });
+      sendTo(ws, { method: 'backend_status', backend_status: 1 });
+      sendTo(ws, { method: 'info', playerid: 0, seat_taken: false });
+      console.log('[P2P] Browser connected: ' + LOCAL_ID);
+      if (LOCAL_ROLE === 'player') {
+        p2p.write(LOCAL_ID, KEYS.JOIN_REQUEST, { table: TABLE_ID, player: LOCAL_ID, ready: true, timestamp: Date.now() })
+          .then(() => console.log('[P2P] Join signal written'))
+          .catch(e => console.log('[P2P] Join signal failed: ' + e.message));
+      }
+      return;
+    }
+
+    origHandleMessage(ws, raw);
+  };
+
+  // ══════════════════════════════════════
+  // DEALER MODE
+  // ══════════════════════════════════════
+  const dealerStart = Date.now();
+  function dt() { return ((Date.now() - dealerStart) / 1000).toFixed(1) + 's'; }
+  function dLog(type, msg) { broadcast({ method: 'comm', type, msg: '[' + dt() + '] ' + msg }); }
+
+  function p2pNotify(event, data) {
+    if (event === 'shuffle_start') {
+      dLog('system', 'Shuffling deck on-chain (hand #' + data.hand + ')...');
+      const pl = p2pDealer.getPlayers();
+      p2pSendSeats(pl.map(p => ({ ...p, bet: 0, folded: false, allIn: false, holeCards: [] })),
+        { phase: 'shuffling', handCount: p2pDealer.getHandCount() });
+    }
+    if (event === 'cards_dealt') {
+      dLog('cards', 'Cards dealt');
+      const myCards = data.holeCards[LOCAL_ID];
+      if (myCards) {
+        dLog('cards', 'Your cards: ' + myCards.map(c => typeof c === 'number' ? cardToString(c) : c).join(' '));
+        for (const [ws2] of clients) sendTo(ws2, { method: 'deal', deal: { holecards: myCards.map(c => typeof c === 'number' ? cardToString(c) : c) } });
+      }
+      const pl = p2pDealer.getPlayers();
+      p2pSendSeats(pl.map(p => ({ ...p, bet: 0, folded: false, allIn: false,
+        holeCards: p.id === LOCAL_ID ? (myCards || []).map(c => typeof c === 'number' ? cardToString(c) : c) : ['??', '??']
+      })), { phase: 'preflop', handCount: p2pDealer.getHandCount() });
+    }
+    if (event === 'action') {
+      const seat = p2pDealer.getPlayers().findIndex(p => p.id === data.player);
+      dLog('betting', data.player + ' ' + data.action + (data.amount ? ' ' + data.amount : ''));
+      broadcast({ method: 'betting', action: data.action, playerid: seat, bet_amount: data.amount || 0 });
+    }
+    if (event === 'community_cards') {
+      const board = (data.board || []).map(c => typeof c === 'number' ? cardToString(c) : c);
+      dLog('cards', (data.phase || 'Board') + ': ' + board.join(' '));
+      broadcast({ method: 'deal', deal: { board } });
+    }
+    if (event === 'need_action') {
+      if (data.playerId === LOCAL_ID) {
+        p2pActionResolver = data.resolve;
+        const mySeat = p2pDealer.getPlayers().findIndex(p => p.id === LOCAL_ID);
+        const poss = data.validActions.map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined);
+        broadcast({ method: 'betting', action: 'round_betting', playerid: mySeat, turnPlayer: LOCAL_ID,
+          pot: data.pot || 0, toCall: data.toCall || 0, minRaiseTo: data.minRaise || 2,
+          turnTimeout: 30, turnStart: Date.now(), possibilities: poss });
+      } else {
+        // Remote player: write betting state to chain, poll for action
+        (async () => {
+          console.log('[P2P] Waiting for ' + data.playerId + ' on-chain...');
+          try {
+            await p2p.write(TABLE_ID, KEYS.BETTING_STATE, {
+              turn: data.playerId, validActions: data.validActions, toCall: data.toCall, pot: data.pot, minRaise: data.minRaise,
+              session: p2pDealer.getGameId(), hand: p2pDealer.getHandCount()
+            });
+          } catch (e) { console.log('[P2P] Write betting state error: ' + e.message); }
+          // Show waiting in dealer's browser
+          const remoteSeat = p2pDealer.getPlayers().findIndex(p => p.id === data.playerId);
+          broadcast({ method: 'betting', action: 'round_betting', playerid: remoteSeat, turnPlayer: data.playerId,
+            pot: data.pot || 0, toCall: 0, minRaiseTo: 0, turnTimeout: 30, possibilities: [] });
+          // Poll player's ID for action
+          const lastAction = await p2p.read(data.playerId, KEYS.PLAYER_ACTION);
+          const response = await p2p.poll(data.playerId, KEYS.PLAYER_ACTION, lastAction, 60000);
+          if (response) {
+            console.log('[P2P] ' + data.playerId + ': ' + response.action);
+            data.resolve({ action: response.action, amount: response.amount || 0 });
+          } else {
+            console.log('[P2P] ' + data.playerId + ' timed out');
+            data.resolve(null);
+          }
+        })();
+      }
+    }
+    if (event === 'showdown') {
+      broadcast({ method: 'finalInfo', winners: data.winners, win_amount: data.winAmount, handNames: data.handNames,
+        showInfo: { allHoleCardsInfo: data.allHoleCards, boardCardInfo: data.board } });
+    }
+    if (event === 'hand_complete') {
+      console.log('[P2P] Hand ' + data.hand + ': verified=' + data.verified);
+      data.players.forEach(p => console.log('  ' + p.id + ': ' + p.chips));
+      for (const [, info] of clients) { const pp = data.players.find(p => p.id === info.id); if (pp) info.chips = pp.chips; }
+      broadcast({ method: 'verification', hand: data.hand, valid: data.verified, errors: [] });
+      setTimeout(async () => {
+        if (p2pDealer && p2pDealer.getPlayers().filter(p => p.chips > 0).length >= 2) {
+          try { await p2pDealer.runHand(); } catch (e) { console.log('[P2P] Hand error: ' + e.message); }
+        }
+      }, 5000);
+    }
+  }
+
+  // ══════════════════════════════════════
+  // Start server
+  // ══════════════════════════════════════
+  server.listen(PORT, '0.0.0.0', async () => {
+    console.log('Verus Poker at http://localhost:' + PORT);
+    console.log('Mode: P2P ON-CHAIN (--local)');
+    console.log('Role: ' + LOCAL_ROLE + ' | ID: ' + LOCAL_ID + ' | Table: ' + TABLE_ID);
+    try { const info = await p2p.client.getInfo(); console.log('Chain: ' + info.name + ' Block: ' + info.blocks); } catch (e) { console.log('WARNING: ' + e.message); }
+
+    // ── DEALER STARTUP ──
+    if (LOCAL_ROLE === 'dealer') {
+      p2pDealer = createP2PDealer(p2p, CONFIG, p2pNotify);
+      await p2pDealer.openTable();
+      p2pDealer.addSelf(200);
+      const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p2'];
+      for (const pid of otherIds) p2pDealer.addPlayer(pid, 200);
+
+      console.log('[P2P] Waiting for all players...');
+      const waitLoop = async () => {
+        while (true) {
+          let allReady = [...clients.values()].some(c => c.id === LOCAL_ID);
+          for (const pid of otherIds) {
+            const req = await p2p.read(pid, KEYS.JOIN_REQUEST);
+            // Only accept join requests from the last 5 minutes
+            const isRecent = req && req.timestamp && (Date.now() - req.timestamp) < 300000;
+            if (!req || req.table !== TABLE_ID || !isRecent) { allReady = false; break; }
+          }
+          if (allReady) {
+            console.log('[P2P] All ready! Starting in 5s...');
+            await new Promise(r => setTimeout(r, 5000));
+            try { await p2pDealer.runHand(); } catch (e) { console.log('[P2P] Hand error: ' + e.message); }
+            return;
+          }
+          await new Promise(r => setTimeout(r, 3000));
+        }
+      };
+      waitLoop();
+    }
+
+    // ── PLAYER STARTUP ──
+    if (LOCAL_ROLE === 'player') {
+      // Auto-detect dealer from table config if --players not specified
+      if (LOCAL_PLAYERS.length === 0) {
+        try {
+          const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+          if (tc && tc.dealer) { LOCAL_PLAYERS.push(tc.dealer); console.log('[P2P] Dealer from table config: ' + tc.dealer); }
+        } catch (e) {}
+        if (LOCAL_PLAYERS.length === 0) LOCAL_PLAYERS.push('poker-p1');
+      }
+      console.log('[P2P] Player mode — polling chain...');
+      let lastBS = null, lastBCPhase = '', lastST = null;
+      let currentSession = null, currentHand = 0, myCards = null;
+      const pollStart = Date.now();
+      function pt() { return ((Date.now() - pollStart) / 1000).toFixed(1) + 's'; }
+
+      // Send a comms log message to the browser
+      function pLog(type, msg) {
+        broadcast({ method: 'comm', type, msg: '[' + pt() + '] ' + msg });
+      }
+
+      function buildPlayers(chips) {
+        const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p1'];
+        const list = [{ id: LOCAL_ID, seat: 0, chips: chips?.[LOCAL_ID] || 200, holeCards: myCards || [] }];
+        otherIds.forEach((pid, i) => list.push({ id: pid, seat: i + 1, chips: chips?.[pid] || 200, holeCards: ['??','??'] }));
+        return list;
+      }
+
+      const pollLoop = async () => {
+        pLog('system', 'Polling chain for game state...');
+        while (true) {
+          try {
+            // 0. Read table config to get current session ID
+            if (!currentSession) {
+              const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+              if (tc && tc.session) {
+                currentSession = tc.session;
+                pLog('system', 'Session: ' + currentSession);
+              }
+            }
+
+            // 1. Card reveals — only process if session matches
+            const cr = await p2p.read(TABLE_ID, KEYS.CARD_BV + '.' + LOCAL_ID);
+            if (cr && cr.cards && cr.session === currentSession && (cr.hand || 0) > currentHand) {
+              currentHand = cr.hand;
+              myCards = cr.cards;
+              playerActed = false;
+              lastBS = null;
+              lastBCPhase = '';
+              lastST = null;
+              console.log('[P2P] ' + pt() + ' Hand ' + currentHand + ' cards: ' + cr.cards.join(' '));
+              pLog('cards', 'Hand #' + currentHand + ' — your cards: ' + cr.cards.join(' '));
+              for (const [ws2] of clients) sendTo(ws2, { method: 'deal', deal: { holecards: cr.cards } });
+              p2pSendSeats(buildPlayers(), { phase: 'preflop', handCount: currentHand });
+            }
+
+            // 2. Betting state — detect ALL changes (my turn AND opponent actions)
+            const bs = await p2p.read(TABLE_ID, KEYS.BETTING_STATE);
+            if (bs && bs.session === currentSession && JSON.stringify(bs) !== JSON.stringify(lastBS)) {
+              const prevBS = lastBS;
+              lastBS = bs;
+
+              // Opponent acted (turn changed, or action field present)
+              if (bs.action && bs.turn !== LOCAL_ID) {
+                console.log('[P2P] ' + pt() + ' Opponent: ' + (bs.action || 'acted'));
+                pLog('betting', (bs.turn || 'Opponent') + ' ' + (bs.action || 'acts'));
+              }
+
+              // My turn — show buttons
+              if (bs.turn === LOCAL_ID && !playerActed && bs.validActions) {
+                console.log('[P2P] ' + pt() + ' My turn! pot=' + (bs.pot||0) + ' toCall=' + (bs.toCall||0));
+                pLog('turn', 'Your turn — pot: ' + (bs.pot||0) + ', to call: ' + (bs.toCall||0));
+                const poss = (bs.validActions || []).map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined);
+                broadcast({ method: 'betting', action: 'round_betting', playerid: 0, turnPlayer: LOCAL_ID,
+                  pot: bs.pot || 0, toCall: bs.toCall || 0, minRaiseTo: bs.minRaise || 2,
+                  turnTimeout: 30, turnStart: Date.now(), possibilities: poss });
+              }
+
+              // Update seats with pot info
+              p2pSendSeats(buildPlayers(), { phase: bs.phase || 'preflop', pot: bs.pot || 0,
+                currentTurn: bs.turn === LOCAL_ID ? 0 : 1, handCount: currentHand });
+            }
+
+            // 3. Board cards
+            const bc = await p2p.read(TABLE_ID, KEYS.BOARD_CARDS);
+            if (bc && bc.board && bc.session === currentSession && bc.phase !== lastBCPhase) {
+              lastBCPhase = bc.phase;
+              console.log('[P2P] ' + pt() + ' Board (' + bc.phase + '): ' + bc.board.join(' '));
+              pLog('cards', bc.phase.charAt(0).toUpperCase() + bc.phase.slice(1) + ': ' + bc.board.join(' '));
+              broadcast({ method: 'deal', deal: { board: bc.board } });
+            }
+
+            // 4. Settlement
+            const st = await p2p.read(TABLE_ID, KEYS.SETTLEMENT);
+            if (st && st.verified !== undefined && JSON.stringify(st) !== JSON.stringify(lastST) && (st.hand || 0) >= currentHand) {
+              lastST = st;
+              console.log('[P2P] ' + pt() + ' Settlement: verified=' + st.verified);
+              pLog('showdown', '═══ SHOWDOWN ═══');
+
+              // Show results
+              if (st.results) {
+                const startChips = {};
+                buildPlayers().forEach(p => startChips[p.id] = p.chips);
+                for (const r of st.results) {
+                  const delta = r.chips - (startChips[r.id] || 200);
+                  if (delta > 0) pLog('showdown', '★ ' + r.id + ' WINS ' + delta);
+                  pLog('system', r.id + ': ' + r.chips + ' chips');
+                  for (const [, info] of clients) { if (info.id === r.id) info.chips = r.chips; }
+                }
+              }
+
+              pLog('verify', 'Verified: ' + (st.verified ? 'PASS' : 'FAIL'));
+              broadcast({ method: 'verification', hand: st.hand || 1, valid: st.verified, errors: [] });
+              // Update seats with final chips
+              const chipMap = {};
+              if (st.results) st.results.forEach(r => chipMap[r.id] = r.chips);
+              p2pSendSeats(buildPlayers(chipMap), { phase: 'settled', pot: 0, handCount: currentHand });
+
+              // Reset for next hand
+              myCards = null;
+              playerActed = false;
+            }
+          } catch (e) {}
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      };
+
+      const waitBrowser = setInterval(() => {
+        if ([...clients.values()].some(c => c.id === LOCAL_ID)) {
+          clearInterval(waitBrowser);
+          console.log('[P2P] Browser connected. Polling...');
+          pollLoop().catch(e => console.log('[P2P] Poll error: ' + e.message));
+        }
+      }, 1000);
+    }
+  });
+} else {
+  // Normal mode (WebSocket-only or --chain)
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log('Verus Poker at http://localhost:' + PORT);
+    console.log('Mode: ' + (USE_CHAIN ? 'ON-CHAIN (--chain)' : 'VIRTUAL (add --chain for real CHIPS)'));
+  });
+}

@@ -12,30 +12,38 @@ import { verifyGame } from './protocol.mjs';
 
 const WAIT = ms => new Promise(r => setTimeout(r, ms));
 
-const RPC = {
-  host: '127.0.0.1', port: 22778,
-  user: 'user918810440',
-  pass: 'passfde4eac81e50dd465529238848a8a77b32c8d17ebb4345c8ebe4150ca3aa9374d1'
-};
-
-const DEALER_ADDR = 'RDGUMRNth3VTdBvkLRCsseHa6VajCjB949';
-
-const CASHIER_NODES = [
-  { id: 'poker-cn1', addr: 'RGK7nWZX1dwJYpqmK7YnSBuExWwCoskhLu' },
-  { id: 'poker-cn2', addr: 'RCGLeG88wArw5ins9LaEmYTtiN8v2t8Pat' }
-];
-
-// Known player addresses (registered on CHIPS chain)
-const PLAYER_ADDRS = {
-  'poker-p1': 'RN2hEjcQ1EcmGGfkGD4JCDNyfT571Eqz64',
-  'poker-p2': 'RECGjSHtaiZ92s3TUtyw3F9kqevwdJ7MtB',
-  'poker-p3': 'RYZLdqYRsgPrTV7cUqTBDqBt8GJErReBG7',
-};
+// RPC config auto-detected from CHIPS conf file
+import { readFileSync, existsSync } from 'fs';
+import { join } from 'path';
+function findRPC() {
+  const paths = [
+    join(process.env.HOME || '', '.komodo/CHIPS/CHIPS.conf'),
+    join(process.env.HOME || '', '.verus/pbaas/f315367528394674d45277e369629605a1c3ce9f/f315367528394674d45277e369629605a1c3ce9f.conf'),
+  ];
+  for (const p of paths) {
+    if (existsSync(p)) {
+      const conf = readFileSync(p, 'utf8');
+      const get = key => (conf.match(new RegExp('^' + key + '=(.+)$', 'm')) || [])[1];
+      if (get('rpcuser') && get('rpcpassword')) {
+        return { host: get('rpchost') || '127.0.0.1', port: parseInt(get('rpcport') || '22778'), user: get('rpcuser'), pass: get('rpcpassword') };
+      }
+    }
+  }
+  throw new Error('CHIPS conf not found — ensure CHIPS daemon is installed');
+}
+const RPC = findRPC();
 
 const RAKE_PERCENT = 2.5;
 
 export function createChainLayer(options = {}) {
   const client = createClient(RPC);
+
+  // Resolve VerusID → primary address from chain
+  async function resolveAddr(identityName) {
+    const fullName = identityName.includes('.') ? identityName : identityName + '.CHIPS@';
+    const id = await client.getIdentity(fullName);
+    return id.identity.primaryaddresses[0];
+  }
   let escrow = null;
   let cn1 = null, cn2 = null;
   let sessionBalances = new Map(); // playerId → CHIPS balance
@@ -53,12 +61,28 @@ export function createChainLayer(options = {}) {
         console.log('[CHAIN] Chain: ' + info.name + ' Block: ' + info.blocks);
       } catch (e) {
         console.log('[CHAIN] WARNING: Cannot connect to daemon: ' + e.message);
-        console.log('[CHAIN] Running in offline mode (virtual chips only)');
+        return false;
+      }
+
+      // Resolve cashier node addresses from chain
+      const cashierIds = options.cashierNodes || ['poker-cn1', 'poker-cn2'];
+      const cashierNodes = [];
+      for (const cid of cashierIds) {
+        try {
+          const addr = await resolveAddr(cid);
+          cashierNodes.push({ id: cid, addr });
+          console.log('[CHAIN] Cashier ' + cid + ': ' + addr);
+        } catch (e) {
+          console.log('[CHAIN] Cannot resolve cashier ' + cid + ': ' + e.message);
+        }
+      }
+      if (cashierNodes.length < 2) {
+        console.log('[CHAIN] Need at least 2 cashier nodes');
         return false;
       }
 
       // Create escrow
-      escrow = createEscrow(RPC, CASHIER_NODES);
+      escrow = createEscrow(RPC, cashierNodes);
       try {
         const msig = await escrow.createMultisig();
         console.log('[CHAIN] Multisig: ' + msig.address);
@@ -68,9 +92,9 @@ export function createChainLayer(options = {}) {
       }
 
       // Init cashier nodes
-      cn1 = createCashierNode({ nodeId: 'poker-cn1', nodeAddr: CASHIER_NODES[0].addr });
-      cn2 = createCashierNode({ nodeId: 'poker-cn2', nodeAddr: CASHIER_NODES[1].addr });
-      console.log('[CHAIN] Cashier nodes ready (poker-cn1, poker-cn2)');
+      cn1 = createCashierNode({ nodeId: cashierNodes[0].id, nodeAddr: cashierNodes[0].addr });
+      cn2 = createCashierNode({ nodeId: cashierNodes[1].id, nodeAddr: cashierNodes[1].addr });
+      console.log('[CHAIN] Cashier nodes ready');
 
       ready = true;
       return true;
@@ -85,8 +109,9 @@ export function createChainLayer(options = {}) {
     async deposit(playerId, amount) {
       if (!ready) return { ok: false, error: 'Chain not initialized' };
 
-      const addr = PLAYER_ADDRS[playerId];
-      if (!addr) return { ok: false, error: 'Unknown player: ' + playerId };
+      let addr;
+      try { addr = await resolveAddr(playerId); }
+      catch (e) { return { ok: false, error: 'Cannot resolve ' + playerId + ': ' + e.message }; }
 
       const msigAddr = escrow.getAddress();
       console.log('[CHAIN] ' + playerId + ' depositing ' + amount + ' CHIPS to ' + msigAddr);
@@ -175,8 +200,9 @@ export function createChainLayer(options = {}) {
         return { ok: false, error: 'Cannot settle — ' + unverified.length + ' hands failed verification' };
       }
 
-      const addr = PLAYER_ADDRS[playerId];
-      if (!addr) return { ok: false, error: 'No address for ' + playerId };
+      let addr;
+      try { addr = await resolveAddr(playerId); }
+      catch (e) { return { ok: false, error: 'Cannot resolve ' + playerId + ': ' + e.message }; }
 
       // Calculate rake on winnings
       const deposited = escrow.getDeposit ? escrow.getDeposit(playerId)?.amount || 0 : 0;
@@ -187,12 +213,17 @@ export function createChainLayer(options = {}) {
       console.log('[CHAIN] Cash out ' + playerId + ': balance=' + balance + ' rake=' + rake.toFixed(8) + ' payout=' + payout.toFixed(8));
 
       try {
+        const dealerAddr = await resolveAddr(options.dealerId || 'poker-dealer');
+        const cashierAddrs = [];
+        for (const cid of (options.cashierNodes || ['poker-cn1', 'poker-cn2'])) {
+          cashierAddrs.push(await resolveAddr(cid));
+        }
         const result = await escrow.settle(
           [{ address: addr, amount: payout }],
           {
-            dealerAddr: DEALER_ADDR,
+            dealerAddr,
             dealerAmount: rake / 2,
-            cashierAddrs: CASHIER_NODES.map(n => n.addr),
+            cashierAddrs,
             cashierAmount: rake / 2
           }
         );
