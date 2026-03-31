@@ -9,13 +9,15 @@
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { readFileSync, existsSync } from 'fs';
-import { join, extname } from 'path';
+import { join, extname, resolve } from 'path';
 import { playerInit, dealerShuffle, cashierShuffle, decodeCard, verifyGame } from './protocol.mjs';
 import { createEngine } from './poker-engine.mjs';
 import { evaluateHand, cardToString } from './hand-eval.mjs';
 import { FOLD, CHECK, CALL, RAISE, ALL_IN, SHOWDOWN, SETTLED } from './game.mjs';
+import { createChainLayer } from './chain-layer.mjs';
 
 const PORT = 3000;
+const USE_CHAIN = process.argv.includes('--chain');
 const STATIC_DIR = '/root/pangea-poker/dist';
 const MAX_PLAYERS = 9;
 const MIN_PLAYERS = 2;      // Start hand when this many are seated
@@ -156,7 +158,7 @@ function createIO() {
           method: 'betting', action: 'round_betting',
           playerid: turnClientSeat, turnPlayer: turnPlayerId, pot: data.pot,
           toCall: data.toCall, minRaiseTo: data.minRaise,
-          turnTimeout: 15, turnStart: Date.now(),
+          turnTimeout: 30, turnStart: Date.now(),
           possibilities: data.validActions.map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined),
           player_funds: g.players.map(p => p.chips)
         });
@@ -293,21 +295,26 @@ async function runHand() {
 
   await engine.playHand(crypto);
 
-  // Post-hand verification (Algorithm 4) — replay all shuffle stages
-  const verification = verifyGame(playerData, dealerData, cashierData, numCards);
-  if (verification.valid) {
-    console.log('[VERIFY] Hand ' + handCount + ' VERIFIED — all shuffle stages match');
+  // Post-hand verification — use chain layer if available, else local
+  let verification;
+  if (chain && chain.isReady()) {
+    verification = await chain.verifyHand(handCount, playerData, dealerData, cashierData, numCards);
   } else {
-    console.log('[VERIFY] Hand ' + handCount + ' FAILED: ' + verification.errors.join(', '));
+    verification = verifyGame(playerData, dealerData, cashierData, numCards);
+    if (verification.valid) console.log('[VERIFY] Hand ' + handCount + ' VERIFIED');
+    else console.log('[VERIFY] Hand ' + handCount + ' FAILED: ' + verification.errors.join(', '));
   }
-  broadcast({ method: 'verification', hand: handCount, valid: verification.valid, errors: verification.errors });
+  broadcast({ method: 'verification', hand: handCount, valid: verification.valid, errors: verification.errors || [] });
 
-  // Update client chips
+  // Update client chips + chain balances
+  const chipUpdate = {};
   for (const p of engine.game.players) {
+    chipUpdate[p.id] = p.chips;
     for (const [, info] of clients) {
       if (info.id === p.id) info.chips = p.chips;
     }
   }
+  if (chain && chain.isReady()) chain.updateBalances(chipUpdate);
 
   // Advance dealer for next hand
   serverDealerIdx++;
@@ -343,16 +350,34 @@ function handleMessage(ws, raw) {
 
   switch (method) {
     case 'join': {
-      const id = msg.name || 'Player-' + (clients.size + 1);
+      // Sanitize name: alphanumeric + dash/underscore only, max 20 chars
+      const rawName = String(msg.name || 'Player-' + (clients.size + 1));
+      const id = rawName.replace(/[^a-zA-Z0-9_\-]/g, '').substring(0, 20) || 'Player';
       const seated = [...clients.values()].filter(c => c.seat !== undefined);
-      if (seated.length >= MAX_PLAYERS) return;
-      if (seated.find(c => c.id === id)) return;
-      // Find first unused seat number
-      const usedSeats = new Set(seated.map(c => c.seat));
-      let seat = 0;
-      while (usedSeats.has(seat)) seat++;
-      const waitForNext = handInProgress;
-      clients.set(ws, { id, seat, chips: 200, waitingForNext: waitForNext });
+
+      // If same name reconnects, take over the old seat + chips
+      const existing = seated.find(c => c.id === id);
+      let seat, chips, sittingOut = false;
+      if (existing) {
+        // Reconnect: close old WS, inherit state
+        for (const [oldWs, oldInfo] of clients) {
+          if (oldInfo.id === id && oldWs !== ws) {
+            clients.delete(oldWs);
+            try { oldWs.close(); } catch(e) {}
+          }
+        }
+        seat = existing.seat;
+        chips = existing.chips || 0;
+        sittingOut = existing.sittingOut || false;
+      } else {
+        if (seated.length >= MAX_PLAYERS) return;
+        const usedSeats = new Set(seated.map(c => c.seat));
+        seat = 0;
+        while (usedSeats.has(seat)) seat++;
+        chips = 200;
+      }
+      const waitForNext = handInProgress && !existing;
+      clients.set(ws, { id, seat, chips, sittingOut, waitingForNext: waitForNext });
       // Pangea protocol: send backend_status, table_info, info
       sendTo(ws, { method: 'backend_status', backend_status: 1 });
       sendTo(ws, {
@@ -363,8 +388,12 @@ function handleMessage(ws, raw) {
         occupied_seats: [...clients.values()].filter(c => c.seat !== undefined).map(c => ({ seat: c.seat, player_id: c.id, stack: c.chips || 200 }))
       });
       sendTo(ws, { method: 'info', playerid: seat, seat_taken: false });
-      if (waitForNext) sendTo(ws, { method: 'waiting_next', msg: 'Seated — joining next hand' });
-      console.log('[JOIN] ' + id + ' seat ' + seat + (waitForNext ? ' (next hand)' : '') + ' (' + (seated.length + 1) + '/' + MAX_PLAYERS + ')');
+      if (sittingOut && chips <= 0) {
+        sendTo(ws, { method: 'busted' });
+      } else if (waitForNext) {
+        sendTo(ws, { method: 'waiting_next', msg: 'Seated — joining next hand' });
+      }
+      console.log('[JOIN] ' + id + ' seat ' + seat + (sittingOut ? ' (busted)' : '') + (waitForNext ? ' (next hand)' : '') + ' (' + ([...clients.values()].filter(c=>c.seat!==undefined).length) + '/' + MAX_PLAYERS + ')');
       broadcastState();
       // Start game when enough players are seated — wait longer for more to arrive
       if (seated.length + 1 >= MIN_PLAYERS && !handInProgress && !startTimer) {
@@ -489,14 +518,19 @@ names.forEach((n,i)=>{
   }
 
   // Static files — check pangea dist first, then local public/
-  const pangea = join(STATIC_DIR, url);
-  const local = join(process.cwd(), 'public', url);
-  const filePath = existsSync(pangea) ? pangea : existsSync(local) ? local : null;
+  // Path traversal protection: resolve and verify path stays within allowed dirs
+  const pangeaBase = resolve(STATIC_DIR);
+  const localBase = resolve(process.cwd(), 'public');
+  const pangeaPath = resolve(STATIC_DIR, '.' + url);
+  const localPath = resolve(process.cwd(), 'public', '.' + url);
+
+  let filePath = null;
+  if (pangeaPath.startsWith(pangeaBase + '/') && existsSync(pangeaPath)) filePath = pangeaPath;
+  else if (localPath.startsWith(localBase + '/') && existsSync(localPath)) filePath = localPath;
 
   if (filePath) {
     const ext = extname(filePath);
     const headers = { 'Content-Type': MIME[ext] || 'application/octet-stream' };
-    // Cache static assets (SVGs, PNGs, fonts, audio) for 1 hour
     if (['.svg','.png','.jpg','.ttf','.woff2','.mp3'].includes(ext)) {
       headers['Cache-Control'] = 'public, max-age=3600';
     }
@@ -504,17 +538,42 @@ names.forEach((n,i)=>{
     res.end(readFileSync(filePath));
   } else {
     res.writeHead(404);
-    res.end('Not found: ' + url);
+    res.end('Not found');
   }
 });
 
 const wss = new WebSocketServer({ server });
-wss.on('connection', ws => {
+const rateLimits = new Map(); // ws → { count, resetTime }
+
+wss.on('connection', (ws, req) => {
+  // Origin validation (allow same-origin and common dev origins)
+  const origin = req.headers.origin || '';
+  const host = req.headers.host || '';
+  if (origin && !origin.includes(host.split(':')[0]) && !origin.includes('localhost') && !origin.includes('127.0.0.1')) {
+    console.log('[SEC] Rejected origin: ' + origin);
+    ws.close(1008, 'Forbidden origin');
+    return;
+  }
+
   clients.set(ws, {});
-  ws.on('message', d => handleMessage(ws, d.toString()));
+  ws.on('message', d => {
+    // Rate limiting: max 30 messages per second
+    const now = Date.now();
+    let rl = rateLimits.get(ws);
+    if (!rl || now > rl.resetTime) { rl = { count: 0, resetTime: now + 1000 }; rateLimits.set(ws, rl); }
+    rl.count++;
+    if (rl.count > 30) { ws.close(4029, 'Rate limit exceeded'); return; }
+
+    // Message size limit (16KB)
+    const msg = d.toString();
+    if (msg.length > 16384) return;
+
+    handleMessage(ws, msg);
+  });
   ws.on('close', () => {
     const info = clients.get(ws);
     clients.delete(ws);
+    rateLimits.delete(ws);
     const seated = [...clients.values()].filter(c => c.seat !== undefined);
     if (seated.length === 0) {
       engine = null; handInProgress = false; pendingAction = null;
@@ -533,4 +592,16 @@ wss.on('connection', ws => {
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => console.log('Verus Poker at http://localhost:' + PORT));
+// Initialize chain layer if --chain flag is set
+const chain = USE_CHAIN ? createChainLayer() : null;
+if (chain) {
+  chain.init().then(ok => {
+    if (ok) console.log('[CHAIN] On-chain mode enabled — deposits and settlement via CHIPS blockchain');
+    else console.log('[CHAIN] Failed to init — running in virtual mode');
+  });
+}
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log('Verus Poker at http://localhost:' + PORT);
+  console.log('Mode: ' + (USE_CHAIN ? 'ON-CHAIN (--chain)' : 'VIRTUAL (add --chain for real CHIPS)'));
+});

@@ -197,6 +197,7 @@ export function getValidActions(game) {
  */
 export function playerAction(game, seat, action, raiseAmount = 0) {
   if (seat !== game.currentTurn) throw new Error(`Not your turn (expected ${game.currentTurn}, got ${seat})`);
+  if (typeof raiseAmount !== 'number' || raiseAmount < 0 || !isFinite(raiseAmount)) raiseAmount = 0;
 
   const p = game.players[seat];
   const toCall = getToCall(game, seat);

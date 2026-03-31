@@ -123,12 +123,19 @@ export function createClient(config = {}) {
       const hexData = Buffer.from(JSON.stringify(data)).toString('hex');
       const vdxfId = await call('getvdxfid', [vdxfKey]);
 
-      return call('updateidentity', [{
-        name: identityName,
-        contentmultimap: {
-          [vdxfId.vdxfid]: [{ [vdxfId.bounddata?.vdxfkey || 'i4GC1YGEVD21afWudGoFsCVxnRRMYotmUG']: hexData }]
-        }
-      }]);
+      // Resolve parent for PBaaS chain IDs
+      const idName = identityName.replace('.CHIPS@', '').replace('.chips@', '');
+      let parent;
+      try {
+        const fullName = identityName.includes('.') ? identityName : identityName + '.CHIPS@';
+        const idInfo = await call('getidentity', [fullName]);
+        parent = idInfo.identity?.parent;
+      } catch (e) {}
+
+      const updateParams = { name: idName, contentmultimap: { [vdxfId.vdxfid]: hexData } };
+      if (parent) updateParams.parent = parent;
+
+      return call('updateidentity', [updateParams]);
     },
 
     /**
@@ -137,8 +144,10 @@ export function createClient(config = {}) {
      */
     readFromIdentity: async (identityName, vdxfKey, fromHeight = 0) => {
       try {
+        const fullName = identityName.includes('.') ? identityName : identityName + '.CHIPS@';
+        const vdxfId = await call('getvdxfid', [vdxfKey]);
         const content = await call('getidentitycontent', [
-          identityName, fromHeight, 0, false, 0, vdxfKey
+          fullName, fromHeight, 0, false, 0, vdxfId.vdxfid
         ]);
         if (!content || !content.contentmultimap) return null;
         // Parse the first matching entry
@@ -226,36 +235,49 @@ export function createClient(config = {}) {
 // ============================================================
 // Poker-specific VDXF key conventions
 // ============================================================
+// VDXF key namespace matching the original C code (chips.vrsc::poker.sg777z.*)
+// Game ID is appended at runtime: key + '.' + gameId
 export const VDXF_KEYS = {
-  // Table listing (written by house to their ID)
-  TABLE_CONFIG: 'vrsc::poker.table.config',
-  TABLE_STATUS: 'vrsc::poker.table.status',
+  // Table ID writes (by Dealer)
+  TABLE_INFO:     'chips.vrsc::poker.sg777z.t_table_info',
+  PLAYER_INFO:    'chips.vrsc::poker.sg777z.t_player_info',
+  GAME_INFO:      'chips.vrsc::poker.sg777z.t_game_info',
+  GAME_IDS:       'chips.vrsc::poker.sg777z.t_game_ids',
+  BETTING_STATE:  'chips.vrsc::poker.sg777z.t_betting_state',
+  BOARD_CARDS:    'chips.vrsc::poker.sg777z.t_board_cards',
+  SETTLEMENT:     'chips.vrsc::poker.sg777z.t_settlement_info',
 
-  // Escrow proof
-  ESCROW_INFO: 'vrsc::poker.escrow.info',
+  // Dealer deck per player (written to Table ID by Dealer)
+  DEALER_DECK:    'chips.vrsc::poker.sg777z.t_d_deck',
+  DEALER_P_DECK:  'chips.vrsc::poker.sg777z.t_d_p',  // append player number: t_d_p1_deck, t_d_p2_deck
 
-  // Game state (written to table ID)
-  GAME_STATE: 'vrsc::poker.game.state',
-  GAME_ID: 'vrsc::poker.game.id',
+  // Cashier deck per player (written to Table ID by Cashier)
+  BLINDER_DECK:   'chips.vrsc::poker.sg777z.t_b_deck',
+  BLINDER_P_DECK: 'chips.vrsc::poker.sg777z.t_b_p',  // append player number: t_b_p1_deck, t_b_p2_deck
+  CARD_BV:        'chips.vrsc::poker.sg777z.card_bv',
 
-  // Deck data
-  PLAYER_DECK: 'vrsc::poker.deck.player',
-  DEALER_DECK: 'vrsc::poker.deck.dealer',
-  BLINDER_DECK: 'vrsc::poker.deck.blinder',
-  CARD_REVEAL: 'vrsc::poker.card.reveal',
-  BOARD_CARDS: 'vrsc::poker.board.cards',
+  // Player ID writes (by Player to their own ID)
+  PLAYER_DECK:    'chips.vrsc::poker.sg777z.player_deck',
+  PLAYER_ACTION:  'chips.vrsc::poker.sg777z.p_betting_action',
+  DECODED_CARD:   'chips.vrsc::poker.sg777z.p_decoded_card',
+  SHOWDOWN_CARDS: 'chips.vrsc::poker.sg777z.p_showdown_cards',
+  PLAYER_JOIN:    'chips.vrsc::poker.sg777z.p_join_request',
+  GAME_HISTORY:   'chips.vrsc::poker.sg777z.p_game_history',
 
-  // Player actions
-  PLAYER_ACTION: 'vrsc::poker.player.action',
-  PLAYER_JOIN: 'vrsc::poker.player.join',
-  SHOWDOWN_CARDS: 'vrsc::poker.showdown.cards',
-
-  // Settlement
-  SETTLEMENT: 'vrsc::poker.settlement',
-
-  // Lobby — list of registered dealers
-  DEALER_REGISTRY: 'vrsc::poker.dealers',
+  // Registry
+  DEALERS:        'chips.vrsc::poker.sg777z.dealers',
+  CASHIERS:       'chips.vrsc::poker.sg777z.cashiers',
 };
+
+// Helper: get a game-specific VDXF key
+export function gameKey(baseKey, gameId) {
+  return baseKey + '.' + gameId;
+}
+
+// Helper: get per-player deck key (t_d_p1_deck, t_d_p2_deck, etc.)
+export function playerDeckKey(baseKey, playerNum) {
+  return baseKey + playerNum + '_deck';
+}
 
 // ============================================================
 // High-level poker operations

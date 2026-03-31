@@ -475,6 +475,8 @@ let turnTimer = null, turnDeadline = 0, turnTotal = 0;
 let isBusted = false;
 const name = new URLSearchParams(location.search).get('name') || 'Player';
 
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
 // ══════════════════════════════════════
 // WEBSOCKET
 // ══════════════════════════════════════
@@ -605,7 +607,7 @@ function stopTurnTimer() {
 }
 
 function pName(seatIdx) {
-  if (st && st.players && st.players[seatIdx]) return st.players[seatIdx].id || ('Seat ' + (seatIdx+1));
+  if (st && st.players && st.players[seatIdx]) return esc(st.players[seatIdx].id || ('Seat ' + (seatIdx+1)));
   return 'Seat ' + (seatIdx+1);
 }
 
@@ -791,7 +793,7 @@ function render() {
       el.innerHTML =
         (cardsHtml ? '<div class="seat-cards">' + cardsHtml + '</div>' : '') +
         '<div class="seat-label">' +
-          '<div class="seat-name">' + roleTag + (p.id || p.name || 'Seat ' + (p.seat+1)) + '</div>' +
+          '<div class="seat-name">' + roleTag + esc(p.id || p.name || 'Seat ' + (p.seat+1)) + '</div>' +
           '<div class="seat-chips">' + (p.chips !== undefined ? p.chips : '') + '</div>' +
           deltaHtml +
         '</div>';
@@ -799,7 +801,7 @@ function render() {
       // Others: name on top, cards below
       el.innerHTML =
         '<div class="seat-label">' +
-          '<div class="seat-name">' + roleTag + (p.id || p.name || 'Seat ' + (p.seat+1)) + '</div>' +
+          '<div class="seat-name">' + roleTag + esc(p.id || p.name || 'Seat ' + (p.seat+1)) + '</div>' +
           '<div class="seat-chips">' + (p.chips !== undefined ? p.chips : '') + '</div>' +
           deltaHtml +
         '</div>' +
@@ -849,7 +851,7 @@ function renderControls() {
     html = '<span class="wait-text">Next hand...</span>';
   } else if (st.currentTurn >= 0 && st.currentTurn !== seat) {
     const tp = st.players ? st.players.find(p => p.seat === st.currentTurn) : null;
-    html = '<span class="wait-text">Waiting: ' + (tp ? tp.id : '...') + '</span>';
+    html = '<span class="wait-text">Waiting: ' + (tp ? esc(tp.id) : '...') + '</span>';
   } else if (st.currentTurn < 0) {
     html = '<span class="wait-text">' + (st.phase || '...') + '</span>';
   }

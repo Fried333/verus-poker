@@ -10,7 +10,7 @@ import { playerInit, dealerShuffle, cashierShuffle, verifyGame } from './protoco
 import { createEngine } from './poker-engine.mjs';
 import { evaluateHand, cardToString } from './hand-eval.mjs';
 import { FOLD, CHECK, CALL, RAISE } from './game.mjs';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 
 const WAIT = ms => new Promise(r => setTimeout(r, ms));
 
@@ -128,7 +128,7 @@ async function main() {
   }
 
   // Generate game ID
-  const gameId = createHash('sha256').update(Date.now().toString() + Math.random().toString()).digest('hex').substring(0, 16);
+  const gameId = createHash('sha256').update(Date.now().toString() + randomBytes(16).toString('hex')).digest('hex').substring(0, 16);
   console.log('\nGame ID: ' + gameId);
 
   // Track chips

@@ -258,7 +258,7 @@ async function runOneAction(game, io) {
     minRaise: game.minRaise
   });
 
-  const response = await io.waitForAction(p.id, validActions, 15000);
+  const response = await io.waitForAction(p.id, validActions, 30000);
 
   if (!response) {
     const action = validActions.includes(CHECK) ? CHECK : FOLD;

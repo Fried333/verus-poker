@@ -44,41 +44,107 @@ The protocol uses efficient Curve25519 cryptography, Shamir secret sharing for c
 
 ## Communication Layer
 
-### All game state via Verus ID contentmultimap
-Every game action is written to a VerusID's contentmultimap using VDXF keys. Each VDXF key type represents a different kind of game data:
+### Write Isolation Principle
+Each party writes ONLY to their own VerusID. No party can forge another's data.
+- **Players** write to their own VerusID (deck, actions, decoded cards)
+- **Dealer** writes to the Table VerusID (game state, dealer deck, board cards, settlement)
+- **Cashier** writes to the Table VerusID (cashier deck, blinding values)
 
-| VDXF Key | Writer | Data |
-|----------|--------|------|
-| `poker.table.config` | Dealer | Table listing (blinds, stakes, players) |
-| `poker.game.state` | Dealer | Current game phase |
-| `poker.deck.player` | Player | Player's initial deck (public points) |
-| `poker.deck.dealer` | Dealer | Dealer-blinded deck |
-| `poker.deck.cashier` | Cashier | Double-blinded deck + SSS shares |
-| `poker.card.reveal` | Cashier/Dealer | Blinding values for card reveals |
-| `poker.player.action` | Player | Betting actions (fold/check/call/raise) |
-| `poker.board.cards` | Dealer | Community cards |
-| `poker.settlement` | Dealer | Hand result + settlement request |
-| `poker.secrets` | All parties | Post-game secret reveals for verification |
+### VDXF Key Namespace
+All keys follow: `chips.vrsc::poker.sg777z.<key_name>.<game_id>`
+
+The game_id is appended to each key so multiple games on the same table don't collide.
+
+### Player → Player's Own VerusID
+
+| VDXF Key | Op | Data | Size |
+|----------|-----|------|------|
+| `player_deck.<game_id>` | append | Player's 52 blinded card points + pubkey + commitment | ~3.5KB |
+| `p_betting_action.<game_id>` | update | Action (fold/call/raise/check/allin) + amount + round | ~100B |
+| `p_decoded_card.<game_id>` | append | Decoded card result (card_id, value) | ~100B |
+| `p_showdown_cards.<game_id>` | append | Hole cards revealed at showdown | ~100B |
+| `p_join_request` | append | Join request (dealer_id, table_id, payin_tx) | ~200B |
+| `p_game_history` | append | Game result record | ~200B |
+
+### Dealer → Table VerusID
+
+| VDXF Key | Op | Data | Size |
+|----------|-----|------|------|
+| `t_table_info.<game_id>` | append | Table config (blinds, stakes, max players) | ~300B |
+| `t_player_info.<game_id>` | update | Player roster (num_players, player_info array) | ~500B |
+| `t_game_info.<game_id>` | append | Game state (phase) | ~100B |
+| `t_betting_state.<game_id>` | update | Whose turn, pot, valid actions, bet amounts, player funds | ~500B |
+| `t_d_deck.<game_id>` | append | Dealer's own shuffled+blinded points | ~3.5KB |
+| `t_d_p1_deck.<game_id>` | append | Player 1's deck shuffled+blinded by dealer | ~3.5KB |
+| `t_d_p2_deck.<game_id>` | append | Player 2's deck shuffled+blinded by dealer | ~3.5KB |
+| `t_board_cards.<game_id>` | append | Community cards (flop[3], turn, river) | ~200B |
+| `t_settlement_info.<game_id>` | update | Final balances, verification result | ~300B |
+
+### Cashier → Table VerusID
+
+| VDXF Key | Op | Data | Size |
+|----------|-----|------|------|
+| `t_b_deck.<game_id>` | append | Cashier's shuffled+blinded deck | ~3.5KB |
+| `t_b_p1_deck.<game_id>` | append | Player 1's cashier deck | ~3.5KB |
+| `t_b_p2_deck.<game_id>` | append | Player 2's cashier deck | ~3.5KB |
+| `card_bv.<game_id>` | append | Blinding values for card reveals (per card) | ~200B |
+
+### Data Operations
+- **append** — adds new data under the key (accumulates, used for deck data, history)
+- **update** — replaces key data entirely (used for current state like betting)
+- Max ~5KB per `updateidentity` call
+- Deck data split per-player to stay under limit (52 cards × 32 bytes = ~3.5KB each)
 
 ### VDXF Indexing
 - All contentmultimap updates are permanently indexed in the blockchain DB
 - Nothing is overwritten — every update to every VDXF key is stored in order
 - `getidentitycontent(id, heightstart, heightend, txproofs, txproofheight, vdxfkey)` retrieves updates filtered by VDXF key and block range
 - `heightend=-1` includes mempool data (unconfirmed transactions)
-- Full audit trail is built into the chain — no separate storage needed
-- After each hand, contentmultimap is cleared for the next hand
+- Track game start block → read incrementally from there (per dev guidance)
+- Full audit trail — no separate storage needed
 
 ### Ordering Guarantees
 - Identity updates spending sequential UTXOs are guaranteed to be ordered even in the mempool
 - The dealer is the primary writer to the table ID — single writer = single UTXO chain = guaranteed order
-- Players write to their own IDs (independent UTXO chains)
-- v1: Wait for block confirmation (~10s per action, simple)
-- v2: Chain UTXOs for mempool-speed ordering (~1s per action)
+- Players write to their own IDs (independent UTXO chains, no UTXO conflicts between players)
 
 ### Read Speed
 - Confirmed data: `getidentitycontent(id, block, 0)` — always available after mining
-- Mempool data: `getidentitycontent(id, 0, -1)` — available before mining (~1s)
+- Mempool data: `getidentitycontent(id, 0, -1)` — available before mining (~0.5-1s)
 - API added by Mike Toutonghi specifically for the poker use case
+- Effective latency: ~2-3s per action (write to mempool + poll + read)
+
+### Data Flow Per Hand
+```
+SHUFFLE (~8s):
+  Player 1 → Player 1 ID: player_deck          (~3.5KB, parallel)
+  Player 2 → Player 2 ID: player_deck          (~3.5KB, parallel)
+  Dealer reads player IDs
+  Dealer → Table ID: t_d_p1_deck, t_d_p2_deck  (~3.5KB each, sequential)
+  Cashier → Table ID: t_b_p1_deck, t_b_p2_deck (~3.5KB each, sequential)
+  Cashier → Table ID: card_bv (hole card BVs)   (~200B)
+
+DEALING (~4s):
+  Players read card_bv from Table ID
+  Players decode cards locally
+
+BETTING (~3s per action):
+  Dealer → Table ID: t_betting_state (whose turn)  (~500B)
+  Player reads Table ID, sees it's their turn
+  Player → Player ID: p_betting_action              (~100B)
+  Dealer reads Player ID, validates
+  Repeat for each player
+
+COMMUNITY CARDS (~3s per street):
+  Cashier → Table ID: card_bv (board card BVs)      (~200B)
+  Dealer → Table ID: t_board_cards                   (~200B)
+
+SETTLEMENT:
+  Dealer → Table ID: t_settlement_info               (~300B)
+
+Total per hand (2 players): ~30-40 seconds
+Total per hand (6 players): ~60-90 seconds
+```
 
 ---
 
