@@ -946,7 +946,8 @@ if (USE_LOCAL) {
         (async () => {
           console.log('[P2P] Waiting for ' + data.playerId + ' on-chain...');
           try {
-            await p2p.write(TABLE_ID, KEYS.BETTING_STATE, {
+            const hid = data.handId || (p2pDealer.getGameId() + '_h' + p2pDealer.getHandCount());
+            await p2p.writeBettingState(hid, {
               turn: data.playerId, validActions: data.validActions, toCall: data.toCall, pot: data.pot, minRaise: data.minRaise,
               session: p2pDealer.getGameId(), hand: p2pDealer.getHandCount(),
               players: data.gamePlayers || [], ts: Date.now()
@@ -1071,7 +1072,7 @@ if (USE_LOCAL) {
       }
       console.log('[P2P] Player mode — waiting for browser + join acknowledgement...');
       let lastBS = null, lastBCPhase = '', lastBCHand = 0, lastST = null;
-      let currentSession = null, currentHand = 0, myCards = null;
+      let currentSession = null, currentHand = 0, currentHandId = null, myCards = null;
       let handStartChips = {}; // Snapshot chips at hand start for winner calculation
       let pollRunning = false;  // Guard against duplicate poll loops
       let joinWritten = false;  // Don't poll until join is written
@@ -1136,30 +1137,43 @@ if (USE_LOCAL) {
               }
             }
 
-            // 1. Card reveals — STRICT session filter
-            const cr = await p2p.read(TABLE_ID, KEYS.CARD_BV + '.' + LOCAL_ID);
-            if (cr && cr.cards && cr.session === currentSession && (cr.hand || 0) > currentHand) {
-              currentHand = cr.hand;
-              myCards = cr.cards;
-              playerActed = false;
-              lastBS = null;
-              lastBCPhase = '';
-              lastST = null;
-              // Snapshot chips at hand start (for winner calculation later)
+            // 0b. Check for new handId from table_info
+            const tcPoll = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+            if (tcPoll && tcPoll.currentHandId && tcPoll.currentHandId !== currentHandId) {
+              const newHandId = tcPoll.currentHandId;
+              console.log('[P2P] ' + pt() + ' New handId: ' + newHandId);
+              currentHandId = newHandId;
+              currentHand = tcPoll.handCount || (currentHand + 1);
+              lastBS = null; lastBCPhase = ''; lastBCHand = 0; lastST = null;
+              myCards = null; playerActed = false;
+              // Snapshot chips for winner calculation
               handStartChips = {};
               buildPlayers().forEach(p => handStartChips[p.id] = p.chips);
-              console.log('[P2P] ' + pt() + ' Hand ' + currentHand + ' cards: ' + cr.cards.join(' '));
-              pLog('cards', 'Hand #' + currentHand + ' — your cards: ' + cr.cards.join(' '));
-              // Clear board from previous hand, deal new hole cards
-              broadcast({ method: 'deal', deal: { board: [], holecards: cr.cards } });
-              p2pSendSeats(buildPlayers(), { phase: 'preflop', handCount: currentHand, dealerSeat: 1 });
-            } else if (cr && cr.session && cr.session !== currentSession) {
-              // Stale data from old session — ignore silently
+              // Clear table
+              broadcast({ method: 'deal', deal: { board: [], holecards: [] } });
+              p2pSendSeats(buildPlayers(), { phase: 'Shuffling...', handCount: currentHand, dealerSeat: 1 });
+              pLog('system', 'Hand #' + currentHand + ' starting...');
             }
 
-            // 2. Betting state — STRICT session + hand filter
-            const bs = await p2p.read(TABLE_ID, KEYS.BETTING_STATE);
-            if (bs && bs.session === currentSession && (bs.hand || 0) >= currentHand && JSON.stringify(bs) !== JSON.stringify(lastBS)) {
+            if (!currentHandId) {
+              await new Promise(r => setTimeout(r, 2000));
+              continue;
+            }
+
+            // 1. Card reveals — read from hand-prefixed key
+            const cardKey = 'chips.vrsc::poker.sg777z.card_bv.' + currentHandId + '.' + LOCAL_ID;
+            const cr = await p2p.read(TABLE_ID, cardKey);
+            if (cr && cr.cards && !myCards) {
+              myCards = cr.cards;
+              console.log('[P2P] ' + pt() + ' Hand ' + currentHand + ' cards: ' + cr.cards.join(' '));
+              pLog('cards', 'Hand #' + currentHand + ' — your cards: ' + cr.cards.join(' '));
+              broadcast({ method: 'deal', deal: { board: [], holecards: cr.cards } });
+              p2pSendSeats(buildPlayers(), { phase: 'preflop', handCount: currentHand, dealerSeat: 1 });
+            }
+
+            // 2. Betting state — hand-prefixed key
+            const bs = await p2p.readBettingState(currentHandId);
+            if (bs && JSON.stringify(bs) !== JSON.stringify(lastBS)) {
               const prevBS = lastBS;
               lastBS = bs;
 
@@ -1194,25 +1208,21 @@ if (USE_LOCAL) {
               }
               p2pSendSeats(pl, { phase: bs.phase || 'preflop', pot: bs.pot || 0,
                 currentTurn: bs.turn === LOCAL_ID ? 0 : 1, handCount: currentHand, dealerSeat: 1 });
-            } else if (bs && bs.session && bs.session !== currentSession) {
-              // Stale betting state from old session — ignore
             }
 
-            // 3. Board cards — STRICT session + hand filter
-            const bc = await p2p.read(TABLE_ID, KEYS.BOARD_CARDS);
-            const bcHand = bc ? (bc.hand || 0) : 0;
-            if (bc && bc.board && bc.session === currentSession && bcHand >= currentHand &&
-                (bcHand > lastBCHand || (bcHand === lastBCHand && bc.phase !== lastBCPhase))) {
-              lastBCHand = bcHand;
+            // 3. Board cards — hand-prefixed key
+            const bc = await p2p.readBoardCards(currentHandId);
+            if (bc && bc.board && bc.phase !== lastBCPhase) {
               lastBCPhase = bc.phase;
               console.log('[P2P] ' + pt() + ' Board (' + bc.phase + '): ' + bc.board.join(' '));
               pLog('cards', bc.phase.charAt(0).toUpperCase() + bc.phase.slice(1) + ': ' + bc.board.join(' '));
               broadcast({ method: 'deal', deal: { board: bc.board } });
             }
 
-            // 4. Settlement — STRICT session filter, only after seeing cards
-            const st = await p2p.read(TABLE_ID, KEYS.SETTLEMENT);
-            if (st && st.session === currentSession && currentHand > 0 && st.verified !== undefined && JSON.stringify(st) !== JSON.stringify(lastST) && (st.hand || 0) >= currentHand) {
+            // 4. Settlement — hand-prefixed key
+            const stKey = KEYS.SETTLEMENT + '.' + currentHandId;
+            const st = await p2p.read(TABLE_ID, stKey);
+            if (st && st.verified !== undefined && JSON.stringify(st) !== JSON.stringify(lastST)) {
               lastST = st;
               console.log('[P2P] ' + pt() + ' Settlement: verified=' + st.verified);
               pLog('showdown', '═══ SHOWDOWN ═══');
@@ -1261,8 +1271,6 @@ if (USE_LOCAL) {
               playerActed = false;
               // Keep lastBS, lastBCPhase, lastBCHand — prevents re-processing stale data
               pLog('system', 'Waiting for next hand...');
-            } else if (st && st.session && st.session !== currentSession) {
-              // Stale settlement from old session — ignore
             }
           } catch (e) {
             console.log('[P2P] Poll error: ' + e.message);

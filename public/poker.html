@@ -614,6 +614,13 @@ function handle(m) {
     case 'verification':
       updateTableInfo(m.hand, m.valid);
       log('verify', 'Hand #' + m.hand + ': ' + (m.valid ? 'VERIFIED' : 'FAILED'));
+      // Clear table for next hand
+      myCards = [];
+      renderBoard([]);
+      render();
+      document.getElementById('controls').innerHTML = '<span class="wait-text">Shuffling next hand...</span>';
+      // Auto-hide winner banner after 5s
+      setTimeout(() => { document.getElementById('winner-banner').style.display = 'none'; }, 5000);
       break;
     case 'error': log('system', 'Error: ' + (m.error || m.message)); break;
   }

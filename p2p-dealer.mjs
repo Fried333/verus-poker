@@ -146,8 +146,9 @@ export function createP2PDealer(p2p, config, localNotify) {
         // Write card reveal to TABLE ID (not player ID — dealer can't sign for remote players)
         // In production, cards are distributed via SSS shares encrypted per-player
         const cardData = { player: activePlayers[i].id, cards: cards.map(cardToString), type: 'hole', hand: handCount, session: gameId };
-        // Write to base key only (player polls this). No duplicate game-specific write.
-        await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.card_bv.' + activePlayers[i].id, cardData);
+        // Write card reveal: handId-prefixed, per-player key
+        const cardKey = 'chips.vrsc::poker.sg777z.card_bv.' + handId + '.' + activePlayers[i].id;
+        await p2p.write(p2p.tableId, cardKey, cardData);
       }
       // ── PLAY THE HAND (betting rounds) ──
       console.log('[DEALER] Playing hand...');
@@ -162,7 +163,13 @@ export function createP2PDealer(p2p, config, localNotify) {
       }
 
       // Notify AFTER blinds posted so browser gets correct chip counts
-      notify('cards_dealt', { holeCards,
+      // Update table_info with current handId so player knows which keys to poll
+      await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_table_info', {
+        smallBlind, bigBlind, buyin, maxPlayers: 9, status: 'playing', dealer: p2p.myId,
+        session: gameId, currentHandId: handId, handCount
+      });
+
+      notify('cards_dealt', { holeCards, handId,
         gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, seat: gp.seat })),
         pot: game.pot, phase: game.phase, dealerSeat: game.dealerSeat
       });
@@ -188,7 +195,7 @@ export function createP2PDealer(p2p, config, localNotify) {
           }
           dealBoard(game, cards);
           const boardData = { board: game.board.map(cardToString), phase: 'flop', hand: handCount, session: gameId };
-          await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', boardData);
+          await p2p.writeBoardCards(handId, boardData);
           notify('community_cards', { phase: 'flop', cards, board: game.board });
           console.log('  Flop: ' + cards.map(cardToString).join(' '));
           await WAIT(1500);
@@ -196,7 +203,7 @@ export function createP2PDealer(p2p, config, localNotify) {
           const idx = decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init);
           dealBoard(game, [idx]); revealPos++;
           const turnData = { board: game.board.map(cardToString), phase: 'turn', hand: handCount, session: gameId };
-          await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', turnData);
+          await p2p.writeBoardCards(handId, turnData);
           notify('community_cards', { phase: 'turn', board: game.board });
           console.log('  Turn: ' + cardToString(game.board[3]));
           await WAIT(1500);
@@ -204,7 +211,7 @@ export function createP2PDealer(p2p, config, localNotify) {
           const idx = decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init);
           dealBoard(game, [idx]); revealPos++;
           const riverData = { board: game.board.map(cardToString), phase: 'river', hand: handCount, session: gameId };
-          await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', riverData);
+          await p2p.writeBoardCards(handId, riverData);
           notify('community_cards', { phase: 'river', board: game.board });
           console.log('  River: ' + cardToString(game.board[4]));
           await WAIT(1500);
@@ -229,7 +236,7 @@ export function createP2PDealer(p2p, config, localNotify) {
         // Ask for action via callback (works for local player and auto-play)
         action = await new Promise(resolve => {
           notify('need_action', { resolve, validActions, toCall, seat, playerId: p.id, pot: game.pot, minRaise: game.minRaise,
-            gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })) });
+            handId, gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })) });
           setTimeout(() => resolve(null), 30000);
         });
 
@@ -250,7 +257,11 @@ export function createP2PDealer(p2p, config, localNotify) {
         await WAIT(500);
       }
 
-      // ── SHOWDOWN ──
+      // ── SETTLE (showdown or fold win) ──
+      let winners = [], winAmount = 0;
+      const handNames = {}, allHoleCards = {};
+      const rankNames = ['High Card','Pair','Two Pair','Three of a Kind','Straight','Flush','Full House','Four of a Kind','Straight Flush','Royal Flush'];
+
       if (game.phase === SHOWDOWN) {
         const nonFolded = game.players.filter(p => !p.folded);
         if (nonFolded.length > 1) {
@@ -262,46 +273,38 @@ export function createP2PDealer(p2p, config, localNotify) {
           notify('community_cards', { phase: 'showdown', board: game.board });
           console.log('  Board: ' + game.board.map(cardToString).join(' '));
         }
-
-        const payouts = settleHand(game, evaluateHand);
-        applyPayouts(game, payouts);
-
-        // Send showdown info to browser
-        const winners = [];
-        let winAmount = 0;
-        const handNames = {};
-        const allHoleCards = {};
-        const rankNames = ['High Card','Pair','Two Pair','Three of a Kind','Straight','Flush','Full House','Four of a Kind','Straight Flush','Royal Flush'];
-        for (const [seat, amt] of Object.entries(payouts)) {
-          if (amt > 0) { winners.push(Number(seat)); winAmount = amt; }
-        }
-        const nonFoldedCount = game.players.filter(p => !p.folded).length;
-        for (const gp of game.players) {
-          if (!gp.folded && gp.holeCards.length > 0 && game.board.length >= 3 && nonFoldedCount > 1) {
-            const score = evaluateHand([...gp.holeCards, ...game.board]);
-            handNames[gp.seat] = rankNames[Math.floor(score / 1e10)] || 'Unknown';
-          }
-          // Only reveal cards if actual showdown (2+ non-folded). Fold wins = no reveal.
-          if (nonFoldedCount > 1 && !gp.folded) {
-            allHoleCards[gp.seat] = gp.holeCards.map(cardToString);
-          } else {
-            allHoleCards[gp.seat] = [null, null];
-          }
-        }
-        notify('showdown', {
-          winners, winAmount, handNames, allHoleCards,
-          board: game.board.map(cardToString), payouts
-        });
-
-        console.log('  Payouts: ' + Object.entries(payouts).filter(([, v]) => v > 0).map(([s, v]) => game.players[s].id + ':+' + v).join(' '));
       }
+
+      const payouts = settleHand(game, evaluateHand);
+      applyPayouts(game, payouts);
+
+      for (const [seat, amt] of Object.entries(payouts)) {
+        if (amt > 0) { winners.push(Number(seat)); winAmount = amt; }
+      }
+      const nonFoldedCount = game.players.filter(p => !p.folded).length;
+      for (const gp of game.players) {
+        if (!gp.folded && gp.holeCards.length > 0 && game.board.length >= 3 && nonFoldedCount > 1) {
+          const score = evaluateHand([...gp.holeCards, ...game.board]);
+          handNames[gp.seat] = rankNames[Math.floor(score / 1e10)] || 'Unknown';
+        }
+        if (nonFoldedCount > 1 && !gp.folded) {
+          allHoleCards[gp.seat] = gp.holeCards.map(cardToString);
+        } else {
+          allHoleCards[gp.seat] = [null, null];
+        }
+      }
+      notify('showdown', {
+        winners, winAmount, handNames, allHoleCards,
+        board: game.board.map(cardToString), payouts
+      });
+      console.log('  Payouts: ' + Object.entries(payouts).filter(([, v]) => v > 0).map(([s, v]) => game.players[s].id + ':+' + v).join(' '));
 
       // ── VERIFY ──
       const verification = verifyGame(playerData, dd, cd, numCards);
       console.log('[DEALER] Verify: ' + (verification.valid ? 'PASS' : 'FAIL: ' + verification.errors.join(', ')));
 
       // Write settlement to base key (player polls this) — include showdown data
-      await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_settlement_info', {
+      await p2p.writeSettlement(handId, {
         hand: handCount, verified: verification.valid, session: gameId,
         results: game.players.map(p => ({ id: p.id, chips: p.chips })),
         board: game.board.map(cardToString),
