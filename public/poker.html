@@ -520,6 +520,7 @@ function connect() {
 
 function handle(m) {
   switch (m.event || m.method) {
+    case 'fullstate': handleFullState(m); break;
     case 'joined':
       seat = m.seat; myId = m.id;
       document.getElementById('my-name').textContent = m.id;
@@ -706,6 +707,94 @@ function handleBetting(m) {
       break;
     }
   }
+}
+
+// ══════════════════════════════════════
+// SINGLE STATE HANDLER — replaces all fragmented message handling for P2P mode
+// Receives ONE message with ALL game state. Sets everything, renders once.
+// ══════════════════════════════════════
+function handleFullState(m) {
+  // 1. Set ALL state at once
+  st = st || {};
+  st.players = m.seats;
+  st.phase = m.phase;
+  st.pot = m.pot;
+  st.dealerSeat = m.dealerSeat;
+  st.sbSeat = m.sbSeat;
+  st.bbSeat = m.bbSeat;
+  st.currentTurn = m.currentTurn;
+  st.handCount = m.handCount;
+
+  // 2. Cards
+  myCards = m.myCards || [];
+
+  // 3. Board
+  renderBoard(m.board || []);
+
+  // 4. Action buttons
+  const el = document.getElementById('controls');
+  if (m.actions && m.actions.possibilities && m.actions.possibilities.length > 0) {
+    st.validActions = m.actions.possibilities;
+    st.toCall = m.actions.toCall || 0;
+    st.minRaise = m.actions.minRaiseTo || 2;
+
+    // Build buttons
+    const me2 = st.players ? st.players.find(p => p.seat === seat) : null;
+    const myChips2 = me2 ? me2.chips : 200;
+    const callAmt = Math.min(st.toCall, myChips2);
+    const minR = st.minRaise || 2;
+    const maxR = Math.max(minR, myChips2 - st.toCall);
+    const va = m.actions.possibilities;
+    let html = '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">';
+    if (va.includes(3)) {
+      html += '<div style="display:flex;align-items:center;gap:4px">';
+      html += '<input id="raise-slider" type="range" min="'+minR+'" max="'+maxR+'" value="'+minR+'" step="1" oninput="document.getElementById(\'raise-input\').value=this.value" style="width:140px;accent-color:#e65100">';
+      html += '<input id="raise-input" type="number" min="'+minR+'" max="'+maxR+'" value="'+minR+'" step="1" oninput="if(document.getElementById(\'raise-slider\'))document.getElementById(\'raise-slider\').value=this.value" style="width:50px;padding:2px;border-radius:3px;border:1px solid #555;background:#222;color:#fff;text-align:center;font-size:12px">';
+      html += '</div>';
+    }
+    html += '<div style="display:flex;gap:6px;align-items:center">';
+    if (va.includes(0)) html += '<button class="btn-fold" onclick="act(\'fold\')">Fold</button>';
+    if (va.includes(1)) html += '<button class="btn-check" onclick="act(\'check\')">Check</button>';
+    if (va.includes(2)) html += '<button class="btn-call" onclick="act(\'call\')">Call ' + callAmt + '</button>';
+    if (va.includes(3)) html += '<button class="btn-raise" onclick="doRaise()">' + (st.toCall ? 'Raise' : 'Bet') + '</button>';
+    if (va.includes(7)) html += '<button class="btn-allin" onclick="act(\'allin\')">All In</button>';
+    html += '</div></div>';
+    if (el) el.innerHTML = html;
+    startTurnTimer(m.actions.turnTimeout || 30);
+  } else if (m.phase === 'waiting' || m.phase === 'shuffling' || m.phase?.includes('aiting') || m.phase?.includes('huffling')) {
+    stopTurnTimer();
+    if (el) el.innerHTML = '<span class="wait-text">' + (m.message || m.phase) + '</span>';
+  } else if (!m.actions) {
+    stopTurnTimer();
+    if (el && !el.querySelector('button')) {
+      el.innerHTML = '<span class="wait-text">Waiting...</span>';
+    }
+  }
+
+  // 5. Winner banner
+  const banner = document.getElementById('winner-banner');
+  if (m.winner && m.winner.winners && m.winner.winners.length > 0) {
+    const names = m.winner.winners.map(s => m.winner.playerNames?.[s] || 'Seat '+(s+1));
+    const hNames = m.winner.handNames || {};
+    const winHand = m.winner.winners.map(s => hNames[s]).filter(Boolean).join(', ');
+    banner.querySelector('.wb-title').textContent = names.join(' & ') + ' wins!';
+    banner.querySelector('.wb-detail').textContent = (winHand ? winHand + ' — ' : '') + '+' + m.winner.win_amount + ' chips';
+    banner.style.display = 'block';
+    winnerSeats = m.winner.winners;
+    winAmount = m.winner.win_amount;
+  } else {
+    banner.style.display = 'none';
+    winnerSeats = [];
+    winAmount = 0;
+  }
+
+  // 6. Verification
+  if (m.verified !== null && m.verified !== undefined) {
+    updateTableInfo(m.handCount, m.verified);
+  }
+
+  // 7. Render seats (one pass)
+  render();
 }
 
 function handleFinalInfo(m) {

@@ -1077,7 +1077,7 @@ if (USE_LOCAL) {
 
       // Push FULL state to ALL browsers — called after every change
       pushState = function() {
-        // Build seats with privacy (hide other players' cards except at showdown)
+        // Build seats with privacy
         const isShowdown = gs.phase === 'showdown' || gs.phase === 'settled';
         const seats = gs.players.map(p => ({
           ...p, name: p.id,
@@ -1089,59 +1089,49 @@ if (USE_LOCAL) {
             (isShowdown && gs.showdownCards[p.seat] ? gs.showdownCards[p.seat] :
               (gs.myCards.length > 0 ? ['??', '??'] : []))
         }));
-        // Add empty seats
         const usedSeats = new Set(seats.map(s => s.seat));
         for (let s = seats.length; s < 9; s++) {
           if (!usedSeats.has(s)) seats.push({ id: '', name: '', seat: s, playing: 0, empty: true, chips: 0 });
         }
         seats.sort((a, b) => a.seat - b.seat);
 
-        const msg = {
-          method: 'seats', seats, phase: gs.phase, pot: gs.pot,
-          dealerSeat: gs.dealerSeat, sbSeat: 0, bbSeat: 1,
-          currentTurn: gs.turn === LOCAL_ID ? 0 : (gs.turn ? 1 : -1),
-          handCount: gs.handCount
-        };
-
-        // Also send deal data (cards + board)
-        const dealMsg = { method: 'deal', deal: { holecards: gs.myCards, board: gs.board } };
-
-        // Also send action buttons if it's our turn
-        let bettingMsg = null;
+        // Build action buttons data
+        let actions = null;
         if (gs.turn === LOCAL_ID && gs.validActions.length > 0) {
-          const poss = gs.validActions.map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined);
-          bettingMsg = { method: 'betting', action: 'round_betting', playerid: 0, turnPlayer: LOCAL_ID,
-            pot: gs.pot, toCall: gs.toCall, minRaiseTo: gs.minRaise || 2,
-            turnTimeout: 30, turnStart: Date.now(), possibilities: poss };
+          actions = {
+            possibilities: gs.validActions.map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined),
+            toCall: gs.toCall, minRaiseTo: gs.minRaise || 2, turnTimeout: 30, turnStart: Date.now()
+          };
         }
 
-        // Winner banner
-        let finalMsg = null;
+        // Build winner data
+        let winner = null;
         if (gs.winner) {
           const playerNames = {};
           gs.players.forEach((p, i) => playerNames[i] = p.id);
-          finalMsg = { method: 'finalInfo', winners: gs.winner.seats || [], win_amount: gs.winner.amount || 0,
+          winner = {
+            winners: gs.winner.seats || [], win_amount: gs.winner.amount || 0,
             playerNames, handNames: gs.handNames || {},
-            showInfo: { allHoleCardsInfo: gs.showdownCards, boardCardInfo: gs.board } };
+            showdownCards: gs.showdownCards
+          };
         }
 
-        // Verification
-        let verifyMsg = null;
-        if (gs.verified !== null) {
-          verifyMsg = { method: 'verification', hand: gs.handCount, valid: gs.verified, errors: [] };
-        }
+        // ONE message with EVERYTHING
+        const fullState = {
+          method: 'fullstate',
+          seats, phase: gs.phase, pot: gs.pot,
+          dealerSeat: gs.dealerSeat, sbSeat: 0, bbSeat: 1,
+          currentTurn: gs.turn === LOCAL_ID ? 0 : (gs.turn ? 1 : -1),
+          handCount: gs.handCount,
+          myCards: gs.myCards, board: gs.board,
+          actions, winner,
+          verified: gs.verified,
+          message: gs.message || ''
+        };
 
         for (const [ws] of clients) {
-          if (ws.readyState !== 1) continue;
-          ws.send(JSON.stringify(dealMsg));
-          ws.send(JSON.stringify(msg));
-          if (bettingMsg) ws.send(JSON.stringify(bettingMsg));
-          if (finalMsg) ws.send(JSON.stringify(finalMsg));
-          if (verifyMsg) ws.send(JSON.stringify(verifyMsg));
+          if (ws.readyState === 1) ws.send(JSON.stringify(fullState));
         }
-
-        // Log
-        if (gs.message) broadcast({ method: 'comm', type: 'system', msg: gs.message });
       };
 
       let lastBSJson = null;
