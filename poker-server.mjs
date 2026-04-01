@@ -921,13 +921,12 @@ if (USE_LOCAL) {
     }
     if (event === 'need_action') {
       if (data.playerId === LOCAL_ID) {
-        // Dealer player — show buttons in browser, wait for click
-        p2pActionResolver = data.resolve;
-        const mySeat = p2pDealer.getPlayers().findIndex(p => p.id === LOCAL_ID);
-        const poss = data.validActions.map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined);
-        broadcast({ method: 'betting', action: 'round_betting', playerid: mySeat, turnPlayer: LOCAL_ID,
-          pot: data.pot || 0, toCall: data.toCall || 0, minRaiseTo: data.minRaise || 2,
-          turnTimeout: 30, turnStart: Date.now(), possibilities: poss });
+        // Dealer auto-plays: check if free, call up to BB, fold big raises
+        const act = data.validActions.includes('check') ? 'check'
+          : (data.validActions.includes('call') && data.toCall <= data.pot * 0.5) ? 'call'
+          : data.validActions.includes('fold') ? 'fold' : 'check';
+        console.log('[P2P] Dealer auto: ' + act + ' (toCall=' + data.toCall + ' pot=' + data.pot + ')');
+        setTimeout(() => data.resolve({ action: act, amount: 0 }), 500);
       } else {
         // Remote player: write betting state to chain, poll for action
         (async () => {
