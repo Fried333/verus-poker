@@ -705,6 +705,9 @@ let p2pActionResolver = null; // Resolves when browser player acts
 let joinSession = null;       // Session from player join flow
 let dealerSeated = false;     // Dealer browser clicked "Sit Here"
 const chipTracker = {};       // Persistent chip counts across hands
+let p2pMyCards = null;        // Current hole cards (for reconnect)
+let p2pCurrentHandId = null;  // Current hand ID (for reconnect)
+let p2pLastBoard = null;      // Last board sent (for reconnect)
 
 if (USE_LOCAL) {
   if (!RPC_CONFIG) { console.error('ERROR: CHIPS daemon config not found'); process.exit(1); }
@@ -806,14 +809,16 @@ if (USE_LOCAL) {
       clients.set(ws, { id: LOCAL_ID, seat: 0, chips: reconnectChips });
       sendTo(ws, { method: 'backend_status', backend_status: 1 });
       sendTo(ws, { method: 'info', playerid: 0, seat_taken: false });
-      console.log('[P2P] Browser connected: ' + LOCAL_ID + ' chips=' + reconnectChips + ' (method=' + method + ')');
-      // Send current seats immediately so browser has chip data on reconnect
-      if (Object.keys(chipTracker).length > 0) {
-        const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p1'];
-        const pl = [{ id: LOCAL_ID, seat: 0, chips: reconnectChips, holeCards: [] }];
-        otherIds.forEach((pid, i) => pl.push({ id: pid, seat: i + 1, chips: chipTracker[pid] || 200, holeCards: ['??','??'] }));
-        p2pSendSeats(pl, { phase: 'waiting', dealerSeat: 1 });
+      console.log('[P2P] Browser reconnected: ' + LOCAL_ID + ' chips=' + reconnectChips + ' hand=' + p2pCurrentHandId + ' cards=' + (p2pMyCards ? p2pMyCards.join(',') : 'none'));
+      // Re-send full hand state on reconnect so browser isn't blank
+      if (p2pMyCards && p2pMyCards.length > 0) {
+        sendTo(ws, { method: 'deal', deal: { holecards: p2pMyCards, board: p2pLastBoard || [] } });
       }
+      // Send current seats with correct chips
+      const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p1'];
+      const pl = [{ id: LOCAL_ID, seat: 0, chips: reconnectChips, holeCards: p2pMyCards || [] }];
+      otherIds.forEach((pid, i) => pl.push({ id: pid, seat: i + 1, chips: chipTracker[pid] || 200, holeCards: p2pMyCards ? ['??','??'] : [] }));
+      p2pSendSeats(pl, { phase: p2pMyCards ? 'playing' : 'waiting', dealerSeat: 1 });
 
       // For dealer: just mark as seated
       if (LOCAL_ROLE === 'dealer') {
@@ -1132,9 +1137,10 @@ if (USE_LOCAL) {
               const newHandId = tcPoll.currentHandId;
               console.log('[P2P] ' + pt() + ' New handId: ' + newHandId);
               currentHandId = newHandId;
+              p2pCurrentHandId = newHandId;
               currentHand = tcPoll.handCount || (currentHand + 1);
               lastBS = null; lastBCPhase = ''; lastBCHand = 0; lastST = null;
-              myCards = null; playerActed = false;
+              myCards = null; p2pMyCards = null; p2pLastBoard = null; playerActed = false;
               // Snapshot chips for winner calculation
               handStartChips = {};
               buildPlayers().forEach(p => handStartChips[p.id] = p.chips);
@@ -1154,7 +1160,7 @@ if (USE_LOCAL) {
             const cardKey = 'chips.vrsc::poker.sg777z.card_bv.' + currentHandId + '.' + LOCAL_ID;
             const cr = await p2p.read(TABLE_ID, cardKey);
             if (cr && cr.cards && !myCards) {
-              myCards = cr.cards;
+              myCards = cr.cards; p2pMyCards = cr.cards;
               console.log('[P2P] ' + pt() + ' Hand ' + currentHand + ' cards: ' + cr.cards.join(' '));
               pLog('cards', 'Hand #' + currentHand + ' — your cards: ' + cr.cards.join(' '));
               broadcast({ method: 'deal', deal: { board: [], holecards: cr.cards } });
@@ -1209,6 +1215,7 @@ if (USE_LOCAL) {
               lastBCPhase = bc.phase;
               console.log('[P2P] ' + pt() + ' Board (' + bc.phase + '): ' + bc.board.join(' '));
               pLog('cards', bc.phase.charAt(0).toUpperCase() + bc.phase.slice(1) + ': ' + bc.board.join(' '));
+              p2pLastBoard = bc.board;
               broadcast({ method: 'deal', deal: { board: bc.board } });
             }
 
@@ -1260,10 +1267,10 @@ if (USE_LOCAL) {
               p2pSendSeats(buildPlayers(chipMap), { phase: 'Shuffling next hand...', pot: 0, handCount: currentHand, dealerSeat: 1 });
 
               // Reset for next hand — remember settled handId to skip it
-              myCards = null;
+              myCards = null; p2pMyCards = null; p2pLastBoard = null;
               playerActed = false;
               lastSettledHandId = currentHandId;
-              currentHandId = null;
+              currentHandId = null; p2pCurrentHandId = null;
               pLog('system', 'Waiting for next hand...');
             }
           } catch (e) {
