@@ -1069,7 +1069,7 @@ if (USE_LOCAL) {
         if (LOCAL_PLAYERS.length === 0) LOCAL_PLAYERS.push('poker-p1');
       }
       console.log('[P2P] Player mode — waiting for browser + join acknowledgement...');
-      let lastBS = null, lastBCPhase = '', lastST = null;
+      let lastBS = null, lastBCPhase = '', lastBCHand = 0, lastST = null;
       let currentSession = null, currentHand = 0, myCards = null;
       let pollRunning = false;  // Guard against duplicate poll loops
       let joinWritten = false;  // Don't poll until join is written
@@ -1195,7 +1195,10 @@ if (USE_LOCAL) {
 
             // 3. Board cards — STRICT session + hand filter
             const bc = await p2p.read(TABLE_ID, KEYS.BOARD_CARDS);
-            if (bc && bc.board && bc.session === currentSession && (bc.hand || 0) >= currentHand && bc.phase !== lastBCPhase) {
+            const bcHand = bc ? (bc.hand || 0) : 0;
+            if (bc && bc.board && bc.session === currentSession && bcHand >= currentHand &&
+                (bcHand > lastBCHand || (bcHand === lastBCHand && bc.phase !== lastBCPhase))) {
+              lastBCHand = bcHand;
               lastBCPhase = bc.phase;
               console.log('[P2P] ' + pt() + ' Board (' + bc.phase + '): ' + bc.board.join(' '));
               pLog('cards', bc.phase.charAt(0).toUpperCase() + bc.phase.slice(1) + ': ' + bc.board.join(' '));
@@ -1209,36 +1212,29 @@ if (USE_LOCAL) {
               console.log('[P2P] ' + pt() + ' Settlement: verified=' + st.verified);
               pLog('showdown', '═══ SHOWDOWN ═══');
 
-              // Show results
-              if (st.results) {
-                const startChips = {};
-                buildPlayers().forEach(p => startChips[p.id] = p.chips);
-                for (const r of st.results) {
-                  const delta = r.chips - (startChips[r.id] || 200);
-                  if (delta > 0) pLog('showdown', '★ ' + r.id + ' WINS ' + delta);
-                  pLog('system', r.id + ': ' + r.chips + ' chips');
-                  for (const [, info] of clients) { if (info.id === r.id) info.chips = r.chips; }
-                }
-              }
+              // Snapshot chips BEFORE settlement update
+              const preChips = {};
+              buildPlayers().forEach(p => preChips[p.id] = p.chips);
 
-              pLog('verify', 'Verified: ' + (st.verified ? 'PASS' : 'FAIL'));
-              // Send winner banner to player browser
+              // Show results + winner banner
               if (st.results) {
-                const startChips2 = {};
-                buildPlayers().forEach(p => startChips2[p.id] = p.chips);
                 const winners = [];
                 let winAmount = 0;
                 const playerNames = {};
-                st.results.forEach((r, i) => {
-                  playerNames[i] = r.id;
-                  const delta = r.chips - (startChips2[r.id] || 200);
-                  if (delta > 0) { winners.push(i); winAmount = delta; }
-                });
+                for (let ri = 0; ri < st.results.length; ri++) {
+                  const r = st.results[ri];
+                  playerNames[ri] = r.id;
+                  const delta = r.chips - (preChips[r.id] || 200);
+                  if (delta > 0) { winners.push(ri); winAmount = delta; pLog('showdown', '★ ' + r.id + ' WINS ' + delta); }
+                  pLog('system', r.id + ': ' + r.chips + ' chips');
+                  for (const [, info] of clients) { if (info.id === r.id) info.chips = r.chips; }
+                }
                 if (winners.length > 0) {
                   broadcast({ method: 'finalInfo', winners, win_amount: winAmount, playerNames,
                     handNames: {}, showInfo: { allHoleCardsInfo: {}, boardCardInfo: st.board || [] } });
                 }
               }
+              pLog('verify', 'Verified: ' + (st.verified ? 'PASS' : 'FAIL'));
               broadcast({ method: 'verification', hand: st.hand || 1, valid: st.verified, errors: [] });
               // Update seats with final chips
               const chipMap = {};
@@ -1253,6 +1249,7 @@ if (USE_LOCAL) {
               playerActed = false;
               // DON'T reset lastBS — old betting state would re-trigger buttons
               lastBCPhase = '';
+              lastBCHand = currentHand;
               pLog('system', 'Waiting for next hand...');
             } else if (st && st.session && st.session !== currentSession) {
               // Stale settlement from old session — ignore

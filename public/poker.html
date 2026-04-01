@@ -572,8 +572,8 @@ function handle(m) {
         if (m.pot !== undefined) st.pot = m.pot;
         if (m.currentTurn !== undefined) st.currentTurn = m.currentTurn;
         if (m.handCount) st.handCount = m.handCount;
-        // Preserve validActions from round_betting — seats update shouldn't clear them
-        if (prevActions && prevActions.length > 0) {
+        // Preserve validActions only if it's still our turn
+        if (prevActions && prevActions.length > 0 && m.currentTurn === seat) {
           st.validActions = prevActions;
           st.toCall = prevToCall;
           st.minRaise = prevMinRaise;
