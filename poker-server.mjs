@@ -1240,9 +1240,9 @@ if (USE_LOCAL) {
               if (st.results) {
                 for (const r of st.results) {
                   const gp = gs.players.find(x => x.id === r.id);
-                  if (gp) gp.chips = r.chips;
+                  if (gp) { console.log('[P2P] Chips update: ' + r.id + ' ' + gp.chips + ' → ' + r.chips); gp.chips = r.chips; }
                 }
-              }
+              } else { console.log('[P2P] WARNING: no results in settlement'); }
               // Show showdown
               gs.phase = 'showdown';
               gs.verified = st.verified;
