@@ -37,40 +37,46 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
 
   const lastTxId = new Map(); // identity → last txid written
 
-  const MEMPOOL_WAIT = 1000; // Wait 1s for mempool propagation between writes
+  async function waitForTxSpendable(txid, maxWait = 30000) {
+    // Wait for TX to be in mempool (spendable) — don't need block confirmation
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+      try {
+        await client.getTransaction(txid);
+        return true; // TX exists = spendable from mempool
+      } catch (e) {
+        // TX not found yet — wait
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    return false;
+  }
 
   async function write(identityId, vdxfKey, data) {
     const idName = identityId.replace('.CHIPS@', '');
     const serialized = serialize(data);
 
-    // Wait for previous write to propagate in mempool
-    const last = lastWrite.get(idName) || 0;
-    const elapsed = Date.now() - last;
-    if (elapsed < MEMPOOL_WAIT) {
-      await new Promise(r => setTimeout(r, MEMPOOL_WAIT - elapsed));
+    // Wait for previous write to THIS identity to confirm
+    const prevTx = lastTxId.get(idName);
+    if (prevTx) {
+      await waitForTxSpendable(prevTx);
     }
 
     try {
       const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
+      lastTxId.set(idName, txid);
       lastWrite.set(idName, Date.now());
+      console.log('[P2P] Written to ' + idName + ' tx=' + txid.substring(0, 12));
       return txid;
     } catch (e) {
       if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
-        // UTXO conflict — wait 2s for mempool then retry
-        console.log('[P2P] UTXO conflict on ' + idName + ' — retrying in 2s...');
-        await new Promise(r => setTimeout(r, 2000));
-        try {
-          const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
-          lastWrite.set(idName, Date.now());
-          return txid;
-        } catch (e2) {
-          // Second conflict — wait longer
-          console.log('[P2P] Second conflict on ' + idName + ' — waiting 5s...');
-          await new Promise(r => setTimeout(r, 5000));
-          const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
-          lastWrite.set(idName, Date.now());
-          return txid;
-        }
+        console.log('[P2P] UTXO conflict on ' + idName + ' — waiting...');
+        if (prevTx) await waitForTxSpendable(prevTx);
+        await new Promise(r => setTimeout(r, 1000)); // Extra 1s for propagation
+        const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
+        lastTxId.set(idName, txid);
+        lastWrite.set(idName, Date.now());
+        return txid;
       }
       throw e;
     }
@@ -98,11 +104,15 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
           recentBlockStart = Math.max(0, info.blocks - 200); // Last ~33 minutes
         } catch (e) { recentBlockStart = 0; }
       }
-      const content = await client.call('getidentitycontent', [
+      let content = await client.call('getidentitycontent', [
         fullName, recentBlockStart, -1
       ]);
-      // contentmultimap may be at top level or under .identity
-      const cmm = content.contentmultimap || content.identity?.contentmultimap;
+      let cmm = content.contentmultimap || content.identity?.contentmultimap;
+      // If no data in recent range, try reading all (for identities with few entries)
+      if (!cmm || Object.keys(cmm).length === 0) {
+        content = await client.call('getidentitycontent', [fullName, 0, -1]);
+        cmm = content.contentmultimap || content.identity?.contentmultimap;
+      }
       if (!cmm) return null;
 
       // Resolve VDXF key name to i-address and look it up in the result

@@ -777,8 +777,10 @@ if (USE_LOCAL) {
         playerActed = true;
         const actionData = { action: method, amount: msg.amount || 0, player: LOCAL_ID, timestamp: Date.now() };
         console.log('[P2P] Writing action: ' + method);
-        p2p.write(LOCAL_ID, KEYS.PLAYER_ACTION, actionData)
-          .then(() => console.log('[P2P] Action written'))
+        // Write directly to identity — don't wait for previous TX confirm (speed is critical)
+        const idName = LOCAL_ID.replace('.CHIPS@', '');
+        p2p.client.writeToIdentity(idName, KEYS.PLAYER_ACTION, actionData)
+          .then(txid => { console.log('[P2P] Action written tx=' + txid.substring(0, 12)); })
           .catch(e => console.log('[P2P] Action write failed: ' + e.message));
       }
       const info = clients.get(ws);
