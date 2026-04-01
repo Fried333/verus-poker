@@ -1263,8 +1263,10 @@ if (USE_LOCAL) {
               p2pSendSeats(updatedPlayers, { phase: 'settled', pot: 0, handCount: currentHand, dealerSeat: 1 });
 
               // Clear board + cards, show waiting state
+              console.log('[P2P] >>> CLEARING TABLE (hand ' + currentHand + ') <<<');
               broadcast({ method: 'deal', deal: { board: [], holecards: [] } });
-              p2pSendSeats(buildPlayers(chipMap), { phase: 'Shuffling next hand...', pot: 0, handCount: currentHand, dealerSeat: 1 });
+              const clearPl1 = buildPlayers(chipMap).map(p => ({ ...p, holeCards: [], holeCardNames: [] }));
+              p2pSendSeats(clearPl1, { phase: 'Shuffling next hand...', pot: 0, handCount: currentHand, dealerSeat: 1 });
 
               // Clear table after showing results for 3 seconds
               await new Promise(r => setTimeout(r, 3000));
