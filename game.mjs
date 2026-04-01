@@ -303,12 +303,13 @@ function isRoundComplete(game) {
  * Advance to the next phase
  */
 function advancePhase(game) {
-  // Reset bets for new round
+  // Reset bets and min raise for new street
   for (const p of game.players) {
     p.bet = 0;
   }
   game.actedThisRound = new Set();
   game.lastRaiser = -1;
+  game.minRaise = game.bigBlind; // Reset to BB each street
 
   switch (game.phase) {
     case PREFLOP:
