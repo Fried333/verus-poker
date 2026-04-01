@@ -36,6 +36,12 @@ async function main() {
 
   await page1.goto('http://localhost:' + PORT + '/play?name=Alice');
   await page2.goto('http://localhost:' + PORT + '/play?name=Bob');
+  await WAIT(2000);
+  // Click "Sit Here" on both pages (lobby → game)
+  const sit1 = await page1.$('button:has-text("Sit Here")');
+  const sit2 = await page2.$('button:has-text("Sit Here")');
+  if (sit1) await sit1.click();
+  if (sit2) await sit2.click();
   await WAIT(3000);
 
   // ══════════════════════════════
