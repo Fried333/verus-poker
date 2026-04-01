@@ -563,8 +563,8 @@ function handle(m) {
         if (m.sbSeat !== undefined) st.sbSeat = m.sbSeat;
         if (m.bbSeat !== undefined) st.bbSeat = m.bbSeat;
         if (m.phase) {
-          // Clear board when new hand starts
-          if ((m.phase === 'shuffling' || m.phase === 'preflop') && st.phase !== m.phase) {
+          // Clear board only when explicitly shuffling (new hand)
+          if (m.phase.toLowerCase().includes('shuffling') && st.phase !== m.phase) {
             renderBoard([]);
           }
           st.phase = m.phase;

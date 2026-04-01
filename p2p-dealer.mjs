@@ -236,7 +236,7 @@ export function createP2PDealer(p2p, config, localNotify) {
         // Ask for action via callback (works for local player and auto-play)
         action = await new Promise(resolve => {
           notify('need_action', { resolve, validActions, toCall, seat, playerId: p.id, pot: game.pot, minRaise: game.minRaise,
-            handId, gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })) });
+            phase: game.phase, handId, gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })) });
           setTimeout(() => resolve(null), 30000);
         });
 

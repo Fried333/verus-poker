@@ -943,6 +943,7 @@ if (USE_LOCAL) {
             const hid = data.handId || (p2pDealer.getGameId() + '_h' + p2pDealer.getHandCount());
             await p2p.writeBettingState(hid, {
               turn: data.playerId, validActions: data.validActions, toCall: data.toCall, pot: data.pot, minRaise: data.minRaise,
+              phase: data.phase || 'preflop',
               session: p2pDealer.getGameId(), hand: p2pDealer.getHandCount(),
               players: data.gamePlayers || [], ts: Date.now()
             });
