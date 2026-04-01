@@ -1173,16 +1173,15 @@ if (USE_LOCAL) {
               const prevBS = lastBS;
               lastBS = bs;
 
-              // Opponent acted or turn changed — reset playerActed if it's a new turn
-              if (bs.turn !== LOCAL_ID) {
-                playerActed = false; // New turn = we can act next time
-                if (bs.action) {
-                  console.log('[P2P] ' + pt() + ' Opponent: ' + (bs.action || 'acted'));
-                  pLog('betting', (bs.turn || 'Opponent') + ' ' + (bs.action || 'acts'));
-                }
+              // New betting state = reset playerActed (it's a genuinely new prompt)
+              // The JSON comparison already ensures this is different from lastBS
+              playerActed = false;
+              if (bs.action && bs.turn !== LOCAL_ID) {
+                console.log('[P2P] ' + pt() + ' Opponent: ' + (bs.action || 'acted'));
+                pLog('betting', (bs.turn || 'Opponent') + ' ' + (bs.action || 'acts'));
               }
 
-              // My turn — show buttons (only if we haven't already acted)
+              // My turn — show buttons (only if we haven't already acted this round)
               if (bs.turn === LOCAL_ID && bs.validActions && !playerActed) {
                 console.log('[P2P] ' + pt() + ' My turn! pot=' + (bs.pot||0) + ' toCall=' + (bs.toCall||0));
                 pLog('turn', 'Your turn — pot: ' + (bs.pot||0) + ', to call: ' + (bs.toCall||0));
