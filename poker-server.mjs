@@ -1138,9 +1138,10 @@ if (USE_LOCAL) {
               // Snapshot chips for winner calculation
               handStartChips = {};
               buildPlayers().forEach(p => handStartChips[p.id] = p.chips);
-              // Clear table
+              // Clear table — send empty cards for ALL players
               broadcast({ method: 'deal', deal: { board: [], holecards: [] } });
-              p2pSendSeats(buildPlayers(), { phase: 'Shuffling...', handCount: currentHand, dealerSeat: 1 });
+              const clearPlayers = buildPlayers().map(p => ({ ...p, holeCards: [], holeCardNames: [] }));
+              p2pSendSeats(clearPlayers, { phase: 'Shuffling...', handCount: currentHand, dealerSeat: 1 });
               pLog('system', 'Hand #' + currentHand + ' starting...');
             }
 
