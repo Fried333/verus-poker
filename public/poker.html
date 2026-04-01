@@ -549,6 +549,7 @@ function handle(m) {
     case 'table_info': break;
     case 'info':
       seat = m.playerid;
+      if (m.id) { myId = m.id; document.getElementById('my-name').textContent = m.id; }
       if (!st) st = { players: [], phase: 'waiting', pot: 0, currentTurn: -1 };
       document.getElementById('controls').innerHTML = '<span class="wait-text">Waiting for players...</span>';
       break;
@@ -868,8 +869,8 @@ function render() {
   // Cards now shown at seat on the felt — clear bottom bar cards
   document.getElementById('my-cards').innerHTML = '';
 
-  // My chips
-  const me = st.players.find(p => p.seat === seat);
+  // My chips — find by seat or by ID
+  const me = st.players.find(p => p.seat === seat) || st.players.find(p => p.id === myId);
   document.getElementById('my-chips').textContent = me ? me.chips + ' chips' : '';
 
   // Controls

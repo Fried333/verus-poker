@@ -384,7 +384,7 @@ function handleMessage(ws, raw) {
         table_min_stake: 50,
         occupied_seats: [...clients.values()].filter(c => c.seat !== undefined).map(c => ({ seat: c.seat, player_id: c.id, stack: c.chips || 200 }))
       });
-      sendTo(ws, { method: 'info', playerid: seat, seat_taken: false });
+      sendTo(ws, { method: 'info', playerid: seat, id, seat_taken: false });
       if (sittingOut && chips <= 0) {
         sendTo(ws, { method: 'busted' });
       } else if (waitForNext) {
@@ -705,9 +705,8 @@ let p2pActionResolver = null; // Resolves when browser player acts
 let joinSession = null;       // Session from player join flow
 let dealerSeated = false;     // Dealer browser clicked "Sit Here"
 const chipTracker = {};       // Persistent chip counts across hands
-let p2pMyCards = null;        // Current hole cards (for reconnect)
-let p2pCurrentHandId = null;  // Current hand ID (for reconnect)
-let p2pLastBoard = null;      // Last board sent (for reconnect)
+let pushState = null;         // Set by player startup, used by reconnect handler
+let acted = false;            // Player acted this turn (prevents double-action)
 
 if (USE_LOCAL) {
   if (!RPC_CONFIG) { console.error('ERROR: CHIPS daemon config not found'); process.exit(1); }
@@ -770,12 +769,8 @@ if (USE_LOCAL) {
         resolver({ action: method, amount: msg.amount || 0 });
       } else if (LOCAL_ROLE === 'player') {
         acted = true;
-        // Clear action buttons immediately
-        if (typeof gs !== 'undefined') {
-          gs.turn = null; gs.validActions = [];
-          gs.message = 'Waiting for opponent...';
-          pushState();
-        }
+        // Clear action buttons in browser
+        broadcast({ method: 'betting', action: 'waiting', playerid: 0 });
         const actionData = { action: method, amount: msg.amount || 0, player: LOCAL_ID, timestamp: Date.now() };
         console.log('[P2P] Writing action: ' + method);
         const idName = LOCAL_ID.replace('.CHIPS@', '');
@@ -813,10 +808,10 @@ if (USE_LOCAL) {
       const reconnectChips = chipTracker[LOCAL_ID] || 200;
       clients.set(ws, { id: LOCAL_ID, seat: 0, chips: reconnectChips });
       sendTo(ws, { method: 'backend_status', backend_status: 1 });
-      sendTo(ws, { method: 'info', playerid: 0, seat_taken: false });
+      sendTo(ws, { method: 'info', playerid: 0, id: LOCAL_ID, seat_taken: false });
       console.log('[P2P] Browser reconnected: ' + LOCAL_ID);
       // Push full game state — browser gets everything instantly
-      if (typeof pushState === 'function') pushState();
+      if (pushState) pushState();
 
       // For dealer: just mark as seated
       if (LOCAL_ROLE === 'dealer') {
@@ -1082,7 +1077,7 @@ if (USE_LOCAL) {
       };
 
       // Push FULL state to ALL browsers — called after every change
-      function pushState() {
+      pushState = function() {
         // Build seats with privacy (hide other players' cards except at showdown)
         const isShowdown = gs.phase === 'showdown' || gs.phase === 'settled';
         const seats = gs.players.map(p => ({
@@ -1148,11 +1143,10 @@ if (USE_LOCAL) {
 
         // Log
         if (gs.message) broadcast({ method: 'comm', type: 'system', msg: gs.message });
-      }
+      };
 
       let lastBSJson = null;
       let lastSettledHandId = null;
-      let acted = false;
       let pollRunning = false;
       let joinWritten = false;
       const pollStart = Date.now();
