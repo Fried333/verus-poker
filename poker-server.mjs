@@ -1072,7 +1072,7 @@ if (USE_LOCAL) {
       }
       console.log('[P2P] Player mode — waiting for browser + join acknowledgement...');
       let lastBS = null, lastBCPhase = '', lastBCHand = 0, lastST = null;
-      let currentSession = null, currentHand = 0, currentHandId = null, myCards = null;
+      let currentSession = null, currentHand = 0, currentHandId = null, lastSettledHandId = null, myCards = null;
       let handStartChips = {}; // Snapshot chips at hand start for winner calculation
       let pollRunning = false;  // Guard against duplicate poll loops
       let joinWritten = false;  // Don't poll until join is written
@@ -1139,7 +1139,7 @@ if (USE_LOCAL) {
 
             // 0b. Check for new handId from table_info
             const tcPoll = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
-            if (tcPoll && tcPoll.currentHandId && tcPoll.currentHandId !== currentHandId) {
+            if (tcPoll && tcPoll.currentHandId && tcPoll.currentHandId !== currentHandId && tcPoll.currentHandId !== lastSettledHandId) {
               const newHandId = tcPoll.currentHandId;
               console.log('[P2P] ' + pt() + ' New handId: ' + newHandId);
               currentHandId = newHandId;
@@ -1266,10 +1266,11 @@ if (USE_LOCAL) {
               broadcast({ method: 'deal', deal: { board: [], holecards: [] } });
               p2pSendSeats(buildPlayers(chipMap), { phase: 'Shuffling next hand...', pot: 0, handCount: currentHand, dealerSeat: 1 });
 
-              // Reset for next hand
+              // Reset for next hand — remember settled handId to skip it
               myCards = null;
               playerActed = false;
-              // Keep lastBS, lastBCPhase, lastBCHand — prevents re-processing stale data
+              lastSettledHandId = currentHandId;
+              currentHandId = null;
               pLog('system', 'Waiting for next hand...');
             }
           } catch (e) {
