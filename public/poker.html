@@ -721,11 +721,12 @@ function handleFinalInfo(m) {
 
   winnerSeats = m.winners || [];
   winAmount = m.win_amount || 0;
+  const pn = m.playerNames || {}; // seat → player name from server
 
   // Show winner banner with hand name
   const banner = document.getElementById('winner-banner');
-  if (winnerSeats.length > 0 && st && st.players) {
-    const names = winnerSeats.map(s => st.players[s] ? (st.players[s].id || 'Seat '+(s+1)) : 'Seat '+(s+1));
+  if (winnerSeats.length > 0) {
+    const names = winnerSeats.map(s => pn[s] || (st && st.players && st.players[s] ? st.players[s].id : null) || 'Seat '+(s+1));
     const winHand = winnerSeats.map(s => hNames[s]).filter(Boolean).join(', ');
     banner.querySelector('.wb-title').textContent = names.join(' & ') + ' wins!';
     banner.querySelector('.wb-detail').textContent = (winHand ? winHand + ' — ' : '') + '+' + winAmount + ' chips';
@@ -733,8 +734,9 @@ function handleFinalInfo(m) {
   }
 
   winnerSeats.forEach(w => {
+    const name = pn[w] || pName(w);
     const hn = hNames[w] ? ' with ' + hNames[w] : '';
-    log('showdown', '★ ' + pName(w) + ' WINS ' + winAmount + hn);
+    log('showdown', '★ ' + name + ' WINS ' + winAmount + hn);
   });
   if (board.length) renderBoard(board);
   render();
@@ -1029,6 +1031,8 @@ function joinGame() {
   document.getElementById('lobby').style.display = 'none';
   document.getElementById('game-screen').style.display = 'flex';
   renderBoard([]);
+  // Tell server player is sitting down (triggers chain join in P2P mode)
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'sit' }));
   // Populate table info bar
   fetch('/api/table').then(r=>r.json()).then(info => {
     const ti = id => document.getElementById(id);

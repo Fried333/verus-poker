@@ -713,6 +713,9 @@ const RPC_CONFIG = findRPCConfig();
 
 let p2pDealer = null;
 let p2pActionResolver = null; // Resolves when browser player acts
+let joinSession = null;       // Session from player join flow
+let dealerSeated = false;     // Dealer browser clicked "Sit Here"
+const chipTracker = {};       // Persistent chip counts across hands
 
 if (USE_LOCAL) {
   if (!RPC_CONFIG) { console.error('ERROR: CHIPS daemon config not found'); process.exit(1); }
@@ -788,31 +791,87 @@ if (USE_LOCAL) {
       return;
     }
 
-    if (method === 'join') {
-      clients.set(ws, { id: LOCAL_ID, seat: 0, chips: 200 });
+    if (method === 'reload') {
+      const info = clients.get(ws);
+      if (info) info.chips = 200;
+      // Update dealer's player list
+      if (p2pDealer) {
+        const pp = p2pDealer.getPlayers().find(p => p.id === (info ? info.id : LOCAL_ID));
+        if (pp) pp.chips = 200;
+      }
+      sendTo(ws, { method: 'reloaded', chips: 200 });
+      console.log('[P2P] ' + (info ? info.id : LOCAL_ID) + ' reloaded to 200');
+      return;
+    }
+
+    if (method === 'sitin') {
+      const info = clients.get(ws);
+      if (info) info.sittingOut = false;
+      sendTo(ws, { method: 'satin' });
+      console.log('[P2P] ' + (info ? info.id : LOCAL_ID) + ' sat back in');
+      return;
+    }
+
+    if (method === 'join' || method === 'sit') {
+      const reconnectChips = chipTracker[LOCAL_ID] || 200;
+      clients.set(ws, { id: LOCAL_ID, seat: 0, chips: reconnectChips });
       sendTo(ws, { method: 'backend_status', backend_status: 1 });
       sendTo(ws, { method: 'info', playerid: 0, seat_taken: false });
-      console.log('[P2P] Browser connected: ' + LOCAL_ID);
-      if (LOCAL_ROLE === 'player') {
-        // Read table config to get session ID before writing join
+      console.log('[P2P] Browser connected: ' + LOCAL_ID + ' chips=' + reconnectChips + ' (method=' + method + ')');
+      // Send current seats immediately so browser has chip data on reconnect
+      if (Object.keys(chipTracker).length > 0) {
+        const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p1'];
+        const pl = [{ id: LOCAL_ID, seat: 0, chips: reconnectChips, holeCards: [] }];
+        otherIds.forEach((pid, i) => pl.push({ id: pid, seat: i + 1, chips: chipTracker[pid] || 200, holeCards: ['??','??'] }));
+        p2pSendSeats(pl, { phase: 'waiting', dealerSeat: 1 });
+      }
+
+      // For dealer: just mark as seated
+      if (LOCAL_ROLE === 'dealer') {
+        dealerSeated = true;
+        return;
+      }
+
+      // For player: write chain join (only once)
+      if (LOCAL_ROLE === 'player' && !joinSession) {
+        console.log('[P2P] Writing chain join...');
         (async () => {
           let session = null;
+          console.log('[P2P] Looking for active table session...');
+
+          const staleSession = new Set();
           try {
-            const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
-            if (tc && tc.session) session = tc.session;
-          } catch(e) {}
-          const joinData = { table: TABLE_ID, player: LOCAL_ID, ready: true, timestamp: Date.now() };
-          if (session) joinData.session = session;
+            const st = await p2p.read(TABLE_ID, KEYS.SETTLEMENT);
+            if (st && st.session) staleSession.add(st.session);
+          } catch {}
+
+          for (let i = 0; i < 90; i++) {
+            try {
+              const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+              if (tc && tc.session) {
+                if (staleSession.has(tc.session)) {
+                  if (i % 10 === 0) console.log('[P2P] Session ' + tc.session + ' already settled, waiting for new...');
+                } else {
+                  session = tc.session;
+                  console.log('[P2P] Found active session: ' + session + ' Dealer: ' + (tc.dealer || '?'));
+                  break;
+                }
+              }
+            } catch(e) {}
+            if (i % 10 === 0 && !session) console.log('[P2P] Waiting for dealer... (' + (i*2) + 's)');
+            await new Promise(r => setTimeout(r, 2000));
+          }
+          if (!session) console.log('[P2P] WARNING: No active session found after 3 min');
+
+          const joinData = { table: TABLE_ID, player: LOCAL_ID, session, ready: true, timestamp: Date.now() };
+          joinSession = session;
           try {
             await p2p.write(LOCAL_ID, KEYS.JOIN_REQUEST, joinData);
-            console.log('[P2P] Join signal written' + (session ? ' (session=' + session + ')' : ''));
-            // NOW start the poll loop — only after join is acknowledged on chain
-            if (p2p._playerPollStart) p2p._playerPollStart();
+            console.log('[P2P] Join written (session=' + (session || 'none') + ')');
           } catch(e) {
-            console.log('[P2P] Join signal failed: ' + e.message);
-            // Start poll anyway so player isn't stuck
-            if (p2p._playerPollStart) p2p._playerPollStart();
+            console.log('[P2P] Join write failed: ' + e.message);
           }
+          if (p2p._playerPollStart) p2p._playerPollStart();
         })();
       }
       return;
@@ -840,17 +899,32 @@ if (USE_LOCAL) {
       const myCards = data.holeCards[LOCAL_ID];
       if (myCards) {
         dLog('cards', 'Your cards: ' + myCards.map(c => typeof c === 'number' ? cardToString(c) : c).join(' '));
-        for (const [ws2] of clients) sendTo(ws2, { method: 'deal', deal: { holecards: myCards.map(c => typeof c === 'number' ? cardToString(c) : c) } });
+        for (const [ws2] of clients) sendTo(ws2, { method: 'deal', deal: { board: [], holecards: myCards.map(c => typeof c === 'number' ? cardToString(c) : c) } });
       }
+      // Use game player chips (after blinds) for accurate display
+      const gp = data.gamePlayers || [];
       const pl = p2pDealer.getPlayers();
-      p2pSendSeats(pl.map(p => ({ ...p, bet: 0, folded: false, allIn: false,
-        holeCards: p.id === LOCAL_ID ? (myCards || []).map(c => typeof c === 'number' ? cardToString(c) : c) : ['??', '??']
-      })), { phase: 'preflop', handCount: p2pDealer.getHandCount() });
+      p2pSendSeats(pl.map(p => {
+        const gpp = gp.find(g => g.id === p.id);
+        return { ...p, chips: gpp ? gpp.chips : p.chips, bet: gpp ? gpp.bet : 0, folded: false, allIn: false,
+          holeCards: p.id === LOCAL_ID ? (myCards || []).map(c => typeof c === 'number' ? cardToString(c) : c) : ['??', '??']
+        };
+      }), { phase: 'preflop', pot: data.pot || 0, handCount: p2pDealer.getHandCount(), dealerSeat: data.dealerSeat || 0 });
     }
     if (event === 'action') {
-      const seat = p2pDealer.getPlayers().findIndex(p => p.id === data.player);
+      const seatIdx = p2pDealer.getPlayers().findIndex(p => p.id === data.player);
       dLog('betting', data.player + ' ' + data.action + (data.amount ? ' ' + data.amount : ''));
-      broadcast({ method: 'betting', action: data.action, playerid: seat, bet_amount: data.amount || 0 });
+      broadcast({ method: 'betting', action: data.action, playerid: seatIdx, bet_amount: data.amount || 0 });
+      // Update seats with current chip/bet/pot after action
+      if (data.gamePlayers) {
+        const gp = data.gamePlayers;
+        const pl = p2pDealer.getPlayers();
+        p2pSendSeats(pl.map(p => {
+          const gpp = gp.find(g => g.id === p.id);
+          return { ...p, chips: gpp ? gpp.chips : p.chips, bet: gpp ? gpp.bet : 0,
+            folded: gpp ? !!gpp.folded : false, allIn: false, holeCards: ['??', '??'] };
+        }), { phase: data.phase || 'preflop', pot: data.pot || 0, handCount: p2pDealer.getHandCount() });
+      }
     }
     if (event === 'community_cards') {
       const board = (data.board || []).map(c => typeof c === 'number' ? cardToString(c) : c);
@@ -859,6 +933,7 @@ if (USE_LOCAL) {
     }
     if (event === 'need_action') {
       if (data.playerId === LOCAL_ID) {
+        // Dealer player — show buttons in browser, wait for click
         p2pActionResolver = data.resolve;
         const mySeat = p2pDealer.getPlayers().findIndex(p => p.id === LOCAL_ID);
         const poss = data.validActions.map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined);
@@ -872,7 +947,8 @@ if (USE_LOCAL) {
           try {
             await p2p.write(TABLE_ID, KEYS.BETTING_STATE, {
               turn: data.playerId, validActions: data.validActions, toCall: data.toCall, pot: data.pot, minRaise: data.minRaise,
-              session: p2pDealer.getGameId(), hand: p2pDealer.getHandCount()
+              session: p2pDealer.getGameId(), hand: p2pDealer.getHandCount(),
+              players: data.gamePlayers || [], ts: Date.now()
             });
           } catch (e) { console.log('[P2P] Write betting state error: ' + e.message); }
           // Show waiting in dealer's browser
@@ -893,17 +969,33 @@ if (USE_LOCAL) {
       }
     }
     if (event === 'showdown') {
+      // Include player names so browser doesn't need to look them up from seats
+      const playerNames = {};
+      if (p2pDealer) p2pDealer.getPlayers().forEach(p => { playerNames[p.seat] = p.id; });
       broadcast({ method: 'finalInfo', winners: data.winners, win_amount: data.winAmount, handNames: data.handNames,
-        showInfo: { allHoleCardsInfo: data.allHoleCards, boardCardInfo: data.board } });
+        playerNames, showInfo: { allHoleCardsInfo: data.allHoleCards, boardCardInfo: data.board } });
     }
     if (event === 'hand_complete') {
       console.log('[P2P] Hand ' + data.hand + ': verified=' + data.verified);
       data.players.forEach(p => console.log('  ' + p.id + ': ' + p.chips));
       for (const [, info] of clients) { const pp = data.players.find(p => p.id === info.id); if (pp) info.chips = pp.chips; }
       broadcast({ method: 'verification', hand: data.hand, valid: data.verified, errors: [] });
+      // Send updated seats with new chip counts
+      p2pSendSeats(data.players.map(p => ({ ...p, bet: 0, folded: false, allIn: false, holeCards: [] })),
+        { phase: 'settled', pot: 0, handCount: data.hand, dealerSeat: p2pDealer ? (p2pDealer.getHandCount() % data.players.length) : 0 });
+      // Notify busted players (0 chips)
+      for (const [ws2, info] of clients) {
+        const pp = data.players.find(p => p.id === info.id);
+        if (pp && pp.chips <= 0) {
+          console.log('[P2P] ' + info.id + ' is busted');
+          sendTo(ws2, { method: 'busted' });
+        }
+      }
       setTimeout(async () => {
         if (p2pDealer && p2pDealer.getPlayers().filter(p => p.chips > 0).length >= 2) {
           try { await p2pDealer.runHand(); } catch (e) { console.log('[P2P] Hand error: ' + e.message); }
+        } else {
+          console.log('[P2P] Not enough players with chips — waiting for reload');
         }
       }, 5000);
     }
@@ -928,29 +1020,24 @@ if (USE_LOCAL) {
       const sessionId = p2pDealer.getGameId();
       const tableOpenTime = Date.now();
 
-      console.log('[P2P] Waiting for browser + remote players...');
+      dealerSeated = true; // Dealer auto-seats — no browser click needed
+      console.log('[P2P] Dealer auto-seated. Waiting for remote players...');
       console.log('[P2P] Session: ' + sessionId + ' | Table opened at: ' + new Date(tableOpenTime).toISOString());
       const waitLoop = async () => {
         while (true) {
-          // 1. Wait for OUR browser to connect
-          const browserConnected = [...clients.values()].some(c => c.id === LOCAL_ID);
-          if (!browserConnected) {
-            console.log('[P2P] Waiting for dealer browser to connect...');
-            await new Promise(r => setTimeout(r, 3000));
-            continue;
-          }
 
           // 2. Wait for ALL remote players to send fresh join requests
           let allReady = true;
           for (const pid of otherIds) {
             const req = await p2p.read(pid, KEYS.JOIN_REQUEST);
-            // Must have: correct table, timestamp AFTER table opened, within last 5 minutes
+            // Must have: correct table AND matching session (best) OR recent timestamp
+            const hasSession = req && req.session === sessionId;
             const isRecent = req && req.timestamp && req.timestamp > tableOpenTime && (Date.now() - req.timestamp) < 300000;
             const isCorrectTable = req && req.table === TABLE_ID;
-            if (!req || !isCorrectTable || !isRecent) {
+            if (!req || !isCorrectTable || (!hasSession && !isRecent)) {
               allReady = false;
-              if (req && req.timestamp) {
-                console.log('[P2P] ' + pid + ' join request too old (ts=' + req.timestamp + ' tableOpen=' + tableOpenTime + ')');
+              if (req && !hasSession && !isRecent) {
+                console.log('[P2P] ' + pid + ' join: session=' + (req.session||'none') + ' expected=' + sessionId + ' ts=' + req.timestamp + ' tableOpen=' + tableOpenTime);
               }
               break;
             }
@@ -995,9 +1082,10 @@ if (USE_LOCAL) {
       }
 
       function buildPlayers(chips) {
+        if (chips) Object.assign(chipTracker, chips); // Update tracker
         const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p1'];
-        const list = [{ id: LOCAL_ID, seat: 0, chips: chips?.[LOCAL_ID] || 200, holeCards: myCards || [] }];
-        otherIds.forEach((pid, i) => list.push({ id: pid, seat: i + 1, chips: chips?.[pid] || 200, holeCards: ['??','??'] }));
+        const list = [{ id: LOCAL_ID, seat: 0, chips: chipTracker[LOCAL_ID] || 200, holeCards: myCards || [] }];
+        otherIds.forEach((pid, i) => list.push({ id: pid, seat: i + 1, chips: chipTracker[pid] || 200, holeCards: ['??','??'] }));
         return list;
       }
 
@@ -1011,12 +1099,14 @@ if (USE_LOCAL) {
         pLog('system', 'Waiting for dealer to start hand...');
         while (true) {
           try {
-            // 0. Read table config EVERY cycle until session found
-            //    (dealer may not have written it yet, or old session may be stale)
+            // 0. Use session from join flow (already verified as NEW)
             if (!currentSession) {
-              const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
-              if (tc && tc.session) {
-                currentSession = tc.session;
+              currentSession = joinSession;
+              if (!currentSession) {
+                const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+                if (tc && tc.session) currentSession = tc.session;
+              }
+              if (currentSession) {
                 pLog('system', 'Session: ' + currentSession);
                 console.log('[P2P] ' + pt() + ' Got session: ' + currentSession);
                 // Check what hand is currently in progress — skip it, wait for next
@@ -1055,15 +1145,16 @@ if (USE_LOCAL) {
               lastST = null;
               console.log('[P2P] ' + pt() + ' Hand ' + currentHand + ' cards: ' + cr.cards.join(' '));
               pLog('cards', 'Hand #' + currentHand + ' — your cards: ' + cr.cards.join(' '));
-              for (const [ws2] of clients) sendTo(ws2, { method: 'deal', deal: { holecards: cr.cards } });
+              // Clear board from previous hand, deal new hole cards
+              broadcast({ method: 'deal', deal: { board: [], holecards: cr.cards } });
               p2pSendSeats(buildPlayers(), { phase: 'preflop', handCount: currentHand, dealerSeat: 1 });
             } else if (cr && cr.session && cr.session !== currentSession) {
               // Stale data from old session — ignore silently
             }
 
-            // 2. Betting state — STRICT session filter, detect ALL changes
+            // 2. Betting state — STRICT session + hand filter
             const bs = await p2p.read(TABLE_ID, KEYS.BETTING_STATE);
-            if (bs && bs.session === currentSession && JSON.stringify(bs) !== JSON.stringify(lastBS)) {
+            if (bs && bs.session === currentSession && (bs.hand || 0) >= currentHand && JSON.stringify(bs) !== JSON.stringify(lastBS)) {
               const prevBS = lastBS;
               lastBS = bs;
 
@@ -1074,7 +1165,7 @@ if (USE_LOCAL) {
               }
 
               // My turn — show buttons
-              if (bs.turn === LOCAL_ID && !playerActed && bs.validActions) {
+              if (bs.turn === LOCAL_ID && bs.validActions) {
                 console.log('[P2P] ' + pt() + ' My turn! pot=' + (bs.pot||0) + ' toCall=' + (bs.toCall||0));
                 pLog('turn', 'Your turn — pot: ' + (bs.pot||0) + ', to call: ' + (bs.toCall||0));
                 const poss = (bs.validActions || []).map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined);
@@ -1083,16 +1174,28 @@ if (USE_LOCAL) {
                   turnTimeout: 30, turnStart: Date.now(), possibilities: poss });
               }
 
-              // Update seats with pot info
-              p2pSendSeats(buildPlayers(), { phase: bs.phase || 'preflop', pot: bs.pot || 0,
+              // Update seats with pot/chip info from betting state
+              const bsChips = {};
+              if (bs.players) bs.players.forEach(p => { if (p.id && p.chips !== undefined) bsChips[p.id] = p.chips; });
+              if (Object.keys(bsChips).length > 0) console.log('[P2P] BS chips:', JSON.stringify(bsChips));
+              else console.log('[P2P] BS has no player chips (players=' + (bs.players ? bs.players.length : 'none') + ')');
+              const pl = buildPlayers(Object.keys(bsChips).length > 0 ? bsChips : undefined);
+              // Apply bet/folded state from dealer's betting data
+              if (bs.players) {
+                for (const bp of bs.players) {
+                  const seat = pl.find(s => s.id === bp.id);
+                  if (seat) { seat.bet = bp.bet || 0; seat.folded = !!bp.folded; }
+                }
+              }
+              p2pSendSeats(pl, { phase: bs.phase || 'preflop', pot: bs.pot || 0,
                 currentTurn: bs.turn === LOCAL_ID ? 0 : 1, handCount: currentHand, dealerSeat: 1 });
             } else if (bs && bs.session && bs.session !== currentSession) {
               // Stale betting state from old session — ignore
             }
 
-            // 3. Board cards — STRICT session filter
+            // 3. Board cards — STRICT session + hand filter
             const bc = await p2p.read(TABLE_ID, KEYS.BOARD_CARDS);
-            if (bc && bc.board && bc.session === currentSession && bc.phase !== lastBCPhase) {
+            if (bc && bc.board && bc.session === currentSession && (bc.hand || 0) >= currentHand && bc.phase !== lastBCPhase) {
               lastBCPhase = bc.phase;
               console.log('[P2P] ' + pt() + ' Board (' + bc.phase + '): ' + bc.board.join(' '));
               pLog('cards', bc.phase.charAt(0).toUpperCase() + bc.phase.slice(1) + ': ' + bc.board.join(' '));
@@ -1119,16 +1222,36 @@ if (USE_LOCAL) {
               }
 
               pLog('verify', 'Verified: ' + (st.verified ? 'PASS' : 'FAIL'));
+              // Send winner banner to player browser
+              if (st.results) {
+                const startChips2 = {};
+                buildPlayers().forEach(p => startChips2[p.id] = p.chips);
+                const winners = [];
+                let winAmount = 0;
+                const playerNames = {};
+                st.results.forEach((r, i) => {
+                  playerNames[i] = r.id;
+                  const delta = r.chips - (startChips2[r.id] || 200);
+                  if (delta > 0) { winners.push(i); winAmount = delta; }
+                });
+                if (winners.length > 0) {
+                  broadcast({ method: 'finalInfo', winners, win_amount: winAmount, playerNames,
+                    handNames: {}, showInfo: { allHoleCardsInfo: {}, boardCardInfo: st.board || [] } });
+                }
+              }
               broadcast({ method: 'verification', hand: st.hand || 1, valid: st.verified, errors: [] });
               // Update seats with final chips
               const chipMap = {};
               if (st.results) st.results.forEach(r => chipMap[r.id] = r.chips);
-              p2pSendSeats(buildPlayers(chipMap), { phase: 'settled', pot: 0, handCount: currentHand, dealerSeat: 1 });
+              console.log('[P2P] Updating chips:', JSON.stringify(chipMap));
+              const updatedPlayers = buildPlayers(chipMap);
+              console.log('[P2P] Sending seats:', updatedPlayers.map(p => p.id + ':' + p.chips).join(' '));
+              p2pSendSeats(updatedPlayers, { phase: 'settled', pot: 0, handCount: currentHand, dealerSeat: 1 });
 
-              // Reset for next hand — clear stale tracking but keep session
+              // Reset for next hand — keep lastBS to avoid re-processing stale data
               myCards = null;
               playerActed = false;
-              lastBS = null;
+              // DON'T reset lastBS — old betting state would re-trigger buttons
               lastBCPhase = '';
               pLog('system', 'Waiting for next hand...');
             } else if (st && st.session && st.session !== currentSession) {

@@ -10,7 +10,7 @@
 import { createClient, VDXF_KEYS, gameKey, playerDeckKey } from './verus-rpc.mjs';
 
 const POLL_INTERVAL = 1500;
-const WRITE_GAP = 1000; // Min ms between writes (initial delay before checking)
+const WRITE_GAP = 1200; // Min ms between writes to same identity
 
 /**
  * Serialize BigInt values for on-chain storage
@@ -91,45 +91,47 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     return r.vdxfid;
   }
 
-  let recentBlockStart = 0; // Set after first getinfo call
+  function extractHex(val) {
+    // Extract hex data from a contentmultimap value, taking LAST (newest) element
+    const last = Array.isArray(val) ? val[val.length - 1] : val;
+    return typeof last === 'string' ? last : (typeof last === 'object' && last !== null ? Object.values(last)[0] : null);
+  }
+
+  function parseHex(hex) {
+    if (!hex || typeof hex !== 'string') return null;
+    try { return JSON.parse(Buffer.from(hex, 'hex').toString('utf8')); } catch { return null; }
+  }
+
+  // Cache block height (refreshed every 10s)
+  let cachedBlocks = 0;
+  let blocksRefreshedAt = 0;
+  async function getBlocks() {
+    if (Date.now() - blocksRefreshedAt < 10000 && cachedBlocks > 0) return cachedBlocks;
+    try { const info = await client.getInfo(); cachedBlocks = info.blocks; blocksRefreshedAt = Date.now(); } catch {}
+    return cachedBlocks;
+  }
 
   async function read(identityId, vdxfKey) {
     try {
       const fullName = identityId.includes('.') ? identityId : identityId + '.CHIPS@';
-      // Read from recent blocks only — avoids scanning thousands of old entries
-      // First call gets current block height, subsequent calls use it
-      if (recentBlockStart === 0) {
-        try {
-          const info = await client.getInfo();
-          recentBlockStart = Math.max(0, info.blocks - 200); // Last ~33 minutes
-        } catch (e) { recentBlockStart = 0; }
-      }
-      let content = await client.call('getidentitycontent', [
-        fullName, recentBlockStart, -1
-      ]);
-      let cmm = content.contentmultimap || content.identity?.contentmultimap;
-      // If no data in recent range, try reading all (for identities with few entries)
-      if (!cmm || Object.keys(cmm).length === 0) {
-        content = await client.call('getidentitycontent', [fullName, 0, -1]);
-        cmm = content.contentmultimap || content.identity?.contentmultimap;
-      }
-      if (!cmm) return null;
-
-      // Resolve VDXF key name to i-address and look it up in the result
       const keyId = await resolveVdxfId(vdxfKey);
-      const keyData = cmm[keyId];
-      if (!keyData) return null;
+      const blocks = await getBlocks();
 
-      // Data can be a hex string or an array of entries
-      let hexData;
-      if (typeof keyData === 'string') {
-        hexData = keyData;
-      } else if (Array.isArray(keyData) && keyData.length > 0) {
-        const last = keyData[keyData.length - 1];
-        hexData = typeof last === 'string' ? last : Object.values(last)[0];
+      // Pass VDXF key directly to getidentitycontent — filters server-side, much faster
+      // Params: [identity, heightstart, heightend, txproofs, txproofheight, vdxfkey]
+      const r = await client.call('getidentitycontent', [fullName, Math.max(0, blocks - 50), -1, false, 0, keyId]);
+      const cmm = r?.identity?.contentmultimap;
+      if (cmm && cmm[keyId]) {
+        const parsed = parseHex(extractHex(cmm[keyId]));
+        if (parsed) return deserialize(parsed);
       }
-      if (typeof hexData === 'string') {
-        return deserialize(JSON.parse(Buffer.from(hexData, 'hex').toString('utf8')));
+
+      // Fallback: getidentity (only shows latest TX's key, but fast)
+      const id = await client.getIdentity(fullName);
+      const cmm2 = id?.identity?.contentmultimap;
+      if (cmm2 && cmm2[keyId]) {
+        const parsed = parseHex(extractHex(cmm2[keyId]));
+        if (parsed) return deserialize(parsed);
       }
       return null;
     } catch (e) { return null; }

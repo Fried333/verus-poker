@@ -130,14 +130,22 @@ export function createP2PDealer(p2p, config, localNotify) {
       console.log('[DEALER] Dealing hole cards...');
       let cardPos = 0;
       const holeCards = {};
+      const usedCards = new Set(); // Prevent duplicate cards
       for (let i = 0; i < numPlayers; i++) {
         const cards = [];
         for (let c = 0; c < 2; c++) {
-          const idx = decodeCard(
+          let idx = decodeCard(
             cd.finalDecks[i][cardPos], cd.b[i][cardPos],
             dd.e[i], dd.d, playerData[i].sessionKey, playerData[i].initialDeck
           );
-          cards.push(idx % 52);
+          // If duplicate (cross-deck collision), try next position from this player's deck
+          let alt = cardPos + numPlayers * 2;
+          while (usedCards.has(idx) && alt < numCards) {
+            idx = decodeCard(cd.finalDecks[i][alt], cd.b[i][alt], dd.e[i], dd.d, playerData[i].sessionKey, playerData[i].initialDeck);
+            alt++;
+          }
+          usedCards.add(idx);
+          cards.push(idx);
           cardPos++;
         }
         holeCards[activePlayers[i].id] = cards;
@@ -149,8 +157,6 @@ export function createP2PDealer(p2p, config, localNotify) {
         // Write to base key only (player polls this). No duplicate game-specific write.
         await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.card_bv.' + activePlayers[i].id, cardData);
       }
-      notify('cards_dealt', { holeCards });
-
       // ── PLAY THE HAND (betting rounds) ──
       console.log('[DEALER] Playing hand...');
       const game = createGame({ smallBlind, bigBlind, rake: 0 });
@@ -162,6 +168,12 @@ export function createP2PDealer(p2p, config, localNotify) {
       for (let i = 0; i < numPlayers; i++) {
         setHoleCards(game, i, holeCards[activePlayers[i].id]);
       }
+
+      // Notify AFTER blinds posted so browser gets correct chip counts
+      notify('cards_dealt', { holeCards,
+        gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, seat: gp.seat })),
+        pot: game.pot, phase: game.phase, dealerSeat: game.dealerSeat
+      });
 
       // Write blinds state
       await p2p.writeBettingState(handId, {
@@ -180,7 +192,7 @@ export function createP2PDealer(p2p, config, localNotify) {
           const cards = [];
           for (let i = 0; i < 3; i++) {
             const idx = decodeCard(cd.finalDecks[0][revealPos], cd.b[0][revealPos], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
-            cards.push(idx % 52); revealPos++;
+            cards.push(idx); revealPos++;
           }
           dealBoard(game, cards);
           const boardData = { board: game.board.map(cardToString), phase: 'flop', hand: handCount, session: gameId };
@@ -190,7 +202,7 @@ export function createP2PDealer(p2p, config, localNotify) {
           await WAIT(1500);
         } else if (game.phase === 'turn' && game.board.length === 3) {
           const idx = decodeCard(cd.finalDecks[0][revealPos], cd.b[0][revealPos], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
-          dealBoard(game, [idx % 52]); revealPos++;
+          dealBoard(game, [idx ]); revealPos++;
           const turnData = { board: game.board.map(cardToString), phase: 'turn', hand: handCount, session: gameId };
           await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', turnData);
           notify('community_cards', { phase: 'turn', board: game.board });
@@ -198,7 +210,7 @@ export function createP2PDealer(p2p, config, localNotify) {
           await WAIT(1500);
         } else if (game.phase === 'river' && game.board.length === 4) {
           const idx = decodeCard(cd.finalDecks[0][revealPos], cd.b[0][revealPos], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
-          dealBoard(game, [idx % 52]); revealPos++;
+          dealBoard(game, [idx ]); revealPos++;
           const riverData = { board: game.board.map(cardToString), phase: 'river', hand: handCount, session: gameId };
           await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', riverData);
           notify('community_cards', { phase: 'river', board: game.board });
@@ -224,7 +236,8 @@ export function createP2PDealer(p2p, config, localNotify) {
         let action;
         // Ask for action via callback (works for local player and auto-play)
         action = await new Promise(resolve => {
-          notify('need_action', { resolve, validActions, toCall, seat, playerId: p.id, pot: game.pot, minRaise: game.minRaise });
+          notify('need_action', { resolve, validActions, toCall, seat, playerId: p.id, pot: game.pot, minRaise: game.minRaise,
+            gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })) });
           setTimeout(() => resolve(null), 30000);
         });
 
@@ -239,7 +252,9 @@ export function createP2PDealer(p2p, config, localNotify) {
           action = { action: FOLD, amount: 0 };
         }
         playerAction(game, seat, action.action, action.amount || 0);
-        notify('action', { player: p.id, action: action.action, amount: action.amount });
+        notify('action', { player: p.id, action: action.action, amount: action.amount,
+          gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })),
+          pot: game.pot, phase: game.phase });
         await WAIT(500);
       }
 
@@ -249,7 +264,7 @@ export function createP2PDealer(p2p, config, localNotify) {
         if (nonFolded.length > 1) {
           while (game.board.length < 5) {
             const idx = decodeCard(cd.finalDecks[0][revealPos], cd.b[0][revealPos], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
-            dealBoard(game, [idx % 52]); revealPos++;
+            dealBoard(game, [idx ]); revealPos++;
           }
           await p2p.writeBoardCards(handId, { board: game.board.map(cardToString), phase: 'showdown' });
           notify('community_cards', { phase: 'showdown', board: game.board });
@@ -268,12 +283,18 @@ export function createP2PDealer(p2p, config, localNotify) {
         for (const [seat, amt] of Object.entries(payouts)) {
           if (amt > 0) { winners.push(Number(seat)); winAmount = amt; }
         }
+        const nonFoldedCount = game.players.filter(p => !p.folded).length;
         for (const gp of game.players) {
-          if (!gp.folded && gp.holeCards.length > 0 && game.board.length >= 3) {
+          if (!gp.folded && gp.holeCards.length > 0 && game.board.length >= 3 && nonFoldedCount > 1) {
             const score = evaluateHand([...gp.holeCards, ...game.board]);
             handNames[gp.seat] = rankNames[Math.floor(score / 1e10)] || 'Unknown';
           }
-          allHoleCards[gp.seat] = gp.folded ? [null, null] : gp.holeCards.map(cardToString);
+          // Only reveal cards if actual showdown (2+ non-folded). Fold wins = no reveal.
+          if (nonFoldedCount > 1 && !gp.folded) {
+            allHoleCards[gp.seat] = gp.holeCards.map(cardToString);
+          } else {
+            allHoleCards[gp.seat] = [null, null];
+          }
         }
         notify('showdown', {
           winners, winAmount, handNames, allHoleCards,

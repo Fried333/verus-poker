@@ -33,6 +33,12 @@ export function playerInit(numCards, playerId) {
   for (let k = 0; k < numCards; k++) {
     const r_ik = randomBytes(32).toString('hex');
     const h_ik_bytes = createHash('sha256').update(r_ik + '||card_' + k + '_string').digest();
+    // Embed card index in byte 30 (matching C code: randval.bytes[30] = index)
+    h_ik_bytes[30] = k;
+    // Clamp for curve25519: bytes[0] &= 0xf8, bytes[31] &= 0x7f, bytes[31] |= 0x40
+    h_ik_bytes[0] &= 0xf8;
+    h_ik_bytes[31] &= 0x7f;
+    h_ik_bytes[31] |= 0x40;
     const h_ik = bytesToBigInt(new Uint8Array(h_ik_bytes)) % P;
     const P_ik = scalarMul(h_ik, G);
 
