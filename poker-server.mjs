@@ -1167,14 +1167,17 @@ if (USE_LOCAL) {
               const prevBS = lastBS;
               lastBS = bs;
 
-              // Opponent acted (turn changed, or action field present)
-              if (bs.action && bs.turn !== LOCAL_ID) {
-                console.log('[P2P] ' + pt() + ' Opponent: ' + (bs.action || 'acted'));
-                pLog('betting', (bs.turn || 'Opponent') + ' ' + (bs.action || 'acts'));
+              // Opponent acted or turn changed — reset playerActed if it's a new turn
+              if (bs.turn !== LOCAL_ID) {
+                playerActed = false; // New turn = we can act next time
+                if (bs.action) {
+                  console.log('[P2P] ' + pt() + ' Opponent: ' + (bs.action || 'acted'));
+                  pLog('betting', (bs.turn || 'Opponent') + ' ' + (bs.action || 'acts'));
+                }
               }
 
-              // My turn — show buttons
-              if (bs.turn === LOCAL_ID && bs.validActions) {
+              // My turn — show buttons (only if we haven't already acted)
+              if (bs.turn === LOCAL_ID && bs.validActions && !playerActed) {
                 console.log('[P2P] ' + pt() + ' My turn! pot=' + (bs.pot||0) + ' toCall=' + (bs.toCall||0));
                 pLog('turn', 'Your turn — pot: ' + (bs.pot||0) + ', to call: ' + (bs.toCall||0));
                 const poss = (bs.validActions || []).map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined);
