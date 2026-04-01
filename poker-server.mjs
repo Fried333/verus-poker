@@ -846,7 +846,7 @@ if (USE_LOCAL) {
               }
             } catch(e) {}
             if (i % 10 === 0 && !session) console.log('[P2P] Waiting for dealer... (' + (i*2) + 's)');
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise(r => setTimeout(r, 1000));
           }
           if (!session) console.log('[P2P] WARNING: No active session found after 3 min');
 
@@ -1266,7 +1266,7 @@ if (USE_LOCAL) {
           } catch (e) {
             console.log('[P2P] Poll error: ' + e.message);
           }
-          await new Promise(r => setTimeout(r, 2000));
+          await new Promise(r => setTimeout(r, 1000));
         }
       };
 

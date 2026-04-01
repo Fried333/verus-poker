@@ -9,7 +9,7 @@
 
 import { createClient, VDXF_KEYS, gameKey, playerDeckKey } from './verus-rpc.mjs';
 
-const POLL_INTERVAL = 1500;
+const POLL_INTERVAL = 1000;
 const WRITE_GAP = 1200; // Min ms between writes to same identity
 
 /**
