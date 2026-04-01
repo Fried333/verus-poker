@@ -202,7 +202,7 @@ function createIO() {
           handNames[mapSeat(Number(engineSeat))] = info.handName || '';
         }
         const playerNames = {};
-        engine.players.forEach((p, i) => { playerNames[mapSeat(i)] = p.id; });
+        g.players.forEach((p, i) => { playerNames[mapSeat(i)] = p.id; });
         broadcast({
           method: 'finalInfo', winners, win_amount: winAmount, handNames, playerNames,
           showInfo: { allHoleCardsInfo: allHoleCards, boardCardInfo: board }
@@ -279,27 +279,13 @@ async function runHand() {
     return decodeCard(encryptedCard, b_ij, e_i, d, p_i, initialDeck);
   }
 
-  // Deal hole cards using full cryptographic unblinding
-  let cardPos = 0;
-  for (let i = 0; i < numPlayers; i++) {
-    const cards = [];
-    for (let c = 0; c < 2; c++) {
-      const idx = decodeCardAtPosition(i, cardPos);
-      cards.push(idx % 52);
-      cardPos++;
-    }
-    engine.game.players[i].holeCards = cards;
-  }
-
-  let revealPos = numPlayers * 2;
+  // Crypto backend — engine calls revealCard(position) for both hole cards and community
+  // All cards decoded from deck 0 (single shuffled deck, no cross-deck duplicates)
   const crypto = {
-    async initDeck(n) { revealPos = numPlayers * 2; return {}; },
-    async revealCard() {
-      if (revealPos >= numCards) return revealPos % 52;
-      // Community cards: use player 0's deck (all players share same community cards)
-      const idx = decodeCardAtPosition(0, revealPos);
-      revealPos++;
-      return idx % 52;
+    async initDeck(n) { return {}; },
+    async revealCard(pos) {
+      if (pos >= numCards) return pos % 52;
+      return decodeCardAtPosition(0, pos);
     }
   };
 
@@ -325,6 +311,7 @@ async function runHand() {
     }
   }
   if (chain && chain.isReady()) chain.updateBalances(chipUpdate);
+  broadcastState(); // Send updated chips to browsers
 
   // Advance dealer for next hand
   serverDealerIdx++;

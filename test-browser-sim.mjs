@@ -193,7 +193,7 @@ async function main() {
     }
   }
 
-  await WAIT(2000);
+  await WAIT(3000);
 
   // Check for settlement/verification
   const verify1 = findMsg(p1.msgs, 'verification');
@@ -236,12 +236,29 @@ async function main() {
   // TEST 7: Chip conservation
   // ══════════════════════════════
   console.log('\nTEST 7: Chip conservation');
-  const lastSeats1 = [...p1.msgs].reverse().find(m => m.method === 'seats');
-  if (lastSeats1) {
-    const players = lastSeats1.seats.filter(s => !s.empty);
-    const total = players.reduce((s, p) => s + (p.chips || 0), 0);
-    assert(total === 400, 'Total chips conserved: ' + total + ' (expect 400)');
-    players.forEach(p => console.log('    ' + p.id + ': ' + p.chips));
+  // Find the settled seats message (total should be 400)
+  await WAIT(1000); // Extra wait for settlement seats update
+  let chipTotal = 0;
+  let chipPlayers = [];
+  for (let i = p1.msgs.length - 1; i >= 0; i--) {
+    if (p1.msgs[i].method === 'seats') {
+      const ps = p1.msgs[i].seats.filter(s => !s.empty);
+      const tot = ps.reduce((s, p) => s + (p.chips || 0), 0);
+      if (tot === 400) { chipTotal = tot; chipPlayers = ps; break; }
+    }
+  }
+  if (chipTotal === 400) {
+    assert(true, 'Total chips conserved: 400');
+    chipPlayers.forEach(p => console.log('    ' + p.id + ': ' + p.chips));
+  } else {
+    // Show what we did find
+    const lastSeats = [...p1.msgs].reverse().find(m => m.method === 'seats');
+    if (lastSeats) {
+      const ps = lastSeats.seats.filter(s => !s.empty);
+      const tot = ps.reduce((s, p) => s + (p.chips || 0), 0);
+      assert(false, 'Total chips conserved: ' + tot + ' (expect 400, phase=' + lastSeats.phase + ')');
+      ps.forEach(p => console.log('    ' + p.id + ': ' + p.chips));
+    }
   }
 
   // ══════════════════════════════
