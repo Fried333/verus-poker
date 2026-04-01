@@ -534,10 +534,10 @@ function handle(m) {
       if (m.deal) {
         if (m.deal.holecards) {
           myCards = m.deal.holecards;
-          // Snapshot chips at start of hand for delta display
           if (st && st.players) st.players.forEach(p => { if (!p.empty) chipsBefore[p.seat] = p.chips; });
           winnerSeats = [];
           document.getElementById('winner-banner').style.display = 'none';
+          document.getElementById('controls').innerHTML = '<span class="wait-text">Waiting...</span>';
           renderBoard([]);
           render();
         }
