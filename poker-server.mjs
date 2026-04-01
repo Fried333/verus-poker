@@ -769,10 +769,15 @@ if (USE_LOCAL) {
         p2pActionResolver = null;
         resolver({ action: method, amount: msg.amount || 0 });
       } else if (LOCAL_ROLE === 'player') {
-        playerActed = true;
+        acted = true;
+        // Clear action buttons immediately
+        if (typeof gs !== 'undefined') {
+          gs.turn = null; gs.validActions = [];
+          gs.message = 'Waiting for opponent...';
+          pushState();
+        }
         const actionData = { action: method, amount: msg.amount || 0, player: LOCAL_ID, timestamp: Date.now() };
         console.log('[P2P] Writing action: ' + method);
-        // Write directly to identity — don't wait for previous TX confirm (speed is critical)
         const idName = LOCAL_ID.replace('.CHIPS@', '');
         p2p.client.writeToIdentity(idName, KEYS.PLAYER_ACTION, actionData)
           .then(txid => { console.log('[P2P] Action written tx=' + txid.substring(0, 12)); })
@@ -809,16 +814,9 @@ if (USE_LOCAL) {
       clients.set(ws, { id: LOCAL_ID, seat: 0, chips: reconnectChips });
       sendTo(ws, { method: 'backend_status', backend_status: 1 });
       sendTo(ws, { method: 'info', playerid: 0, seat_taken: false });
-      console.log('[P2P] Browser reconnected: ' + LOCAL_ID + ' chips=' + reconnectChips + ' hand=' + p2pCurrentHandId + ' cards=' + (p2pMyCards ? p2pMyCards.join(',') : 'none'));
-      // Re-send full hand state on reconnect so browser isn't blank
-      if (p2pMyCards && p2pMyCards.length > 0) {
-        sendTo(ws, { method: 'deal', deal: { holecards: p2pMyCards, board: p2pLastBoard || [] } });
-      }
-      // Send current seats with correct chips
-      const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p1'];
-      const pl = [{ id: LOCAL_ID, seat: 0, chips: reconnectChips, holeCards: p2pMyCards || [] }];
-      otherIds.forEach((pid, i) => pl.push({ id: pid, seat: i + 1, chips: chipTracker[pid] || 200, holeCards: p2pMyCards ? ['??','??'] : [] }));
-      p2pSendSeats(pl, { phase: p2pMyCards ? 'playing' : 'waiting', dealerSeat: 1 });
+      console.log('[P2P] Browser reconnected: ' + LOCAL_ID);
+      // Push full game state — browser gets everything instantly
+      if (typeof pushState === 'function') pushState();
 
       // For dealer: just mark as seated
       if (LOCAL_ROLE === 'dealer') {
@@ -1065,221 +1063,222 @@ if (USE_LOCAL) {
         } catch (e) {}
         if (LOCAL_PLAYERS.length === 0) LOCAL_PLAYERS.push('poker-p1');
       }
-      console.log('[P2P] Player mode — waiting for browser + join acknowledgement...');
-      let lastBS = null, lastBCPhase = '', lastBCHand = 0, lastST = null;
-      let currentSession = null, currentHand = 0, currentHandId = null, lastSettledHandId = null, myCards = null;
-      let handStartChips = {}; // Snapshot chips at hand start for winner calculation
-      let pollRunning = false;  // Guard against duplicate poll loops
-      let joinWritten = false;  // Don't poll until join is written
+      console.log('[P2P] Player mode — single state object architecture');
+
+      // ═══════════════════════════════════════════════════
+      // SINGLE GAME STATE — the ONLY source of truth
+      // ═══════════════════════════════════════════════════
+      const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p1'];
+      const gs = {
+        phase: 'waiting', handId: null, handCount: 0,
+        myCards: [], board: [], pot: 0,
+        players: [
+          { id: LOCAL_ID, seat: 0, chips: 200, bet: 0, folded: false, holeCards: [] },
+          ...otherIds.map((pid, i) => ({ id: pid, seat: i + 1, chips: 200, bet: 0, folded: false, holeCards: [] }))
+        ],
+        turn: null, validActions: [], toCall: 0, minRaise: 2, dealerSeat: 0,
+        winner: null, verified: null, showdownCards: {}, handNames: {},
+        message: 'Waiting for dealer...'
+      };
+
+      // Push FULL state to ALL browsers — called after every change
+      function pushState() {
+        // Build seats with privacy (hide other players' cards except at showdown)
+        const isShowdown = gs.phase === 'showdown' || gs.phase === 'settled';
+        const seats = gs.players.map(p => ({
+          ...p, name: p.id,
+          playing: p.folded ? 0 : 1, empty: false, allIn: false,
+          holeCards: p.id === LOCAL_ID ? gs.myCards :
+            (isShowdown && gs.showdownCards[p.seat] ? gs.showdownCards[p.seat] :
+              (gs.myCards.length > 0 ? ['??', '??'] : [])),
+          holeCardNames: p.id === LOCAL_ID ? gs.myCards :
+            (isShowdown && gs.showdownCards[p.seat] ? gs.showdownCards[p.seat] :
+              (gs.myCards.length > 0 ? ['??', '??'] : []))
+        }));
+        // Add empty seats
+        const usedSeats = new Set(seats.map(s => s.seat));
+        for (let s = seats.length; s < 9; s++) {
+          if (!usedSeats.has(s)) seats.push({ id: '', name: '', seat: s, playing: 0, empty: true, chips: 0 });
+        }
+        seats.sort((a, b) => a.seat - b.seat);
+
+        const msg = {
+          method: 'seats', seats, phase: gs.phase, pot: gs.pot,
+          dealerSeat: gs.dealerSeat, sbSeat: 0, bbSeat: 1,
+          currentTurn: gs.turn === LOCAL_ID ? 0 : (gs.turn ? 1 : -1),
+          handCount: gs.handCount
+        };
+
+        // Also send deal data (cards + board)
+        const dealMsg = { method: 'deal', deal: { holecards: gs.myCards, board: gs.board } };
+
+        // Also send action buttons if it's our turn
+        let bettingMsg = null;
+        if (gs.turn === LOCAL_ID && gs.validActions.length > 0) {
+          const poss = gs.validActions.map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined);
+          bettingMsg = { method: 'betting', action: 'round_betting', playerid: 0, turnPlayer: LOCAL_ID,
+            pot: gs.pot, toCall: gs.toCall, minRaiseTo: gs.minRaise || 2,
+            turnTimeout: 30, turnStart: Date.now(), possibilities: poss };
+        }
+
+        // Winner banner
+        let finalMsg = null;
+        if (gs.winner) {
+          const playerNames = {};
+          gs.players.forEach((p, i) => playerNames[i] = p.id);
+          finalMsg = { method: 'finalInfo', winners: gs.winner.seats || [], win_amount: gs.winner.amount || 0,
+            playerNames, handNames: gs.handNames || {},
+            showInfo: { allHoleCardsInfo: gs.showdownCards, boardCardInfo: gs.board } };
+        }
+
+        // Verification
+        let verifyMsg = null;
+        if (gs.verified !== null) {
+          verifyMsg = { method: 'verification', hand: gs.handCount, valid: gs.verified, errors: [] };
+        }
+
+        for (const [ws] of clients) {
+          if (ws.readyState !== 1) continue;
+          ws.send(JSON.stringify(dealMsg));
+          ws.send(JSON.stringify(msg));
+          if (bettingMsg) ws.send(JSON.stringify(bettingMsg));
+          if (finalMsg) ws.send(JSON.stringify(finalMsg));
+          if (verifyMsg) ws.send(JSON.stringify(verifyMsg));
+        }
+
+        // Log
+        if (gs.message) broadcast({ method: 'comm', type: 'system', msg: gs.message });
+      }
+
+      let lastBSJson = null;
+      let lastSettledHandId = null;
+      let acted = false;
+      let pollRunning = false;
+      let joinWritten = false;
       const pollStart = Date.now();
       function pt() { return ((Date.now() - pollStart) / 1000).toFixed(1) + 's'; }
 
-      // Send a comms log message to the browser
-      function pLog(type, msg) {
-        broadcast({ method: 'comm', type, msg: '[' + pt() + '] ' + msg });
-      }
-
-      function buildPlayers(chips) {
-        if (chips) Object.assign(chipTracker, chips); // Update tracker
-        const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p1'];
-        const list = [{ id: LOCAL_ID, seat: 0, chips: chipTracker[LOCAL_ID] || 200, holeCards: myCards || [] }];
-        otherIds.forEach((pid, i) => list.push({ id: pid, seat: i + 1, chips: chipTracker[pid] || 200, holeCards: ['??','??'] }));
-        return list;
-      }
-
       const pollLoop = async () => {
-        if (pollRunning) {
-          console.log('[P2P] Poll loop already running — skipping duplicate');
-          return;
-        }
+        if (pollRunning) return;
         pollRunning = true;
-        pLog('system', 'Polling chain for game state...');
-        pLog('system', 'Waiting for dealer to start hand...');
+        console.log('[P2P] Poll loop started');
+
         while (true) {
           try {
-            // 0. Use session from join flow (already verified as NEW)
-            if (!currentSession) {
-              currentSession = joinSession;
-              if (!currentSession) {
-                const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
-                if (tc && tc.session) currentSession = tc.session;
-              }
-              if (currentSession) {
-                pLog('system', 'Session: ' + currentSession);
-                console.log('[P2P] ' + pt() + ' Got session: ' + currentSession);
-                // Check what hand is currently in progress — skip it, wait for next
-                const st = await p2p.read(TABLE_ID, KEYS.SETTLEMENT);
-                if (st && st.session === currentSession && st.hand) {
-                  currentHand = st.hand;
-                  lastST = st;
-                  pLog('system', 'Waiting for next hand (current: #' + currentHand + ')...');
-                  p2pSendSeats(buildPlayers(), { phase: 'Waiting for next hand...', dealerSeat: 1 });
-                } else {
-                  const cr = await p2p.read(TABLE_ID, KEYS.CARD_BV + '.' + LOCAL_ID);
-                  if (cr && cr.session === currentSession && cr.hand) {
-                    currentHand = cr.hand;
-                    pLog('system', 'Hand #' + currentHand + ' in progress — waiting for next...');
-                    p2pSendSeats(buildPlayers(), { phase: 'Hand in progress — waiting...', dealerSeat: 1 });
-                  } else {
-                    pLog('system', 'Waiting for first hand...');
-                    p2pSendSeats(buildPlayers(), { phase: 'Waiting for dealer to deal...', dealerSeat: 1 });
-                  }
-                }
-              } else {
-                pLog('system', 'Waiting for dealer to open table...');
-                await new Promise(r => setTimeout(r, 3000));
-                continue;
+            // 1. Check for new handId from table_info
+            const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+            if (tc && tc.currentHandId && tc.currentHandId !== gs.handId && tc.currentHandId !== lastSettledHandId) {
+              console.log('[P2P] ' + pt() + ' New hand: ' + tc.currentHandId);
+              // Snapshot chips before reset
+              const chipSnap = {};
+              gs.players.forEach(p => chipSnap[p.id] = p.chips);
+              // Reset state for new hand
+              gs.handId = tc.currentHandId;
+              gs.handCount = tc.handCount || (gs.handCount + 1);
+              gs.phase = 'shuffling'; gs.myCards = []; gs.board = []; gs.pot = 0;
+              gs.turn = null; gs.validActions = []; gs.toCall = 0; gs.minRaise = 2;
+              gs.winner = null; gs.verified = null; gs.showdownCards = {}; gs.handNames = {};
+              gs.message = 'Hand #' + gs.handCount + ' — shuffling...';
+              gs.players.forEach(p => { p.bet = 0; p.folded = false; p.holeCards = []; });
+              lastBSJson = null; acted = false;
+              pushState();
+            }
+
+            if (!gs.handId) { await new Promise(r => setTimeout(r, 2000)); continue; }
+
+            // 2. Check for my cards
+            if (gs.myCards.length === 0) {
+              const cardKey = 'chips.vrsc::poker.sg777z.card_bv.' + gs.handId + '.' + LOCAL_ID;
+              const cr = await p2p.read(TABLE_ID, cardKey);
+              if (cr && cr.cards) {
+                console.log('[P2P] ' + pt() + ' Cards: ' + cr.cards.join(' '));
+                gs.myCards = cr.cards;
+                gs.phase = 'preflop';
+                gs.message = '';
+                pushState();
               }
             }
 
-            // 0b. Check for new handId from table_info
-            const tcPoll = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
-            if (tcPoll && tcPoll.currentHandId && tcPoll.currentHandId !== currentHandId && tcPoll.currentHandId !== lastSettledHandId) {
-              const newHandId = tcPoll.currentHandId;
-              console.log('[P2P] ' + pt() + ' New handId: ' + newHandId);
-              currentHandId = newHandId;
-              p2pCurrentHandId = newHandId;
-              currentHand = tcPoll.handCount || (currentHand + 1);
-              lastBS = null; lastBCPhase = ''; lastBCHand = 0; lastST = null;
-              myCards = null; p2pMyCards = null; p2pLastBoard = null; playerActed = false;
-              // Snapshot chips for winner calculation
-              handStartChips = {};
-              buildPlayers().forEach(p => handStartChips[p.id] = p.chips);
-              // Clear table — send empty cards for ALL players
-              broadcast({ method: 'deal', deal: { board: [], holecards: [] } });
-              const clearPlayers = buildPlayers().map(p => ({ ...p, holeCards: [], holeCardNames: [] }));
-              p2pSendSeats(clearPlayers, { phase: 'Shuffling...', handCount: currentHand, dealerSeat: 1 });
-              pLog('system', 'Hand #' + currentHand + ' starting...');
-            }
-
-            if (!currentHandId) {
-              await new Promise(r => setTimeout(r, 2000));
-              continue;
-            }
-
-            // 1. Card reveals — read from hand-prefixed key
-            const cardKey = 'chips.vrsc::poker.sg777z.card_bv.' + currentHandId + '.' + LOCAL_ID;
-            const cr = await p2p.read(TABLE_ID, cardKey);
-            if (cr && cr.cards && !myCards) {
-              myCards = cr.cards; p2pMyCards = cr.cards;
-              console.log('[P2P] ' + pt() + ' Hand ' + currentHand + ' cards: ' + cr.cards.join(' '));
-              pLog('cards', 'Hand #' + currentHand + ' — your cards: ' + cr.cards.join(' '));
-              broadcast({ method: 'deal', deal: { board: [], holecards: cr.cards } });
-              p2pSendSeats(buildPlayers(), { phase: 'preflop', handCount: currentHand, dealerSeat: 1 });
-            }
-
-            // 2. Betting state — hand-prefixed key
-            const bs = await p2p.readBettingState(currentHandId);
-            if (bs && JSON.stringify(bs) !== JSON.stringify(lastBS)) {
-              const prevBS = lastBS;
-              lastBS = bs;
-
-              // New betting state = reset playerActed (it's a genuinely new prompt)
-              // The JSON comparison already ensures this is different from lastBS
-              playerActed = false;
-              if (bs.action && bs.turn !== LOCAL_ID) {
-                console.log('[P2P] ' + pt() + ' Opponent: ' + (bs.action || 'acted'));
-                pLog('betting', (bs.turn || 'Opponent') + ' ' + (bs.action || 'acts'));
-              }
-
-              // My turn — show buttons (only if we haven't already acted this round)
-              if (bs.turn === LOCAL_ID && bs.validActions && !playerActed) {
-                console.log('[P2P] ' + pt() + ' My turn! pot=' + (bs.pot||0) + ' toCall=' + (bs.toCall||0));
-                pLog('turn', 'Your turn — pot: ' + (bs.pot||0) + ', to call: ' + (bs.toCall||0));
-                const poss = (bs.validActions || []).map(a => ({ fold: 0, check: 1, call: 2, raise: 3, allin: 7 })[a]).filter(p => p !== undefined);
-                broadcast({ method: 'betting', action: 'round_betting', playerid: 0, turnPlayer: LOCAL_ID,
-                  pot: bs.pot || 0, toCall: bs.toCall || 0, minRaiseTo: bs.minRaise || 2,
-                  turnTimeout: 30, turnStart: Date.now(), possibilities: poss });
-              }
-
-              // Update seats with pot/chip info from betting state
-              const bsChips = {};
-              if (bs.players) bs.players.forEach(p => { if (p.id && p.chips !== undefined) bsChips[p.id] = p.chips; });
-              if (Object.keys(bsChips).length > 0) console.log('[P2P] BS chips:', JSON.stringify(bsChips));
-              else console.log('[P2P] BS has no player chips (players=' + (bs.players ? bs.players.length : 'none') + ')');
-              const pl = buildPlayers(Object.keys(bsChips).length > 0 ? bsChips : undefined);
-              // Apply bet/folded state from dealer's betting data
+            // 3. Check betting state
+            const bs = await p2p.readBettingState(gs.handId);
+            const bsJson = bs ? JSON.stringify(bs) : null;
+            if (bsJson && bsJson !== lastBSJson) {
+              lastBSJson = bsJson;
+              gs.pot = bs.pot || gs.pot;
+              if (bs.phase) gs.phase = bs.phase;
+              // Update player chips/bets from dealer data
               if (bs.players) {
                 for (const bp of bs.players) {
-                  const seat = pl.find(s => s.id === bp.id);
-                  if (seat) { seat.bet = bp.bet || 0; seat.folded = !!bp.folded; }
+                  const gp = gs.players.find(x => x.id === bp.id);
+                  if (gp) { gp.chips = bp.chips; gp.bet = bp.bet || 0; gp.folded = !!bp.folded; }
                 }
               }
-              p2pSendSeats(pl, { phase: bs.phase || 'preflop', pot: bs.pot || 0,
-                currentTurn: bs.turn === LOCAL_ID ? 0 : 1, handCount: currentHand, dealerSeat: 1 });
+              // Determine if it's our turn
+              if (bs.turn === LOCAL_ID && bs.validActions && !acted) {
+                gs.turn = LOCAL_ID;
+                gs.validActions = bs.validActions;
+                gs.toCall = bs.toCall || 0;
+                gs.minRaise = bs.minRaise || 2;
+                console.log('[P2P] ' + pt() + ' My turn! pot=' + gs.pot + ' toCall=' + gs.toCall);
+              } else {
+                gs.turn = bs.turn || null;
+                gs.validActions = [];
+                if (bs.turn !== LOCAL_ID) acted = false;
+              }
+              gs.message = '';
+              pushState();
             }
 
-            // 3. Board cards — hand-prefixed key
-            const bc = await p2p.readBoardCards(currentHandId);
-            if (bc && bc.board && bc.phase !== lastBCPhase) {
-              lastBCPhase = bc.phase;
-              console.log('[P2P] ' + pt() + ' Board (' + bc.phase + '): ' + bc.board.join(' '));
-              pLog('cards', bc.phase.charAt(0).toUpperCase() + bc.phase.slice(1) + ': ' + bc.board.join(' '));
-              p2pLastBoard = bc.board;
-              broadcast({ method: 'deal', deal: { board: bc.board } });
+            // 4. Check board cards
+            const bc = await p2p.readBoardCards(gs.handId);
+            if (bc && bc.board && bc.board.length > gs.board.length) {
+              console.log('[P2P] ' + pt() + ' Board (' + (bc.phase||'') + '): ' + bc.board.join(' '));
+              gs.board = bc.board;
+              if (bc.phase) gs.phase = bc.phase;
+              pushState();
             }
 
-            // 4. Settlement — hand-prefixed key
-            const stKey = KEYS.SETTLEMENT + '.' + currentHandId;
+            // 5. Check settlement
+            const stKey = KEYS.SETTLEMENT + '.' + gs.handId;
             const st = await p2p.read(TABLE_ID, stKey);
-            if (st && st.verified !== undefined && JSON.stringify(st) !== JSON.stringify(lastST)) {
-              lastST = st;
+            if (st && st.verified !== undefined && gs.verified === null) {
               console.log('[P2P] ' + pt() + ' Settlement: verified=' + st.verified);
-              pLog('showdown', '═══ SHOWDOWN ═══');
-
-              // Use hand-start chips for winner calculation (chipTracker may be updated mid-hand)
-              const preChips = Object.keys(handStartChips).length > 0 ? handStartChips : {};
-
-              // Show results + winner banner (use showdown data from dealer if available)
+              // Update chips from results
               if (st.results) {
-                const playerNames = {};
-                st.results.forEach((r, i) => { playerNames[i] = r.id; });
-                // Use dealer's showdown data if present, otherwise compute from chip delta
-                let winners = st.winners || [];
-                let winAmount = st.winAmount || 0;
-                if (winners.length === 0) {
-                  for (let ri = 0; ri < st.results.length; ri++) {
-                    const delta = st.results[ri].chips - (preChips[st.results[ri].id] || 200);
-                    if (delta > 0) { winners.push(ri); winAmount = delta; }
-                  }
-                }
                 for (const r of st.results) {
-                  const delta = r.chips - (preChips[r.id] || 200);
-                  if (delta > 0) pLog('showdown', '★ ' + r.id + ' WINS ' + delta);
-                  pLog('system', r.id + ': ' + r.chips + ' chips');
-                  for (const [, info] of clients) { if (info.id === r.id) info.chips = r.chips; }
+                  const gp = gs.players.find(x => x.id === r.id);
+                  if (gp) gp.chips = r.chips;
                 }
-                broadcast({ method: 'finalInfo', winners, win_amount: winAmount, playerNames,
-                  handNames: st.handNames || {}, showInfo: { allHoleCardsInfo: st.allHoleCards || {}, boardCardInfo: st.board || [] } });
               }
-              pLog('verify', 'Verified: ' + (st.verified ? 'PASS' : 'FAIL'));
-              broadcast({ method: 'verification', hand: st.hand || 1, valid: st.verified, errors: [] });
-              // Update seats with final chips
-              const chipMap = {};
-              if (st.results) st.results.forEach(r => chipMap[r.id] = r.chips);
-              console.log('[P2P] Updating chips:', JSON.stringify(chipMap));
-              const updatedPlayers = buildPlayers(chipMap);
-              console.log('[P2P] Sending seats:', updatedPlayers.map(p => p.id + ':' + p.chips).join(' '));
-              p2pSendSeats(updatedPlayers, { phase: 'settled', pot: 0, handCount: currentHand, dealerSeat: 1 });
+              // Show showdown
+              gs.phase = 'showdown';
+              gs.verified = st.verified;
+              gs.board = st.board || gs.board;
+              gs.showdownCards = st.allHoleCards || {};
+              gs.handNames = st.handNames || {};
+              // Compute winner
+              const winnerSeats = st.winners || [];
+              const winAmount = st.winAmount || 0;
+              if (winnerSeats.length > 0) {
+                gs.winner = { seats: winnerSeats, amount: winAmount };
+              }
+              gs.message = 'Hand #' + gs.handCount + ' — verified';
+              pushState();
 
-              // Clear board + cards, show waiting state
-              console.log('[P2P] >>> CLEARING TABLE (hand ' + currentHand + ') <<<');
-              broadcast({ method: 'deal', deal: { board: [], holecards: [] } });
-              const clearPl1 = buildPlayers(chipMap).map(p => ({ ...p, holeCards: [], holeCardNames: [] }));
-              p2pSendSeats(clearPl1, { phase: 'Shuffling next hand...', pot: 0, handCount: currentHand, dealerSeat: 1 });
+              // Show results for 4 seconds, then clear
+              await new Promise(r => setTimeout(r, 4000));
 
-              // Clear table after showing results for 3 seconds
-              await new Promise(r => setTimeout(r, 3000));
-              broadcast({ method: 'deal', deal: { board: [], holecards: [] } });
-              const clearPl = buildPlayers(chipMap).map(p => ({ ...p, holeCards: [], holeCardNames: [] }));
-              p2pSendSeats(clearPl, { phase: 'Waiting for next hand...', pot: 0, handCount: currentHand, dealerSeat: 1 });
-
-              // Reset for next hand — remember settled handId to skip it
-              myCards = null; p2pMyCards = null; p2pLastBoard = null;
-              playerActed = false;
-              lastSettledHandId = currentHandId;
-              currentHandId = null; p2pCurrentHandId = null;
-              pLog('system', 'Waiting for next hand...');
+              gs.phase = 'waiting';
+              gs.myCards = []; gs.board = [];
+              gs.winner = null; gs.verified = null;
+              gs.showdownCards = {}; gs.handNames = {};
+              gs.turn = null; gs.validActions = [];
+              gs.players.forEach(p => { p.bet = 0; p.folded = false; p.holeCards = []; });
+              gs.message = 'Waiting for next hand...';
+              lastSettledHandId = gs.handId;
+              gs.handId = null;
+              lastBSJson = null;
+              pushState();
             }
           } catch (e) {
             console.log('[P2P] Poll error: ' + e.message);
