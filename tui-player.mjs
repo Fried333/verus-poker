@@ -81,6 +81,26 @@ const state = {
 };
 
 // ══════════════════════════════════════
+// Debug Log + Timing
+// ══════════════════════════════════════
+const T0 = Date.now();
+function ts() { return ((Date.now() - T0) / 1000).toFixed(1) + 's'; }
+const debugLog = []; // Last N log entries
+const MAX_LOG = 8;
+function dlog(msg) {
+  debugLog.push('[' + ts() + '] ' + msg);
+  if (debugLog.length > MAX_LOG) debugLog.shift();
+}
+// Timed read wrapper
+async function timedRead(p2p, id, key, label) {
+  const t = Date.now();
+  const result = await p2p.read(id, key);
+  const ms = Date.now() - t;
+  if (ms > 50) dlog(label + ': ' + ms + 'ms');
+  return result;
+}
+
+// ══════════════════════════════════════
 // Terminal Rendering (ANSI, no npm)
 // ══════════════════════════════════════
 const CLEAR = '\x1b[2J\x1b[H';
@@ -174,6 +194,11 @@ function render() {
     out += CYAN + '║ ' + (state.verified ? GREEN + '✓ Verified' : RED + '✗ FAILED') + RESET + '\n';
   }
 
+  out += CYAN + '╠' + line + '╣' + RESET + '\n';
+  // Debug log
+  for (const entry of debugLog) {
+    out += CYAN + '║ ' + DIM + entry + RESET + '\n';
+  }
   out += CYAN + '╚' + line + '╝' + RESET + '\n';
   process.stdout.write(out);
 }
@@ -278,8 +303,9 @@ async function main() {
   while (true) {
     try {
       // 1. Check for new handId
-      const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+      const tc = await timedRead(p2p, TABLE_ID, KEYS.TABLE_CONFIG, 'table_info');
       if (tc && tc.currentHandId && tc.currentHandId !== state.handId && tc.currentHandId !== lastSettledHandId) {
+        dlog('New hand detected: ' + tc.currentHandId);
         state.handId = tc.currentHandId;
         state.handCount = tc.handCount || (state.handCount + 1);
         state.phase = 'shuffling';
@@ -303,8 +329,9 @@ async function main() {
       // 2. Check for my cards
       if (state.myCards.length === 0) {
         const cardKey = KEYS.CARD_BV + '.' + state.handId + '.' + MY_ID;
-        const cr = await p2p.read(TABLE_ID, cardKey);
+        const cr = await timedRead(p2p, TABLE_ID, cardKey, 'card_bv');
         if (cr && cr.cards) {
+          dlog('Cards received: ' + cr.cards.join(' '));
           state.myCards = cr.cards;
           state.phase = 'preflop';
           state.message = '';
@@ -313,7 +340,9 @@ async function main() {
       }
 
       // 3. Check betting state
+      const bsT = Date.now();
       const bs = await p2p.readBettingState(state.handId);
+      const bsMs = Date.now() - bsT;
       const bsJson = bs ? JSON.stringify(bs) : null;
       if (bsJson && bsJson !== lastBSJson) {
         lastBSJson = bsJson;
@@ -327,8 +356,10 @@ async function main() {
             gp.chips = bp.chips; gp.bet = bp.bet || 0; gp.folded = !!bp.folded;
           }
         }
+        if (bsMs > 50) dlog('betting_state read: ' + bsMs + 'ms');
         // My turn?
         if (bs.turn === MY_ID && bs.validActions && !acted) {
+          dlog('My turn! pot=' + bs.pot + ' toCall=' + (bs.toCall||0) + ' phase=' + (bs.phase||''));
           state.turn = MY_ID;
           state.validActions = bs.validActions;
           state.toCall = bs.toCall || 0;
@@ -349,9 +380,11 @@ async function main() {
           } else {
             // Prompt for action
             const action = await promptAction();
+            const writeT = Date.now();
             await p2p.write(MY_ID, KEYS.PLAYER_ACTION, {
               action: action.action, amount: action.amount, session: state.session, player: MY_ID, timestamp: Date.now()
             });
+            dlog('Action ' + action.action + ' written in ' + (Date.now() - writeT) + 'ms');
             acted = true; missedTurns = 0;
             state.turn = null; state.validActions = [];
             state.message = 'Action sent: ' + action.action + (action.amount ? ' ' + action.amount : '');
@@ -369,6 +402,7 @@ async function main() {
       // 4. Check board
       const bc = await p2p.readBoardCards(state.handId);
       if (bc && bc.board && bc.board.length > state.board.length) {
+        dlog('Board (' + (bc.phase||'') + '): ' + bc.board.join(' '));
         state.board = bc.board;
         if (bc.phase) state.phase = bc.phase;
         render();
@@ -376,8 +410,9 @@ async function main() {
 
       // 5. Check settlement
       const stKey = KEYS.SETTLEMENT + '.' + state.handId;
-      const st = await p2p.read(TABLE_ID, stKey);
+      const st = await timedRead(p2p, TABLE_ID, stKey, 'settlement');
       if (st && st.verified !== undefined && state.verified === null) {
+        dlog('Settlement received — verified=' + st.verified);
         state.verified = st.verified;
         state.phase = 'showdown';
         if (st.board) state.board = st.board;
