@@ -130,21 +130,13 @@ export function createP2PDealer(p2p, config, localNotify) {
       console.log('[DEALER] Dealing hole cards...');
       let cardPos = 0;
       const holeCards = {};
-      const usedCards = new Set(); // Prevent duplicate cards
+      // Decode ALL cards from deck 0 (single shuffled deck = no cross-deck duplicates)
+      // In production, each player decodes only their own cards via SSS shares
+      const d0 = { deck: cd.finalDecks[0], b: cd.b[0], e: dd.e[0], key: playerData[0].sessionKey, init: playerData[0].initialDeck };
       for (let i = 0; i < numPlayers; i++) {
         const cards = [];
         for (let c = 0; c < 2; c++) {
-          let idx = decodeCard(
-            cd.finalDecks[i][cardPos], cd.b[i][cardPos],
-            dd.e[i], dd.d, playerData[i].sessionKey, playerData[i].initialDeck
-          );
-          // If duplicate (cross-deck collision), try next position from this player's deck
-          let alt = cardPos + numPlayers * 2;
-          while (usedCards.has(idx) && alt < numCards) {
-            idx = decodeCard(cd.finalDecks[i][alt], cd.b[i][alt], dd.e[i], dd.d, playerData[i].sessionKey, playerData[i].initialDeck);
-            alt++;
-          }
-          usedCards.add(idx);
+          const idx = decodeCard(d0.deck[cardPos], d0.b[cardPos], d0.e, dd.d, d0.key, d0.init);
           cards.push(idx);
           cardPos++;
         }
@@ -191,7 +183,7 @@ export function createP2PDealer(p2p, config, localNotify) {
         if (game.phase === 'flop' && game.board.length === 0) {
           const cards = [];
           for (let i = 0; i < 3; i++) {
-            const idx = decodeCard(cd.finalDecks[0][revealPos], cd.b[0][revealPos], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
+            const idx = decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init);
             cards.push(idx); revealPos++;
           }
           dealBoard(game, cards);
@@ -201,16 +193,16 @@ export function createP2PDealer(p2p, config, localNotify) {
           console.log('  Flop: ' + cards.map(cardToString).join(' '));
           await WAIT(1500);
         } else if (game.phase === 'turn' && game.board.length === 3) {
-          const idx = decodeCard(cd.finalDecks[0][revealPos], cd.b[0][revealPos], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
-          dealBoard(game, [idx ]); revealPos++;
+          const idx = decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init);
+          dealBoard(game, [idx]); revealPos++;
           const turnData = { board: game.board.map(cardToString), phase: 'turn', hand: handCount, session: gameId };
           await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', turnData);
           notify('community_cards', { phase: 'turn', board: game.board });
           console.log('  Turn: ' + cardToString(game.board[3]));
           await WAIT(1500);
         } else if (game.phase === 'river' && game.board.length === 4) {
-          const idx = decodeCard(cd.finalDecks[0][revealPos], cd.b[0][revealPos], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
-          dealBoard(game, [idx ]); revealPos++;
+          const idx = decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init);
+          dealBoard(game, [idx]); revealPos++;
           const riverData = { board: game.board.map(cardToString), phase: 'river', hand: handCount, session: gameId };
           await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', riverData);
           notify('community_cards', { phase: 'river', board: game.board });
@@ -263,8 +255,8 @@ export function createP2PDealer(p2p, config, localNotify) {
         const nonFolded = game.players.filter(p => !p.folded);
         if (nonFolded.length > 1) {
           while (game.board.length < 5) {
-            const idx = decodeCard(cd.finalDecks[0][revealPos], cd.b[0][revealPos], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
-            dealBoard(game, [idx ]); revealPos++;
+            const idx = decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init);
+            dealBoard(game, [idx]); revealPos++;
           }
           await p2p.writeBoardCards(handId, { board: game.board.map(cardToString), phase: 'showdown' });
           notify('community_cards', { phase: 'showdown', board: game.board });
