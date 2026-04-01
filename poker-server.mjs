@@ -1266,6 +1266,12 @@ if (USE_LOCAL) {
               broadcast({ method: 'deal', deal: { board: [], holecards: [] } });
               p2pSendSeats(buildPlayers(chipMap), { phase: 'Shuffling next hand...', pot: 0, handCount: currentHand, dealerSeat: 1 });
 
+              // Clear table after showing results for 3 seconds
+              await new Promise(r => setTimeout(r, 3000));
+              broadcast({ method: 'deal', deal: { board: [], holecards: [] } });
+              const clearPl = buildPlayers(chipMap).map(p => ({ ...p, holeCards: [], holeCardNames: [] }));
+              p2pSendSeats(clearPl, { phase: 'Waiting for next hand...', pot: 0, handCount: currentHand, dealerSeat: 1 });
+
               // Reset for next hand — remember settled handId to skip it
               myCards = null; p2pMyCards = null; p2pLastBoard = null;
               playerActed = false;
