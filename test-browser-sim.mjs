@@ -176,15 +176,17 @@ async function main() {
   // ══════════════════════════════
   console.log('\nTEST 5: Play to settlement');
   // Auto-play: check/call everything for both players
-  for (let round = 0; round < 20; round++) {
+  const playerNames = { Alice: p1, Bob: p2 };
+  for (let round = 0; round < 40; round++) {
     await WAIT(500);
-    // Check each player's messages for round_betting
-    for (const p of [p1, p2]) {
+    for (const [name, p] of Object.entries(playerNames)) {
       for (let i = p.msgs.length - 1; i >= Math.max(0, p.msgs.length - 5); i--) {
         const m = p.msgs[i];
-        if (m.method === 'betting' && m.action === 'round_betting' && m.possibilities?.length > 0) {
+        // Only act on round_betting if it's OUR turn
+        if (m.method === 'betting' && m.action === 'round_betting' && m.turnPlayer === name && m.possibilities?.length > 0 && !m._acted) {
           const act = m.toCall === 0 ? 'check' : (m.possibilities.includes(2) ? 'call' : 'fold');
-          p.send({ action: act, amount: 0 });
+          p.send({ action: act, amount: m.toCall || 0 });
+          m._acted = true;
           break;
         }
       }

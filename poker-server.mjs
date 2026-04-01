@@ -201,8 +201,10 @@ function createIO() {
         for (const [engineSeat, info] of Object.entries(data.hands || {})) {
           handNames[mapSeat(Number(engineSeat))] = info.handName || '';
         }
+        const playerNames = {};
+        engine.players.forEach((p, i) => { playerNames[mapSeat(i)] = p.id; });
         broadcast({
-          method: 'finalInfo', winners, win_amount: winAmount, handNames,
+          method: 'finalInfo', winners, win_amount: winAmount, handNames, playerNames,
           showInfo: { allHoleCardsInfo: allHoleCards, boardCardInfo: board }
         });
       }
@@ -213,7 +215,7 @@ function createIO() {
         const cards = data.cards.map(c => typeof c === 'number' ? cardToString(c) : c);
         for (const [ws, info] of clients) {
           if (info.id === playerId) {
-            sendTo(ws, { method: 'deal', deal: { holecards: cards, balance: 0 } });
+            sendTo(ws, { method: 'deal', deal: { holecards: cards, board: [], balance: 0 } });
           }
         }
       }
