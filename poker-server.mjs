@@ -792,9 +792,26 @@ if (USE_LOCAL) {
       sendTo(ws, { method: 'info', playerid: 0, seat_taken: false });
       console.log('[P2P] Browser connected: ' + LOCAL_ID);
       if (LOCAL_ROLE === 'player') {
-        p2p.write(LOCAL_ID, KEYS.JOIN_REQUEST, { table: TABLE_ID, player: LOCAL_ID, ready: true, timestamp: Date.now() })
-          .then(() => console.log('[P2P] Join signal written'))
-          .catch(e => console.log('[P2P] Join signal failed: ' + e.message));
+        // Read table config to get session ID before writing join
+        (async () => {
+          let session = null;
+          try {
+            const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+            if (tc && tc.session) session = tc.session;
+          } catch(e) {}
+          const joinData = { table: TABLE_ID, player: LOCAL_ID, ready: true, timestamp: Date.now() };
+          if (session) joinData.session = session;
+          try {
+            await p2p.write(LOCAL_ID, KEYS.JOIN_REQUEST, joinData);
+            console.log('[P2P] Join signal written' + (session ? ' (session=' + session + ')' : ''));
+            // NOW start the poll loop — only after join is acknowledged on chain
+            if (p2p._playerPollStart) p2p._playerPollStart();
+          } catch(e) {
+            console.log('[P2P] Join signal failed: ' + e.message);
+            // Start poll anyway so player isn't stuck
+            if (p2p._playerPollStart) p2p._playerPollStart();
+          }
+        })();
       }
       return;
     }
@@ -905,24 +922,47 @@ if (USE_LOCAL) {
       await p2pDealer.openTable();
       p2pDealer.addSelf(200);
       const otherIds = LOCAL_PLAYERS.length > 0 ? LOCAL_PLAYERS : ['poker-p2'];
-      for (const pid of otherIds) p2pDealer.addPlayer(pid, 200);
+      // Don't add players yet — wait until they actually join
+      const sessionId = p2pDealer.getGameId();
+      const tableOpenTime = Date.now();
 
-      console.log('[P2P] Waiting for all players...');
+      console.log('[P2P] Waiting for browser + remote players...');
+      console.log('[P2P] Session: ' + sessionId + ' | Table opened at: ' + new Date(tableOpenTime).toISOString());
       const waitLoop = async () => {
         while (true) {
-          let allReady = [...clients.values()].some(c => c.id === LOCAL_ID);
+          // 1. Wait for OUR browser to connect
+          const browserConnected = [...clients.values()].some(c => c.id === LOCAL_ID);
+          if (!browserConnected) {
+            console.log('[P2P] Waiting for dealer browser to connect...');
+            await new Promise(r => setTimeout(r, 3000));
+            continue;
+          }
+
+          // 2. Wait for ALL remote players to send fresh join requests
+          let allReady = true;
           for (const pid of otherIds) {
             const req = await p2p.read(pid, KEYS.JOIN_REQUEST);
-            // Only accept join requests from the last 5 minutes
-            const isRecent = req && req.timestamp && (Date.now() - req.timestamp) < 300000;
-            if (!req || req.table !== TABLE_ID || !isRecent) { allReady = false; break; }
+            // Must have: correct table, timestamp AFTER table opened, within last 5 minutes
+            const isRecent = req && req.timestamp && req.timestamp > tableOpenTime && (Date.now() - req.timestamp) < 300000;
+            const isCorrectTable = req && req.table === TABLE_ID;
+            if (!req || !isCorrectTable || !isRecent) {
+              allReady = false;
+              if (req && req.timestamp) {
+                console.log('[P2P] ' + pid + ' join request too old (ts=' + req.timestamp + ' tableOpen=' + tableOpenTime + ')');
+              }
+              break;
+            }
           }
           if (allReady) {
+            // Add remote players now that they've confirmed
+            for (const pid of otherIds) p2pDealer.addPlayer(pid, 200);
             console.log('[P2P] All ready! Starting in 5s...');
+            dLog('system', 'All players connected. Starting in 5s...');
             await new Promise(r => setTimeout(r, 5000));
             try { await p2pDealer.runHand(); } catch (e) { console.log('[P2P] Hand error: ' + e.message); }
             return;
           }
+          dLog('system', 'Waiting for players to join...');
           await new Promise(r => setTimeout(r, 3000));
         }
       };
@@ -939,9 +979,11 @@ if (USE_LOCAL) {
         } catch (e) {}
         if (LOCAL_PLAYERS.length === 0) LOCAL_PLAYERS.push('poker-p1');
       }
-      console.log('[P2P] Player mode — polling chain...');
+      console.log('[P2P] Player mode — waiting for browser + join acknowledgement...');
       let lastBS = null, lastBCPhase = '', lastST = null;
       let currentSession = null, currentHand = 0, myCards = null;
+      let pollRunning = false;  // Guard against duplicate poll loops
+      let joinWritten = false;  // Don't poll until join is written
       const pollStart = Date.now();
       function pt() { return ((Date.now() - pollStart) / 1000).toFixed(1) + 's'; }
 
@@ -958,19 +1000,49 @@ if (USE_LOCAL) {
       }
 
       const pollLoop = async () => {
+        if (pollRunning) {
+          console.log('[P2P] Poll loop already running — skipping duplicate');
+          return;
+        }
+        pollRunning = true;
         pLog('system', 'Polling chain for game state...');
+        pLog('system', 'Waiting for dealer to start hand...');
         while (true) {
           try {
-            // 0. Read table config to get current session ID
+            // 0. Read table config EVERY cycle until session found
+            //    (dealer may not have written it yet, or old session may be stale)
             if (!currentSession) {
               const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
               if (tc && tc.session) {
                 currentSession = tc.session;
                 pLog('system', 'Session: ' + currentSession);
+                console.log('[P2P] ' + pt() + ' Got session: ' + currentSession);
+                // Check what hand is currently in progress — skip it, wait for next
+                const st = await p2p.read(TABLE_ID, KEYS.SETTLEMENT);
+                if (st && st.session === currentSession && st.hand) {
+                  currentHand = st.hand;
+                  lastST = st;
+                  pLog('system', 'Waiting for next hand (current: #' + currentHand + ')...');
+                  p2pSendSeats(buildPlayers(), { phase: 'Waiting for next hand...', dealerSeat: 1 });
+                } else {
+                  const cr = await p2p.read(TABLE_ID, KEYS.CARD_BV + '.' + LOCAL_ID);
+                  if (cr && cr.session === currentSession && cr.hand) {
+                    currentHand = cr.hand;
+                    pLog('system', 'Hand #' + currentHand + ' in progress — waiting for next...');
+                    p2pSendSeats(buildPlayers(), { phase: 'Hand in progress — waiting...', dealerSeat: 1 });
+                  } else {
+                    pLog('system', 'Waiting for first hand...');
+                    p2pSendSeats(buildPlayers(), { phase: 'Waiting for dealer to deal...', dealerSeat: 1 });
+                  }
+                }
+              } else {
+                pLog('system', 'Waiting for dealer to open table...');
+                await new Promise(r => setTimeout(r, 3000));
+                continue;
               }
             }
 
-            // 1. Card reveals — only process if session matches
+            // 1. Card reveals — STRICT session filter
             const cr = await p2p.read(TABLE_ID, KEYS.CARD_BV + '.' + LOCAL_ID);
             if (cr && cr.cards && cr.session === currentSession && (cr.hand || 0) > currentHand) {
               currentHand = cr.hand;
@@ -982,10 +1054,12 @@ if (USE_LOCAL) {
               console.log('[P2P] ' + pt() + ' Hand ' + currentHand + ' cards: ' + cr.cards.join(' '));
               pLog('cards', 'Hand #' + currentHand + ' — your cards: ' + cr.cards.join(' '));
               for (const [ws2] of clients) sendTo(ws2, { method: 'deal', deal: { holecards: cr.cards } });
-              p2pSendSeats(buildPlayers(), { phase: 'preflop', handCount: currentHand });
+              p2pSendSeats(buildPlayers(), { phase: 'preflop', handCount: currentHand, dealerSeat: 1 });
+            } else if (cr && cr.session && cr.session !== currentSession) {
+              // Stale data from old session — ignore silently
             }
 
-            // 2. Betting state — detect ALL changes (my turn AND opponent actions)
+            // 2. Betting state — STRICT session filter, detect ALL changes
             const bs = await p2p.read(TABLE_ID, KEYS.BETTING_STATE);
             if (bs && bs.session === currentSession && JSON.stringify(bs) !== JSON.stringify(lastBS)) {
               const prevBS = lastBS;
@@ -1009,10 +1083,12 @@ if (USE_LOCAL) {
 
               // Update seats with pot info
               p2pSendSeats(buildPlayers(), { phase: bs.phase || 'preflop', pot: bs.pot || 0,
-                currentTurn: bs.turn === LOCAL_ID ? 0 : 1, handCount: currentHand });
+                currentTurn: bs.turn === LOCAL_ID ? 0 : 1, handCount: currentHand, dealerSeat: 1 });
+            } else if (bs && bs.session && bs.session !== currentSession) {
+              // Stale betting state from old session — ignore
             }
 
-            // 3. Board cards
+            // 3. Board cards — STRICT session filter
             const bc = await p2p.read(TABLE_ID, KEYS.BOARD_CARDS);
             if (bc && bc.board && bc.session === currentSession && bc.phase !== lastBCPhase) {
               lastBCPhase = bc.phase;
@@ -1021,9 +1097,9 @@ if (USE_LOCAL) {
               broadcast({ method: 'deal', deal: { board: bc.board } });
             }
 
-            // 4. Settlement
+            // 4. Settlement — STRICT session filter, only after seeing cards
             const st = await p2p.read(TABLE_ID, KEYS.SETTLEMENT);
-            if (st && st.verified !== undefined && JSON.stringify(st) !== JSON.stringify(lastST) && (st.hand || 0) >= currentHand) {
+            if (st && st.session === currentSession && currentHand > 0 && st.verified !== undefined && JSON.stringify(st) !== JSON.stringify(lastST) && (st.hand || 0) >= currentHand) {
               lastST = st;
               console.log('[P2P] ' + pt() + ' Settlement: verified=' + st.verified);
               pLog('showdown', '═══ SHOWDOWN ═══');
@@ -1045,24 +1121,31 @@ if (USE_LOCAL) {
               // Update seats with final chips
               const chipMap = {};
               if (st.results) st.results.forEach(r => chipMap[r.id] = r.chips);
-              p2pSendSeats(buildPlayers(chipMap), { phase: 'settled', pot: 0, handCount: currentHand });
+              p2pSendSeats(buildPlayers(chipMap), { phase: 'settled', pot: 0, handCount: currentHand, dealerSeat: 1 });
 
-              // Reset for next hand
+              // Reset for next hand — clear stale tracking but keep session
               myCards = null;
               playerActed = false;
+              lastBS = null;
+              lastBCPhase = '';
+              pLog('system', 'Waiting for next hand...');
+            } else if (st && st.session && st.session !== currentSession) {
+              // Stale settlement from old session — ignore
             }
-          } catch (e) {}
+          } catch (e) {
+            console.log('[P2P] Poll error: ' + e.message);
+          }
           await new Promise(r => setTimeout(r, 2000));
         }
       };
 
-      const waitBrowser = setInterval(() => {
-        if ([...clients.values()].some(c => c.id === LOCAL_ID)) {
-          clearInterval(waitBrowser);
-          console.log('[P2P] Browser connected. Polling...');
-          pollLoop().catch(e => console.log('[P2P] Poll error: ' + e.message));
-        }
-      }, 1000);
+      // Expose joinWritten flag setter — called from handleMessage after join is written
+      p2p._playerPollStart = () => {
+        if (joinWritten) return;  // Already started
+        joinWritten = true;
+        console.log('[P2P] Join written. Starting poll loop...');
+        pollLoop().catch(e => console.log('[P2P] Poll error: ' + e.message));
+      };
     }
   });
 } else {

@@ -10,7 +10,7 @@
 import { createClient, VDXF_KEYS, gameKey, playerDeckKey } from './verus-rpc.mjs';
 
 const POLL_INTERVAL = 1500;
-const WRITE_GAP = 3000; // Min ms between writes to same identity (UTXO must confirm)
+const WRITE_GAP = 1000; // Min ms between writes (initial delay before checking)
 
 /**
  * Serialize BigInt values for on-chain storage
@@ -35,29 +35,42 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
   const client = createClient(rpcConfig);
   const lastWrite = new Map(); // identity → timestamp of last write
 
+  const lastTxId = new Map(); // identity → last txid written
+
+  const MEMPOOL_WAIT = 1000; // Wait 1s for mempool propagation between writes
+
   async function write(identityId, vdxfKey, data) {
     const idName = identityId.replace('.CHIPS@', '');
-    const now = Date.now();
-    const last = lastWrite.get(idName) || 0;
-    const gap = now - last;
-    if (gap < WRITE_GAP) {
-      const wait = WRITE_GAP - gap;
-      console.log('[P2P] Waiting ' + (wait/1000).toFixed(1) + 's for ' + idName + ' UTXO...');
-      await new Promise(r => setTimeout(r, wait));
-    }
     const serialized = serialize(data);
+
+    // Wait for previous write to propagate in mempool
+    const last = lastWrite.get(idName) || 0;
+    const elapsed = Date.now() - last;
+    if (elapsed < MEMPOOL_WAIT) {
+      await new Promise(r => setTimeout(r, MEMPOOL_WAIT - elapsed));
+    }
+
     try {
-      const result = await client.writeToIdentity(idName, vdxfKey, serialized);
+      const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
       lastWrite.set(idName, Date.now());
-      return result;
+      return txid;
     } catch (e) {
       if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
-        // UTXO conflict — wait longer and retry once
-        console.log('[P2P] UTXO conflict on ' + idName + ' — waiting 10s and retrying...');
-        await new Promise(r => setTimeout(r, 10000));
-        const result = await client.writeToIdentity(idName, vdxfKey, serialized);
-        lastWrite.set(idName, Date.now());
-        return result;
+        // UTXO conflict — wait 2s for mempool then retry
+        console.log('[P2P] UTXO conflict on ' + idName + ' — retrying in 2s...');
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
+          lastWrite.set(idName, Date.now());
+          return txid;
+        } catch (e2) {
+          // Second conflict — wait longer
+          console.log('[P2P] Second conflict on ' + idName + ' — waiting 5s...');
+          await new Promise(r => setTimeout(r, 5000));
+          const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
+          lastWrite.set(idName, Date.now());
+          return txid;
+        }
       }
       throw e;
     }
@@ -72,12 +85,21 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     return r.vdxfid;
   }
 
+  let recentBlockStart = 0; // Set after first getinfo call
+
   async function read(identityId, vdxfKey) {
     try {
       const fullName = identityId.includes('.') ? identityId : identityId + '.CHIPS@';
-      // Read ALL contentmultimap, filter by key client-side (matches C code approach)
+      // Read from recent blocks only — avoids scanning thousands of old entries
+      // First call gets current block height, subsequent calls use it
+      if (recentBlockStart === 0) {
+        try {
+          const info = await client.getInfo();
+          recentBlockStart = Math.max(0, info.blocks - 200); // Last ~33 minutes
+        } catch (e) { recentBlockStart = 0; }
+      }
       const content = await client.call('getidentitycontent', [
-        fullName, 0, -1
+        fullName, recentBlockStart, -1
       ]);
       // contentmultimap may be at top level or under .identity
       const cmm = content.contentmultimap || content.identity?.contentmultimap;

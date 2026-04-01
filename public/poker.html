@@ -97,7 +97,8 @@ body {
   left: 50%;
   transform: translate(-50%, 40px);
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 14px;
+  text-align: center;
 }
 
 /* ══════ PLAYER SEATS ══════ */
@@ -610,6 +611,10 @@ function handle(m) {
       log('system', m.msg || 'Joining next hand');
       document.getElementById('controls').innerHTML = '<span class="wait-text">Seated — joining next hand...</span>';
       break;
+    case 'verification':
+      updateTableInfo(m.hand, m.valid);
+      log('verify', 'Hand #' + m.hand + ': ' + (m.valid ? 'VERIFIED' : 'FAILED'));
+      break;
     case 'error': log('system', 'Error: ' + (m.error || m.message)); break;
   }
 }
@@ -1031,6 +1036,13 @@ function joinGame() {
     if (ti('ti-blinds')) ti('ti-blinds').textContent = (info.config?.smallBlind||1) + '/' + (info.config?.bigBlind||2);
     if (ti('ti-mode')) ti('ti-mode').textContent = info.mode || '';
     if (ti('ti-hand')) ti('ti-hand').textContent = '';
+    // Show session in comms if available
+    if (info.session) log('system', 'Session: ' + info.session);
+    // Player sees waiting message until dealer starts dealing
+    if (info.role === 'player') {
+      document.getElementById('controls').innerHTML = '<span class="wait-text">Waiting for dealer to start hand...</span>';
+      log('system', 'Joined table. Waiting for dealer to start hand...');
+    }
   }).catch(()=>{});
   connect();
 }

@@ -29,14 +29,11 @@ export function createP2PDealer(p2p, config, localNotify) {
     async openTable() {
       gameId = 'g' + Date.now().toString(36);
       console.log('[DEALER] Opening table ' + p2p.tableId + ' session=' + gameId);
-      await p2p.writeTableInfo(gameId, {
+      // Write ONLY to base key (player polls this). Skip game-specific key to avoid UTXO conflict.
+      await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_table_info', {
         smallBlind, bigBlind, buyin, maxPlayers: 9, status: 'open', dealer: p2p.myId, session: gameId
       });
-      // Also write to base key so player can discover the session
-      try { await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_table_info', {
-        smallBlind, bigBlind, buyin, dealer: p2p.myId, session: gameId
-      }); } catch(e) {}
-      await WAIT(1500);
+      await WAIT(2000);
     },
 
     addSelf(chips) {
@@ -149,10 +146,8 @@ export function createP2PDealer(p2p, config, localNotify) {
         // Write card reveal to TABLE ID (not player ID — dealer can't sign for remote players)
         // In production, cards are distributed via SSS shares encrypted per-player
         const cardData = { player: activePlayers[i].id, cards: cards.map(cardToString), type: 'hole', hand: handCount, session: gameId };
-        // Write to raw key FIRST (player polls this), then game-specific
+        // Write to base key only (player polls this). No duplicate game-specific write.
         await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.card_bv.' + activePlayers[i].id, cardData);
-        try { await p2p.writeCardBV(handId, cardData); } catch(e) {}
-        await WAIT(1500);
       }
       notify('cards_dealt', { holeCards });
 
@@ -190,7 +185,6 @@ export function createP2PDealer(p2p, config, localNotify) {
           dealBoard(game, cards);
           const boardData = { board: game.board.map(cardToString), phase: 'flop', hand: handCount, session: gameId };
           await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', boardData);
-          try { await p2p.writeBoardCards(handId, boardData); } catch(e) {}
           notify('community_cards', { phase: 'flop', cards, board: game.board });
           console.log('  Flop: ' + cards.map(cardToString).join(' '));
           await WAIT(1500);
@@ -199,7 +193,6 @@ export function createP2PDealer(p2p, config, localNotify) {
           dealBoard(game, [idx % 52]); revealPos++;
           const turnData = { board: game.board.map(cardToString), phase: 'turn', hand: handCount, session: gameId };
           await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', turnData);
-          try { await p2p.writeBoardCards(handId, turnData); } catch(e) {}
           notify('community_cards', { phase: 'turn', board: game.board });
           console.log('  Turn: ' + cardToString(game.board[3]));
           await WAIT(1500);
@@ -208,7 +201,6 @@ export function createP2PDealer(p2p, config, localNotify) {
           dealBoard(game, [idx % 52]); revealPos++;
           const riverData = { board: game.board.map(cardToString), phase: 'river', hand: handCount, session: gameId };
           await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_board_cards', riverData);
-          try { await p2p.writeBoardCards(handId, riverData); } catch(e) {}
           notify('community_cards', { phase: 'river', board: game.board });
           console.log('  River: ' + cardToString(game.board[4]));
           await WAIT(1500);
@@ -295,9 +287,9 @@ export function createP2PDealer(p2p, config, localNotify) {
       const verification = verifyGame(playerData, dd, cd, numCards);
       console.log('[DEALER] Verify: ' + (verification.valid ? 'PASS' : 'FAIL: ' + verification.errors.join(', ')));
 
-      // Write settlement
-      await p2p.writeSettlement(handId, {
-        hand: handCount, verified: verification.valid,
+      // Write settlement to base key only (player polls this)
+      await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_settlement_info', {
+        hand: handCount, verified: verification.valid, session: gameId,
         results: game.players.map(p => ({ id: p.id, chips: p.chips })),
         board: game.board.map(cardToString)
       });
