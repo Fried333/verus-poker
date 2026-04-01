@@ -300,11 +300,12 @@ export function createP2PDealer(p2p, config, localNotify) {
       const verification = verifyGame(playerData, dd, cd, numCards);
       console.log('[DEALER] Verify: ' + (verification.valid ? 'PASS' : 'FAIL: ' + verification.errors.join(', ')));
 
-      // Write settlement to base key only (player polls this)
+      // Write settlement to base key (player polls this) — include showdown data
       await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_settlement_info', {
         hand: handCount, verified: verification.valid, session: gameId,
         results: game.players.map(p => ({ id: p.id, chips: p.chips })),
-        board: game.board.map(cardToString)
+        board: game.board.map(cardToString),
+        handNames, allHoleCards, winners, winAmount
       });
 
       // Update player chips
