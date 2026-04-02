@@ -82,6 +82,58 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     }
   }
 
+  /**
+   * Batch write — multiple VDXF keys in ONE updateidentity TX
+   * entries: [{ key: 'chips.vrsc::poker.sg777z.xxx', data: {...} }, ...]
+   */
+  async function writeBatch(identityId, entries) {
+    const idName = identityId.replace('.CHIPS@', '');
+
+    // Wait for previous write to THIS identity
+    const prevTx = lastTxId.get(idName);
+    if (prevTx) {
+      await waitForTxSpendable(prevTx);
+    }
+
+    // Resolve parent
+    let parent;
+    try {
+      const fullName = identityId.includes('.') ? identityId : identityId + '.CHIPS@';
+      const idInfo = await client.getIdentity(fullName);
+      parent = idInfo.identity?.parent;
+    } catch (e) {}
+
+    // Build contentmultimap with ALL keys
+    const cmm = {};
+    for (const entry of entries) {
+      const vdxfId = await resolveVdxfId(entry.key);
+      const hexData = Buffer.from(JSON.stringify(serialize(entry.data))).toString('hex');
+      cmm[vdxfId] = hexData;
+    }
+
+    const updateParams = { name: idName, contentmultimap: cmm };
+    if (parent) updateParams.parent = parent;
+
+    try {
+      const txid = await client.call('updateidentity', [updateParams]);
+      lastTxId.set(idName, txid);
+      lastWrite.set(idName, Date.now());
+      console.log('[P2P] Batch written to ' + idName + ' (' + entries.length + ' keys) tx=' + txid.substring(0, 12));
+      return txid;
+    } catch (e) {
+      if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
+        console.log('[P2P] UTXO conflict on batch ' + idName + ' — retrying...');
+        if (prevTx) await waitForTxSpendable(prevTx);
+        await new Promise(r => setTimeout(r, 1000));
+        const txid = await client.call('updateidentity', [updateParams]);
+        lastTxId.set(idName, txid);
+        lastWrite.set(idName, Date.now());
+        return txid;
+      }
+      throw e;
+    }
+  }
+
   // Cache VDXF ID lookups
   const vdxfCache = new Map();
   async function resolveVdxfId(keyName) {
@@ -148,7 +200,7 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
   }
 
   return {
-    client, myId, tableId,
+    client, myId, tableId, writeBatch,
 
     // ═══════════════════════════════════════
     // PLAYER writes to PLAYER'S OWN ID
