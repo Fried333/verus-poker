@@ -37,43 +37,71 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
 
   const lastTxId = new Map(); // identity → last txid written
 
-  async function waitForTxSpendable(txid, maxWait = 30000) {
-    // Wait for TX to be in mempool (spendable) — don't need block confirmation
+  async function waitForTxConfirmed(txid, maxWait = 60000) {
+    // Wait for TX to have at least 1 confirmation (in a block, not just mempool)
+    // This prevents UTXO chains deeper than 1 — remote nodes can't see chained mempool TXs
     const start = Date.now();
     while (Date.now() - start < maxWait) {
       try {
-        await client.getTransaction(txid);
-        return true; // TX exists = spendable from mempool
+        const tx = await client.getTransaction(txid);
+        if (tx && tx.confirmations && tx.confirmations >= 1) return true;
       } catch (e) {
-        // TX not found yet — wait
+        // TX not found yet
       }
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 1000));
     }
     return false;
+  }
+
+  // Track if there's already an unconfirmed TX for this identity
+  const pendingTx = new Map(); // identity → { txid, confirmed }
+
+  async function ensureNoChain(idName) {
+    const pending = pendingTx.get(idName);
+    if (!pending) return; // No pending TX — safe to write
+
+    // Check if pending TX is confirmed
+    try {
+      const tx = await client.getTransaction(pending.txid);
+      if (tx && tx.confirmations && tx.confirmations >= 1) {
+        pendingTx.delete(idName); // Confirmed — clear it
+        return;
+      }
+    } catch (e) {}
+
+    // Unconfirmed — wait for confirmation (max 30s)
+    console.log('[P2P] Waiting for conf on ' + idName + ' tx=' + pending.txid.substring(0, 12) + '...');
+    const confirmed = await waitForTxConfirmed(pending.txid, 30000);
+    if (confirmed) {
+      pendingTx.delete(idName);
+    } else {
+      // Timed out waiting — proceed anyway (TX is in local mempool, risk chain depth 2)
+      console.log('[P2P] Conf timeout — proceeding (chain depth may be 2)');
+    }
   }
 
   async function write(identityId, vdxfKey, data) {
     const idName = identityId.replace('.CHIPS@', '');
     const serialized = serialize(data);
 
-    // Wait for previous write to THIS identity to confirm
-    const prevTx = lastTxId.get(idName);
-    if (prevTx) {
-      await waitForTxSpendable(prevTx);
-    }
+    // Ensure max 1 unconfirmed TX per identity — prevents deep UTXO chains
+    await ensureNoChain(idName);
 
     try {
       const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
+      pendingTx.set(idName, { txid }); // Track as pending
       lastTxId.set(idName, txid);
       lastWrite.set(idName, Date.now());
       console.log('[P2P] Written to ' + idName + ' tx=' + txid.substring(0, 12));
       return txid;
     } catch (e) {
       if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
-        console.log('[P2P] UTXO conflict on ' + idName + ' — waiting...');
-        if (prevTx) await waitForTxSpendable(prevTx);
-        await new Promise(r => setTimeout(r, 1000)); // Extra 1s for propagation
+        console.log('[P2P] UTXO conflict on ' + idName + ' — waiting for conf...');
+        const prev = pendingTx.get(idName);
+        if (prev) await waitForTxConfirmed(prev.txid);
+        pendingTx.delete(idName);
         const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
+        pendingTx.set(idName, { txid });
         lastTxId.set(idName, txid);
         lastWrite.set(idName, Date.now());
         return txid;
@@ -89,11 +117,8 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
   async function writeBatch(identityId, entries) {
     const idName = identityId.replace('.CHIPS@', '');
 
-    // Wait for previous write to THIS identity
-    const prevTx = lastTxId.get(idName);
-    if (prevTx) {
-      await waitForTxSpendable(prevTx);
-    }
+    // Ensure max 1 unconfirmed TX per identity
+    await ensureNoChain(idName);
 
     // Resolve parent
     let parent;
@@ -116,16 +141,19 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
 
     try {
       const txid = await client.call('updateidentity', [updateParams]);
+      pendingTx.set(idName, { txid });
       lastTxId.set(idName, txid);
       lastWrite.set(idName, Date.now());
       console.log('[P2P] Batch written to ' + idName + ' (' + entries.length + ' keys) tx=' + txid.substring(0, 12));
       return txid;
     } catch (e) {
       if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
-        console.log('[P2P] UTXO conflict on batch ' + idName + ' — retrying...');
-        if (prevTx) await waitForTxSpendable(prevTx);
-        await new Promise(r => setTimeout(r, 1000));
+        console.log('[P2P] UTXO conflict on batch ' + idName + ' — waiting for conf...');
+        const prev = pendingTx.get(idName);
+        if (prev) await waitForTxConfirmed(prev.txid);
+        pendingTx.delete(idName);
         const txid = await client.call('updateidentity', [updateParams]);
+        pendingTx.set(idName, { txid });
         lastTxId.set(idName, txid);
         lastWrite.set(idName, Date.now());
         return txid;

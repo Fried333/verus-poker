@@ -207,20 +207,27 @@ export function createP2PDealer(p2p, config, localNotify) {
           players: game.players.map(pp => ({ id: pp.id, chips: pp.chips, bet: pp.bet, folded: pp.folded }))
         };
 
-        let wt = Date.now();
-        if (streetDealt) {
-          // Batch: board_cards + betting_state in 1 TX
-          const boardKey = gameKey(VDXF_KEYS.BOARD_CARDS, handId);
-          const bsKey = gameKey(VDXF_KEYS.BETTING_STATE, handId);
-          await p2p.writeBatch(p2p.tableId, [
-            { key: boardKey, data: { board: game.board.map(cardToString), phase: game.phase, hand: handCount, session: gameId } },
-            { key: bsKey, data: bsData }
-          ]);
-          dlog('Board+BS batch: ' + game.phase + ' turn=' + p.id + ' pot=' + game.pot + ' (' + (Date.now()-wt) + 'ms)');
+        // Only write to chain when it's a REMOTE player's turn
+        // Dealer's own turn is handled locally — no chain write needed
+        const isLocalPlayer = (p.id === p2p.myId);
+
+        if (!isLocalPlayer) {
+          let wt = Date.now();
+          if (streetDealt) {
+            // Batch: board_cards + betting_state in 1 TX
+            const boardKey = gameKey(VDXF_KEYS.BOARD_CARDS, handId);
+            const bsKey = gameKey(VDXF_KEYS.BETTING_STATE, handId);
+            await p2p.writeBatch(p2p.tableId, [
+              { key: boardKey, data: { board: game.board.map(cardToString), phase: game.phase, hand: handCount, session: gameId } },
+              { key: bsKey, data: bsData }
+            ]);
+            dlog('Board+BS batch: ' + game.phase + ' turn=' + p.id + ' pot=' + game.pot + ' (' + (Date.now()-wt) + 'ms)');
+          } else {
+            await p2p.writeBettingState(handId, bsData);
+            dlog('BS written: turn=' + p.id + ' phase=' + game.phase + ' pot=' + game.pot + ' (' + (Date.now()-wt) + 'ms)');
+          }
         } else {
-          // Just BS (no new board)
-          await p2p.writeBettingState(handId, bsData);
-          dlog('BS written: turn=' + p.id + ' phase=' + game.phase + ' pot=' + game.pot + ' (' + (Date.now()-wt) + 'ms)');
+          dlog('Local turn: ' + p.id + ' phase=' + game.phase + ' (no chain write)');
         }
 
         // Wait for player action
