@@ -933,9 +933,11 @@ if (USE_LOCAL) {
           console.log('[P2P] Waiting for ' + data.playerId + ' on-chain...');
           try {
             const hid = data.handId || (p2pDealer.getGameId() + '_h' + p2pDealer.getHandCount());
-            await p2p.writeBettingState(hid, {
+            const bsSeq = data.bsSeq || 0;
+            const bsKey = KEYS.BETTING_STATE + '.' + hid + '.s' + bsSeq;
+            await p2p.write(TABLE_ID, bsKey, {
               turn: data.playerId, validActions: data.validActions, toCall: data.toCall, pot: data.pot, minRaise: data.minRaise,
-              phase: data.phase || 'preflop',
+              phase: data.phase || 'preflop', seq: bsSeq,
               session: p2pDealer.getGameId(), hand: p2pDealer.getHandCount(),
               players: data.gamePlayers || [], ts: Date.now()
             });
@@ -945,13 +947,15 @@ if (USE_LOCAL) {
           broadcast({ method: 'betting', action: 'round_betting', playerid: remoteSeat, turnPlayer: data.playerId,
             pot: data.pot || 0, toCall: 0, minRaiseTo: 0, turnTimeout: 30, possibilities: [] });
           // Poll player's ID for action
+          const pollT = Date.now();
           const lastAction = await p2p.read(data.playerId, KEYS.PLAYER_ACTION);
           const response = await p2p.poll(data.playerId, KEYS.PLAYER_ACTION, lastAction, 60000);
+          const pollMs = Date.now() - pollT;
           if (response) {
-            console.log('[P2P] ' + data.playerId + ': ' + response.action);
+            console.log('[P2P] ' + data.playerId + ': ' + response.action + ' (poll ' + (pollMs/1000).toFixed(1) + 's)');
             data.resolve({ action: response.action, amount: response.amount || 0 });
           } else {
-            console.log('[P2P] ' + data.playerId + ' timed out');
+            console.log('[P2P] ' + data.playerId + ' timed out (poll ' + (pollMs/1000).toFixed(1) + 's)');
             data.resolve(null);
           }
         })();
@@ -1134,7 +1138,7 @@ if (USE_LOCAL) {
         }
       };
 
-      let lastBSJson = null;
+      let lastBSSeq = -1;
       let lastSettledHandId = null;
       let pollRunning = false;
       let joinWritten = false;
@@ -1163,7 +1167,7 @@ if (USE_LOCAL) {
               gs.winner = null; gs.verified = null; gs.showdownCards = {}; gs.handNames = {};
               gs.message = 'Hand #' + gs.handCount + ' — shuffling...';
               gs.players.forEach(p => { p.bet = 0; p.folded = false; p.holeCards = []; });
-              lastBSJson = null; acted = false;
+              lastBSSeq = -1; acted = false;
               pushState();
             }
 
@@ -1182,11 +1186,12 @@ if (USE_LOCAL) {
               }
             }
 
-            // 3. Check betting state
-            const bs = await p2p.readBettingState(gs.handId);
-            const bsJson = bs ? JSON.stringify(bs) : null;
-            if (bsJson && bsJson !== lastBSJson) {
-              lastBSJson = bsJson;
+            // 3. Check betting state — unique key per write (seq)
+            const nextSeq = (lastBSSeq || 0) + 1;
+            const bsKey = KEYS.BETTING_STATE + '.' + gs.handId + '.s' + nextSeq;
+            const bs = await p2p.read(TABLE_ID, bsKey);
+            if (bs) {
+              lastBSSeq = bs.seq || nextSeq;
               gs.pot = bs.pot || gs.pot;
               if (bs.phase) gs.phase = bs.phase;
               // Update player chips/bets from dealer data

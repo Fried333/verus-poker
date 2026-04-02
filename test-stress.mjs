@@ -81,13 +81,16 @@ async function playHand(p2p, handId, num) {
   process.stdout.write(' ' + myCards.join(','));
 
   // Play
+  let bsSeq = -1;
   for (let tick = 0; tick < 180; tick++) {
     await WAIT(1000);
 
-    const bs = await p2p.readBettingState(handId);
-    const bj = bs ? JSON.stringify(bs) : null;
-    if (bj && bj !== lastBSJson) {
-      lastBSJson = bj;
+    // Read next sequential BS key
+    const nextSeq = bsSeq + 1;
+    const bsKey = KEYS.BETTING_STATE + '.' + handId + '.s' + nextSeq;
+    const bs = await p2p.read(TABLE_ID, bsKey);
+    if (bs) {
+      bsSeq = bs.seq || nextSeq;
       if (bs.phase) streetsHit.add(bs.phase);
       if (bs.players) { const me = bs.players.find(p => p.id === MY_ID); if (me) myChips = me.chips; }
 

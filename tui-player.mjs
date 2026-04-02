@@ -292,7 +292,7 @@ async function main() {
   console.log('Join written ✓\n');
 
   // ── POLL LOOP ──
-  let lastBSJson = null;
+  let lastBSSeq = -1;
   let lastSettledHandId = null;
   let acted = false;
 
@@ -320,7 +320,7 @@ async function main() {
             { id: tc.dealer, seat: 1, chips: 200, bet: 0, folded: false }
           ];
         }
-        lastBSJson = null; acted = false; missedTurns = 0;
+        lastBSSeq = -1; acted = false; missedTurns = 0;
         render();
       }
 
@@ -339,13 +339,14 @@ async function main() {
         }
       }
 
-      // 3. Check betting state
+      // 3. Check betting state — poll for next sequence number
       const bsT = Date.now();
-      const bs = await p2p.readBettingState(state.handId);
+      const nextSeq = lastBSSeq + 1;
+      const bsKey = KEYS.BETTING_STATE + '.' + state.handId + '.s' + nextSeq;
+      const bs = await p2p.read(TABLE_ID, bsKey);
       const bsMs = Date.now() - bsT;
-      const bsJson = bs ? JSON.stringify(bs) : null;
-      if (bsJson && bsJson !== lastBSJson) {
-        lastBSJson = bsJson;
+      if (bs) {
+        lastBSSeq = bs.seq || nextSeq;
         state.pot = bs.pot || state.pot;
         if (bs.phase) state.phase = bs.phase;
         // Update player chips/bets
@@ -447,7 +448,7 @@ async function main() {
         state.message = 'Waiting for next hand...';
         lastSettledHandId = state.handId;
         state.handId = null;
-        lastBSJson = null;
+        lastBSSeq = -1;
         render();
       }
     } catch (e) {
