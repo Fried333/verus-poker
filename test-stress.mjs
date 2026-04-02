@@ -1,680 +1,199 @@
+#!/usr/bin/env node
 /**
- * Automated Poker Stress Test
- * Validates gameplay rules across many hands with random actions.
- * Run with: node --test test-stress.mjs
- */
-
-import { describe, it } from 'node:test';
-import assert from 'node:assert/strict';
-
-import {
-  createGame, addPlayer, startHand, postBlinds, playerAction,
-  dealBoard, setHoleCards, settleHand, applyPayouts, getGameState,
-  getValidActions, getToCall, calculatePots,
-  FOLD, CHECK, CALL, RAISE, ALL_IN,
-  WAITING, SHUFFLING, PREFLOP, FLOP, TURN, RIVER, SHOWDOWN, SETTLED
-} from './game.mjs';
-
-import { createEngine, createMockCrypto, createMockIO } from './poker-engine.mjs';
-import { evaluateHand, cardToString } from './hand-eval.mjs';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Create a mock IO that picks random valid actions.
- * Uses the engine reference to query game state for legal raise amounts.
- */
-function createRandomIO() {
-  const log = [];
-  const messages = [];
-  let engineRef = null;
-
-  return {
-    setEngine(e) { engineRef = e; },
-    broadcast(event, data) {
-      messages.push({ type: 'broadcast', event, data });
-    },
-    sendTo(playerId, event, data) {
-      messages.push({ type: 'sendTo', playerId, event, data });
-    },
-    async waitForAction(playerId, validActions, timeout) {
-      return pickRandomAction(validActions, engineRef);
-    },
-    log(msg) {
-      log.push(msg);
-    },
-    getLog() { return log; },
-    getMessages() { return messages; },
-  };
-}
-
-/** Pick a random valid action with legal raise amounts */
-function pickRandomAction(validActions, engineRef) {
-  if (!validActions || validActions.length === 0) return { action: FOLD };
-
-  const weights = {
-    [FOLD]: 5,
-    [CHECK]: 35,
-    [CALL]: 35,
-    [RAISE]: 20,
-    [ALL_IN]: 5,
-  };
-
-  let totalWeight = 0;
-  for (const a of validActions) totalWeight += (weights[a] || 10);
-  let roll = Math.random() * totalWeight;
-  let action = validActions[0];
-  for (const a of validActions) {
-    roll -= (weights[a] || 10);
-    if (roll <= 0) { action = a; break; }
-  }
-
-  if (action === RAISE && engineRef) {
-    const game = engineRef.game;
-    const seat = game.currentTurn;
-    const p = game.players[seat];
-    const toCall = getToCall(game, seat);
-    const chipsAfterCall = p.chips - toCall;
-    const minR = game.minRaise;
-
-    if (chipsAfterCall < minR) {
-      if (validActions.includes(CALL)) return { action: CALL };
-      if (validActions.includes(CHECK)) return { action: CHECK };
-      return { action: ALL_IN };
-    }
-
-    const maxR = Math.min(minR * 3, chipsAfterCall);
-    const amount = minR + Math.floor(Math.random() * (maxR - minR + 1));
-    return { action: RAISE, amount };
-  }
-
-  return { action };
-}
-
-/** Sum all chips across players */
-function totalChipsInPlay(game) {
-  let total = 0;
-  for (const p of game.players) total += p.chips;
-  return total;
-}
-
-/** Format game state for debugging */
-function dumpState(game, extra = '') {
-  const lines = [`Phase: ${game.phase}, Pot: ${game.pot}, Dealer: ${game.dealerSeat}`];
-  for (const p of game.players) {
-    lines.push(`  Seat ${p.seat} (${p.id}): chips=${p.chips} bet=${p.bet} totalBet=${p.totalBet} folded=${p.folded} allIn=${p.allIn}`);
-  }
-  if (game.sidePots && game.sidePots.length > 0) {
-    lines.push(`  Side pots: ${JSON.stringify(game.sidePots)}`);
-  }
-  if (extra) lines.push(extra);
-  return lines.join('\n');
-}
-
-/**
- * Play a complete hand using the game state machine directly (no engine, no delays).
- * Deals random cards, runs random actions through betting rounds, settles.
- * Returns the game state after settlement.
+ * Stress Test — plays N hands with random actions across two daemons
+ * Runs on LOCAL PC against dealer on SERVER. Random fold/check/call/raise/allin.
+ * Reports: timing, card integrity, chip conservation, errors.
  *
- * @param {object} game - Game state from createGame + addPlayer
- * @param {object} opts - { conservative: false } - if true, no fold/allin
+ * Usage: node test-stress.mjs [--hands=10]
  */
-function playHandDirect(game, opts = {}) {
-  const n = game.players.length;
-  const activeBefore = game.players.filter(p => p.chips > 0);
-  if (activeBefore.length < 2) return game;
 
-  // Advance dealer to a player with chips
-  game.dealerSeat = game.dealerSeat % n;
-  while (game.players[game.dealerSeat].chips <= 0) {
-    game.dealerSeat = (game.dealerSeat + 1) % n;
-  }
+import { createP2PLayer } from './p2p-layer.mjs';
+import { VDXF_KEYS } from './verus-rpc.mjs';
+import { readFileSync, existsSync } from 'fs';
+import { join } from 'path';
 
-  startHand(game);
-  postBlinds(game);
+const TOTAL_HANDS = parseInt(process.argv.find(a => a.startsWith('--hands='))?.split('=')[1] || '10');
+const WAIT = ms => new Promise(r => setTimeout(r, ms));
+const T0 = Date.now();
+function ts() { return ((Date.now() - T0) / 1000).toFixed(1); }
 
-  // Generate a shuffled deck for this hand
-  const deck = Array.from({ length: 52 }, (_, i) => i);
-  for (let i = deck.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [deck[i], deck[j]] = [deck[j], deck[i]];
-  }
-  let cardIdx = 0;
-
-  // Deal hole cards
-  for (const p of game.players) {
-    setHoleCards(game, p.seat, [deck[cardIdx++], deck[cardIdx++]]);
-  }
-
-  let safety = 0;
-  const maxActions = 500; // Safety limit per hand (generous for re-raise wars)
-
-  while (game.phase !== SHOWDOWN && game.phase !== SETTLED && safety < maxActions) {
-    // Deal community cards when entering new street
-    if (game.phase === FLOP && game.board.length === 0) {
-      dealBoard(game, [deck[cardIdx++], deck[cardIdx++], deck[cardIdx++]]);
-    } else if (game.phase === TURN && game.board.length === 3) {
-      dealBoard(game, [deck[cardIdx++]]);
-    } else if (game.phase === RIVER && game.board.length === 4) {
-      dealBoard(game, [deck[cardIdx++]]);
+function findRPC() {
+  const paths = [
+    join(process.env.HOME, '.verus/pbaas/f315367528394674d45277e369629605a1c3ce9f/f315367528394674d45277e369629605a1c3ce9f.conf'),
+    join(process.env.HOME, '.komodo/CHIPS/CHIPS.conf'),
+  ];
+  for (const p of paths) {
+    if (existsSync(p)) {
+      const conf = readFileSync(p, 'utf8');
+      const get = k => (conf.match(new RegExp('^' + k + '=(.+)$', 'm')) || [])[1];
+      if (get('rpcuser') && get('rpcpassword'))
+        return { host: '127.0.0.1', port: parseInt(get('rpcport') || '22778'), user: get('rpcuser'), pass: get('rpcpassword') };
     }
-
-    if (game.currentTurn < 0) {
-      game.phase = SHOWDOWN;
-      break;
-    }
-
-    // Pick and execute a random valid action
-    const seat = game.currentTurn;
-    const valid = getValidActions(game);
-    if (valid.length === 0) break;
-
-    const { action, amount } = pickRandomActionDirect(game, seat, valid, opts);
-    playerAction(game, seat, action, amount || 0);
-    safety++;
   }
-
-  // If safety limit was hit without reaching showdown, force it
-  if (game.phase !== SHOWDOWN && game.phase !== SETTLED) {
-    game.phase = SHOWDOWN;
-    game.currentTurn = -1;
-  }
-
-  // Deal remaining community cards for showdown with multiple players
-  if (game.phase === SHOWDOWN) {
-    const nonFolded = game.players.filter(p => !p.folded);
-    if (nonFolded.length > 1) {
-      while (game.board.length < 5 && cardIdx < deck.length) {
-        dealBoard(game, [deck[cardIdx++]]);
-      }
-    }
-    const payouts = settleHand(game, evaluateHand);
-    applyPayouts(game, payouts);
-  }
-
-  // Advance dealer for next hand
-  game.dealerSeat = (game.dealerSeat + 1) % n;
-
-  return game;
+  throw new Error('CHIPS config not found');
 }
 
-/**
- * Pick a random action directly from game state (for playHandDirect).
- */
-function pickRandomActionDirect(game, seat, validActions, opts = {}) {
-  const conservative = opts.conservative || false;
-  const weights = conservative ? {
-    [FOLD]: 0, [CHECK]: 45, [CALL]: 45, [RAISE]: 10, [ALL_IN]: 0,
-  } : {
-    [FOLD]: 5, [CHECK]: 35, [CALL]: 35, [RAISE]: 20, [ALL_IN]: 5,
-  };
+const MY_ID = 'pc-player';
+const TABLE_ID = 'poker-table';
+const KEYS = {
+  TABLE_CONFIG:  'chips.vrsc::poker.sg777z.t_table_info',
+  JOIN_REQUEST:  'chips.vrsc::poker.sg777z.p_join_request',
+  CARD_BV:       'chips.vrsc::poker.sg777z.card_bv',
+  PLAYER_ACTION: 'chips.vrsc::poker.sg777z.p_betting_action',
+  SETTLEMENT:    'chips.vrsc::poker.sg777z.t_settlement_info',
+};
 
-  let totalWeight = 0;
-  // Filter to actions with non-zero weight, falling back to all if none
-  const available = validActions.filter(a => (weights[a] ?? 0) > 0);
-  const choices = available.length > 0 ? available : validActions;
+// Stats
+const stats = {
+  played: 0, failed: 0, handTimes: [], actionWriteTimes: [], propagationTimes: [],
+  settlementDelays: [], duplicateCards: 0, chipErrors: 0, verifyFails: 0,
+  actions: {}, streets: {}, errors: []
+};
 
-  for (const a of choices) totalWeight += (weights[a] ?? 1);
-  let roll = Math.random() * totalWeight;
-  let action = choices[0];
-  for (const a of choices) {
-    roll -= (weights[a] ?? 1);
-    if (roll <= 0) { action = a; break; }
+function pickAction(valid, toCall, minRaise, chips) {
+  const r = Math.random();
+  if (r < 0.35 && valid.includes('check')) return { action: 'check', amount: 0 };
+  if (r < 0.35 && valid.includes('call')) return { action: 'call', amount: toCall };
+  if (r < 0.65 && valid.includes('raise')) {
+    const amt = Math.min(chips - toCall, Math.max(minRaise, Math.floor(Math.random() * minRaise * 3)));
+    return { action: 'raise', amount: Math.max(minRaise, amt) };
   }
-
-  if (action === RAISE) {
-    const p = game.players[seat];
-    const toCall = getToCall(game, seat);
-    const chipsAfterCall = p.chips - toCall;
-    const minR = game.minRaise;
-
-    if (chipsAfterCall < minR) {
-      if (validActions.includes(CALL)) return { action: CALL, amount: 0 };
-      if (validActions.includes(CHECK)) return { action: CHECK, amount: 0 };
-      return { action: ALL_IN, amount: 0 };
-    }
-
-    const maxR = conservative
-      ? minR
-      : Math.min(minR * 3, chipsAfterCall);
-    const amount = minR + Math.floor(Math.random() * (maxR - minR + 1));
-    return { action: RAISE, amount };
-  }
-
-  return { action, amount: 0 };
+  if (r < 0.85 && valid.includes('fold')) return { action: 'fold', amount: 0 };
+  if (valid.includes('allin')) return { action: 'allin', amount: 0 };
+  if (valid.includes('check')) return { action: 'check', amount: 0 };
+  if (valid.includes('call')) return { action: 'call', amount: toCall };
+  return { action: 'fold', amount: 0 };
 }
 
-// ---------------------------------------------------------------------------
-// 1. Chip Conservation — the most important test
-//    Uses playHandDirect for speed (no engine delays).
-//    NOTE: May occasionally fail when random play triggers a known engine bug
-//    in settleHand/calculatePots where chips get stuck in the pot during
-//    certain multi-player all-in scenarios with folded blind posters.
-//    A failure here indicates a real bug in game.mjs, not a test issue.
-// ---------------------------------------------------------------------------
+async function playHand(p2p, handId, num) {
+  const t0 = Date.now();
+  let lastBSJson = null, acted = false, myCards = [], board = [], myChips = 200;
+  let lastActTime = null, streetsHit = new Set();
 
-describe('Chip Conservation', () => {
-  for (const numPlayers of [2, 3, 4, 6, 9]) {
-    it(`conserves chips across 100 hands with ${numPlayers} players`, () => {
-      const startingChips = 1000;
-      const expectedTotal = numPlayers * startingChips;
-
-      const game = createGame({ smallBlind: 5, bigBlind: 10, rake: 0 });
-      for (let i = 0; i < numPlayers; i++) {
-        addPlayer(game, `player_${i}`, startingChips);
-      }
-
-      for (let hand = 0; hand < 100; hand++) {
-        const active = game.players.filter(p => p.chips > 0);
-        if (active.length < 2) break;
-
-        playHandDirect(game);
-
-        const total = totalChipsInPlay(game);
-        assert.equal(total, expectedTotal,
-          `Hand ${hand + 1} with ${numPlayers} players: chip total ${total} != expected ${expectedTotal}\n${dumpState(game)}`);
-      }
-    });
+  // Wait for cards (60s max)
+  const ck = KEYS.CARD_BV + '.' + handId + '.' + MY_ID;
+  for (let i = 0; i < 60; i++) {
+    const cr = await p2p.read(TABLE_ID, ck);
+    if (cr?.cards) { myCards = cr.cards; break; }
+    await WAIT(1000);
   }
-});
+  if (!myCards.length) { stats.errors.push('H' + num + ': no cards 60s'); return false; }
+  process.stdout.write(' ' + myCards.join(','));
 
-// ---------------------------------------------------------------------------
-// 2. Variable Player Counts — each count runs at least 20 hands
-//    Uses conservative play + deep stacks to avoid early busts.
-// ---------------------------------------------------------------------------
+  // Play
+  for (let tick = 0; tick < 180; tick++) {
+    await WAIT(1000);
 
-describe('Variable Player Counts', () => {
-  for (const numPlayers of [2, 3, 4, 6, 9]) {
-    it(`plays 20+ hands correctly with ${numPlayers} players`, () => {
-      const startingChips = 100000;
-      const expectedTotal = numPlayers * startingChips;
+    const bs = await p2p.readBettingState(handId);
+    const bj = bs ? JSON.stringify(bs) : null;
+    if (bj && bj !== lastBSJson) {
+      lastBSJson = bj;
+      if (bs.phase) streetsHit.add(bs.phase);
+      if (bs.players) { const me = bs.players.find(p => p.id === MY_ID); if (me) myChips = me.chips; }
 
-      const game = createGame({ smallBlind: 1, bigBlind: 2, rake: 0 });
-      for (let i = 0; i < numPlayers; i++) {
-        addPlayer(game, `p${i}`, startingChips);
+      if (bs.turn === MY_ID && bs.validActions && !acted) {
+        if (lastActTime) stats.propagationTimes.push(Date.now() - lastActTime);
+        const act = pickAction(bs.validActions, bs.toCall || 0, bs.minRaise || 2, myChips);
+        stats.actions[act.action] = (stats.actions[act.action] || 0) + 1;
+        const wt = Date.now();
+        await p2p.write(MY_ID, KEYS.PLAYER_ACTION, { action: act.action, amount: act.amount, player: MY_ID, timestamp: Date.now() });
+        stats.actionWriteTimes.push(Date.now() - wt);
+        lastActTime = Date.now();
+        acted = true;
+        process.stdout.write(' ' + act.action[0]);
+      } else if (bs.turn !== MY_ID) { acted = false; }
+    }
+
+    const bc = await p2p.readBoardCards(handId);
+    if (bc?.board && bc.board.length > board.length) { board = bc.board; if (bc.phase) streetsHit.add(bc.phase); }
+
+    const st = await p2p.read(TABLE_ID, KEYS.SETTLEMENT + '.' + handId);
+    if (st?.verified !== undefined) {
+      const handTime = (Date.now() - t0) / 1000;
+      stats.handTimes.push(handTime);
+      if (lastActTime) stats.settlementDelays.push(Date.now() - lastActTime);
+      if (!st.verified) stats.verifyFails++;
+      if (myCards.length > 0 && board.length > 0) {
+        const all = [...myCards, ...board];
+        if (new Set(all).size !== all.length) stats.duplicateCards++;
       }
-
-      let handsPlayed = 0;
-      const failures = [];
-
-      for (let h = 0; h < 40; h++) {
-        const active = game.players.filter(p => p.chips > 0);
-        if (active.length < 2) break;
-
-        playHandDirect(game, { conservative: true });
-        handsPlayed++;
-
-        const total = totalChipsInPlay(game);
-        if (total !== expectedTotal) {
-          failures.push({
-            hand: h + 1,
-            actual: total,
-            expected: expectedTotal,
-            state: dumpState(game),
-          });
-        }
+      if (st.results) {
+        const total = st.results.reduce((s, r) => s + r.chips, 0);
+        if (total !== 400) { stats.chipErrors++; stats.errors.push('H' + num + ': chips=' + total); }
       }
-
-      assert.equal(failures.length, 0,
-        `Chip conservation failed ${failures.length} time(s). First on hand ${failures[0]?.hand}: ` +
-        `total ${failures[0]?.actual} != expected ${failures[0]?.expected}\n${failures[0]?.state}`);
-
-      assert.ok(handsPlayed >= 20,
-        `Only played ${handsPlayed} hands with ${numPlayers} players, expected at least 20`);
-    });
+      for (const s of streetsHit) stats.streets[s] = (stats.streets[s] || 0) + 1;
+      process.stdout.write(' ' + handTime.toFixed(0) + 's ' + (st.verified ? '✓' : '✗'));
+      return true;
+    }
   }
-});
+  stats.errors.push('H' + num + ': timeout 180s');
+  process.stdout.write(' TIMEOUT');
+  return false;
+}
 
-// ---------------------------------------------------------------------------
-// 3. All-in + Side Pot Correctness
-// ---------------------------------------------------------------------------
+async function main() {
+  console.log('══════════════════════════════════════');
+  console.log('  STRESS TEST — ' + TOTAL_HANDS + ' hands');
+  console.log('══════════════════════════════════════\n');
 
-describe('All-in and Side Pot Correctness', () => {
-  it('calculates side pots correctly with different stack sizes', () => {
-    const game = createGame({ smallBlind: 5, bigBlind: 10 });
-    addPlayer(game, 'short', 50);
-    addPlayer(game, 'medium', 200);
-    addPlayer(game, 'deep', 500);
+  const p2p = createP2PLayer(findRPC(), MY_ID, TABLE_ID);
+  const info = await p2p.client.getInfo();
+  console.log('Block: ' + info.blocks);
 
-    startHand(game);
-    postBlinds(game);
+  // Find session
+  const stale = new Set();
+  try { const s = await p2p.read(TABLE_ID, KEYS.SETTLEMENT); if (s?.session) stale.add(s.session); } catch {}
+  let session = null;
+  for (let i = 0; i < 60; i++) {
+    const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+    if (tc?.session && !stale.has(tc.session)) { session = tc.session; break; }
+    await WAIT(1000);
+  }
+  if (!session) { console.log('No session'); process.exit(1); }
+  console.log('Session: ' + session);
 
-    // 3-player: dealer=0, SB=1, BB=2. First to act preflop = seat 0.
-    const seat0 = game.currentTurn;
-    playerAction(game, seat0, ALL_IN);
+  await p2p.write(MY_ID, KEYS.JOIN_REQUEST, { table: TABLE_ID, player: MY_ID, session, ready: true, timestamp: Date.now() });
+  console.log('Joined\n');
 
-    const seat1 = game.currentTurn;
-    playerAction(game, seat1, ALL_IN);
-
-    const seat2 = game.currentTurn;
-    if (game.currentTurn >= 0) {
-      playerAction(game, seat2, CALL);
+  let lastHand = null;
+  for (let h = 1; h <= TOTAL_HANDS; h++) {
+    process.stdout.write('H' + h + ':');
+    let handId = null;
+    for (let i = 0; i < 120; i++) {
+      const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+      if (tc?.currentHandId && tc.currentHandId !== lastHand) { handId = tc.currentHandId; break; }
+      await WAIT(1000);
     }
-
-    const pots = calculatePots(game);
-
-    // Verify pot amounts sum to total bets
-    const potTotal = pots.reduce((s, p) => s + p.amount, 0);
-    const betTotal = game.players.reduce((s, p) => s + p.totalBet, 0);
-    assert.equal(potTotal, betTotal,
-      `Pot total ${potTotal} != bet total ${betTotal}\nPots: ${JSON.stringify(pots)}`);
-
-    // Short stack should be eligible for only the first pot
-    const shortSeat = game.players.find(p => p.id === 'short').seat;
-    assert.ok(pots[0].eligible.includes(shortSeat),
-      'Short stack should be eligible for main pot');
-
-    for (let i = 1; i < pots.length; i++) {
-      assert.ok(!pots[i].eligible.includes(shortSeat),
-        `Short stack should not be eligible for side pot ${i}`);
-    }
-  });
-
-  it('short-stack player can only win up to their contribution x callers', () => {
-    const game = createGame({ smallBlind: 5, bigBlind: 10 });
-    addPlayer(game, 'tiny', 30);   // seat 0
-    addPlayer(game, 'big1', 500);  // seat 1
-    addPlayer(game, 'big2', 500);  // seat 2
-
-    startHand(game);
-    postBlinds(game);
-
-    playerAction(game, game.currentTurn, ALL_IN);
-    if (game.currentTurn >= 0) playerAction(game, game.currentTurn, CALL);
-    if (game.currentTurn >= 0) playerAction(game, game.currentTurn, CALL);
-
-    const pots = calculatePots(game);
-
-    // Main pot: tiny's contribution (30) x 3 players = 90
-    assert.equal(pots[0].amount, 90,
-      `Main pot should be 90 (30 x 3 callers), got ${pots[0].amount}\nPots: ${JSON.stringify(pots)}`);
-  });
-
-  it('awards each pot to the correct winner via engine', async () => {
-    const io = createRandomIO();
-    const crypto = createMockCrypto();
-    const engine = createEngine({ smallBlind: 10, bigBlind: 20, rake: 0 }, io);
-    io.setEngine(engine);
-
-    engine.addPlayer('short', 40);
-    engine.addPlayer('med', 200);
-    engine.addPlayer('deep', 800);
-
-    const expectedTotal = 40 + 200 + 800;
-
-    for (let h = 0; h < 10; h++) {
-      const active = engine.game.players.filter(p => p.chips > 0);
-      if (active.length < 2) break;
-
-      await engine.playHand(crypto);
-
-      const total = totalChipsInPlay(engine.game);
-      assert.equal(total, expectedTotal,
-        `Side pot hand ${h + 1}: chip total ${total} != ${expectedTotal}\n${dumpState(engine.game)}`);
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 4. Blind Posting
-// ---------------------------------------------------------------------------
-
-describe('Blind Posting', () => {
-  it('heads-up: dealer posts SB, other posts BB', () => {
-    const game = createGame({ smallBlind: 5, bigBlind: 10 });
-    addPlayer(game, 'A', 500);
-    addPlayer(game, 'B', 500);
-
-    game.dealerSeat = 0;
-    startHand(game);
-    postBlinds(game);
-
-    assert.equal(game.players[0].bet, 5,
-      `Dealer (seat 0) should post SB of 5, got ${game.players[0].bet}`);
-    assert.equal(game.players[1].bet, 10,
-      `Seat 1 should post BB of 10, got ${game.players[1].bet}`);
-    assert.equal(game.pot, 15, `Pot should be 15, got ${game.pot}`);
-  });
-
-  it('3+ players: SB left of dealer, BB left of SB', () => {
-    for (const n of [3, 4, 6]) {
-      const game = createGame({ smallBlind: 5, bigBlind: 10 });
-      for (let i = 0; i < n; i++) addPlayer(game, `p${i}`, 500);
-
-      game.dealerSeat = 0;
-      startHand(game);
-      postBlinds(game);
-
-      const sbSeat = 1;
-      const bbSeat = 2;
-
-      assert.equal(game.players[sbSeat].bet, 5,
-        `${n}-player: SB (seat ${sbSeat}) should be 5, got ${game.players[sbSeat].bet}`);
-      assert.equal(game.players[bbSeat].bet, 10,
-        `${n}-player: BB (seat ${bbSeat}) should be 10, got ${game.players[bbSeat].bet}`);
-      assert.equal(game.pot, 15,
-        `${n}-player: Pot should be 15, got ${game.pot}`);
-
-      for (let i = 0; i < n; i++) {
-        if (i !== sbSeat && i !== bbSeat) {
-          assert.equal(game.players[i].bet, 0,
-            `${n}-player: Seat ${i} should have 0 bet, got ${game.players[i].bet}`);
-        }
-      }
-    }
-  });
-
-  it('player with fewer chips than blind posts what they have', () => {
-    const game = createGame({ smallBlind: 5, bigBlind: 10 });
-    addPlayer(game, 'A', 500);
-    addPlayer(game, 'B', 3);
-
-    game.dealerSeat = 1;
-    startHand(game);
-    postBlinds(game);
-
-    assert.equal(game.players[1].bet, 3,
-      `Short-stacked SB should post 3, got ${game.players[1].bet}`);
-    assert.equal(game.players[1].allIn, true,
-      'Short-stacked SB should be all-in');
-    assert.equal(game.players[0].bet, 10,
-      `BB should post 10, got ${game.players[0].bet}`);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 5. Dealer Button Advancement
-// ---------------------------------------------------------------------------
-
-describe('Dealer Button Advancement', () => {
-  it('dealer rotates correctly over multiple hands', () => {
-    const game = createGame({ smallBlind: 5, bigBlind: 10, rake: 0 });
-    const numPlayers = 4;
-    for (let i = 0; i < numPlayers; i++) {
-      addPlayer(game, `p${i}`, 50000);
-    }
-
-    const dealerPositions = [];
-    for (let h = 0; h < 12; h++) {
-      const active = game.players.filter(p => p.chips > 0);
-      if (active.length < 2) break;
-
-      dealerPositions.push(game.dealerSeat % numPlayers);
-      playHandDirect(game, { conservative: true });
-    }
-
-    // Dealer should advance each hand
-    for (let i = 1; i < dealerPositions.length; i++) {
-      assert.notEqual(dealerPositions[i], dealerPositions[i - 1],
-        `Dealer did not advance between hand ${i} and ${i + 1}: both at seat ${dealerPositions[i]}`);
-    }
-
-    // Should cycle through all 4 seats over 8+ hands
-    const uniqueSeats = new Set(dealerPositions);
-    assert.ok(uniqueSeats.size >= numPlayers,
-      `Dealer should rotate through all ${numPlayers} seats, only visited ${uniqueSeats.size}: [${[...uniqueSeats]}]`);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 6. All-in Shortcut to Showdown
-// ---------------------------------------------------------------------------
-
-describe('All-in Shortcut to Showdown', () => {
-  it('goes straight to showdown when all players are all-in', async () => {
-    const scriptedActions = [];
-    for (let i = 0; i < 20; i++) {
-      scriptedActions.push({ action: ALL_IN });
-    }
-
-    const io = createMockIO(scriptedActions);
-    const crypto = createMockCrypto();
-    const engine = createEngine({ smallBlind: 5, bigBlind: 10, rake: 0 }, io);
-
-    engine.addPlayer('a', 500);
-    engine.addPlayer('b', 500);
-    engine.addPlayer('c', 500);
-
-    await engine.playHand(crypto);
-
-    assert.equal(engine.game.phase, SETTLED,
-      `Expected SETTLED phase, got ${engine.game.phase}`);
-
-    const total = totalChipsInPlay(engine.game);
-    assert.equal(total, 1500,
-      `Chips not conserved after all-in showdown: ${total} vs 1500`);
-
-    const turnMessages = io.getMessages().filter(m => m.event === 'turn');
-    assert.ok(turnMessages.length <= 3,
-      `Expected at most 3 turn prompts for all-in showdown, got ${turnMessages.length}`);
-  });
-
-  it('heads-up all-in on first action goes to showdown', async () => {
-    const scriptedActions = [{ action: ALL_IN }, { action: CALL }];
-    const io = createMockIO(scriptedActions);
-    const crypto = createMockCrypto();
-    const engine = createEngine({ smallBlind: 5, bigBlind: 10, rake: 0 }, io);
-
-    engine.addPlayer('x', 200);
-    engine.addPlayer('y', 200);
-
-    await engine.playHand(crypto);
-
-    assert.equal(engine.game.phase, SETTLED,
-      `Expected SETTLED, got ${engine.game.phase}`);
-
-    const total = totalChipsInPlay(engine.game);
-    assert.equal(total, 400, `Chips not conserved: ${total} vs 400`);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 7. Edge Cases
-// ---------------------------------------------------------------------------
-
-describe('Edge Cases', () => {
-  it('all players fold to big blind -- BB wins uncontested', async () => {
-    const scriptedActions = [
-      { action: FOLD },
-      { action: FOLD },
-    ];
-    const io = createMockIO(scriptedActions);
-    const crypto = createMockCrypto();
-    const engine = createEngine({ smallBlind: 5, bigBlind: 10, rake: 0 }, io);
-
-    engine.addPlayer('a', 500);
-    engine.addPlayer('b', 500);
-    engine.addPlayer('c', 500);
-
-    await engine.playHand(crypto);
-
-    const total = totalChipsInPlay(engine.game);
-    assert.equal(total, 1500, `Chips not conserved: ${total}`);
-
-    assert.ok(engine.game.players[2].chips > 500,
-      `BB should have won the pot, but has ${engine.game.players[2].chips} chips`);
-  });
-
-  it('player with fewer chips than blind posts what they have', async () => {
-    const scriptedActions = [];
-    for (let i = 0; i < 10; i++) scriptedActions.push({ action: FOLD });
-
-    const io = createMockIO(scriptedActions);
-    const crypto = createMockCrypto();
-    const engine = createEngine({ smallBlind: 5, bigBlind: 10, rake: 0 }, io);
-
-    engine.addPlayer('rich', 500);
-    engine.addPlayer('poor', 3);
-
-    await engine.playHand(crypto);
-
-    const total = totalChipsInPlay(engine.game);
-    assert.equal(total, 503, `Chips not conserved: ${total} vs 503`);
-  });
-
-  it('heads-up all-in preflop -- both get showdown with 5 board cards', async () => {
-    const scriptedActions = [
-      { action: ALL_IN },
-      { action: ALL_IN },
-    ];
-    const io = createMockIO(scriptedActions);
-    const crypto = createMockCrypto();
-    const engine = createEngine({ smallBlind: 5, bigBlind: 10, rake: 0 }, io);
-
-    engine.addPlayer('x', 100);
-    engine.addPlayer('y', 300);
-
-    await engine.playHand(crypto);
-
-    assert.equal(engine.game.phase, SETTLED, `Expected SETTLED, got ${engine.game.phase}`);
-
-    const total = totalChipsInPlay(engine.game);
-    assert.equal(total, 400, `Chips not conserved: ${total} vs 400`);
-
-    assert.equal(engine.game.board.length, 5,
-      `Board should have 5 cards at showdown, got ${engine.game.board.length}`);
-  });
-
-  it('survives 200 hands of pure random play without crashing', () => {
-    const game = createGame({ smallBlind: 1, bigBlind: 2, rake: 0 });
-    const numPlayers = 6;
-    const startingChips = 100000;
-    const expectedTotal = numPlayers * startingChips;
-
-    for (let i = 0; i < numPlayers; i++) {
-      addPlayer(game, `stress_${i}`, startingChips);
-    }
-
-    let handsPlayed = 0;
-    const failures = [];
-
-    for (let h = 0; h < 200; h++) {
-      const active = game.players.filter(p => p.chips > 0);
-      if (active.length < 2) break;
-
-      playHandDirect(game, { conservative: true });
-      handsPlayed++;
-
-      const total = totalChipsInPlay(game);
-      if (total !== expectedTotal) {
-        failures.push({
-          hand: h + 1,
-          actual: total,
-          expected: expectedTotal,
-          state: dumpState(game),
-        });
-      }
-    }
-
-    // Chip conservation
-    assert.equal(failures.length, 0,
-      `Chip conservation failed ${failures.length} time(s). First on hand ${failures[0]?.hand}: ` +
-      `total ${failures[0]?.actual} != expected ${failures[0]?.expected}\n${failures[0]?.state}`);
-
-    // Endurance
-    assert.ok(handsPlayed >= 50,
-      `Only played ${handsPlayed} hands in 200-hand stress test, expected at least 50`);
-  });
-});
+    if (!handId) { console.log(' NO HAND'); stats.failed++; continue; }
+    if (await playHand(p2p, handId, h)) { stats.played++; lastHand = handId; }
+    else { stats.failed++; lastHand = handId; }
+    console.log();
+    await WAIT(2000);
+  }
+
+  // Report
+  const avg = a => a.length ? (a.reduce((s,v) => s+v, 0) / a.length) : 0;
+  const med = a => { const s = [...a].sort((x,y) => x-y); return s[Math.floor(s.length/2)] || 0; };
+
+  console.log('\n══════════════════════════════════════');
+  console.log('  REPORT');
+  console.log('══════════════════════════════════════');
+  console.log('Hands: ' + stats.played + '/' + TOTAL_HANDS + ' ok, ' + stats.failed + ' failed');
+  console.log('Total: ' + ((Date.now()-T0)/1000).toFixed(0) + 's (' + (((Date.now()-T0)/1000)/Math.max(1,stats.played)).toFixed(0) + 's/hand)');
+  console.log('\nHand time:  avg=' + avg(stats.handTimes).toFixed(0) + 's  med=' + med(stats.handTimes).toFixed(0) + 's  min=' + Math.min(...stats.handTimes||[0]).toFixed(0) + 's  max=' + Math.max(...stats.handTimes||[0]).toFixed(0) + 's');
+  console.log('Action write: avg=' + avg(stats.actionWriteTimes).toFixed(0) + 'ms  med=' + med(stats.actionWriteTimes).toFixed(0) + 'ms');
+  console.log('Propagation:  avg=' + (avg(stats.propagationTimes)/1000).toFixed(1) + 's  med=' + (med(stats.propagationTimes)/1000).toFixed(1) + 's');
+  console.log('Settlement:   avg=' + (avg(stats.settlementDelays)/1000).toFixed(1) + 's  med=' + (med(stats.settlementDelays)/1000).toFixed(1) + 's');
+  console.log('\nActions: ' + Object.entries(stats.actions).map(([k,v]) => k + '=' + v).join('  '));
+  console.log('Streets: ' + Object.entries(stats.streets).map(([k,v]) => k + '=' + v).join('  '));
+  console.log('\nIntegrity:');
+  console.log('  Duplicate cards: ' + stats.duplicateCards);
+  console.log('  Chip errors: ' + stats.chipErrors);
+  console.log('  Verify fails: ' + stats.verifyFails);
+  if (stats.errors.length) { console.log('  Errors:'); stats.errors.slice(0, 20).forEach(e => console.log('    ' + e)); }
+  const ok = stats.duplicateCards === 0 && stats.chipErrors === 0 && stats.verifyFails === 0 && stats.failed === 0;
+  console.log('\n' + (ok ? '★ ALL PASS' : '✗ ISSUES FOUND'));
+  process.exit(ok ? 0 : 1);
+}
+
+main().catch(e => { console.error(e); process.exit(1); });

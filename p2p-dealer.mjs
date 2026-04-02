@@ -112,8 +112,17 @@ export function createP2PDealer(p2p, config, localNotify) {
         dlog('  ' + activePlayers[i].id + ': ' + cards.map(cardToString).join(' '));
       }
 
-      // ── SINGLE BATCH WRITE: all init data in ONE TX ──
-      // Matches C code: "Single atomic update with all init data in single transaction"
+      // ── PLAY THE HAND (setup game state locally first) ──
+      const game = createGame({ smallBlind, bigBlind, rake: 0 });
+      for (const p of activePlayers) addPlayer(game, p.id, p.chips);
+      game.dealerSeat = dealerSeatIdx % numPlayers;
+      startHand(game);
+      postBlinds(game);
+      for (let i = 0; i < numPlayers; i++) {
+        setHoleCards(game, i, holeCards[activePlayers[i].id]);
+      }
+
+      // ── SINGLE BATCH WRITE: table_info + card_bv + blinds BS — ALL IN 1 TX ──
       handStartTime = Date.now();
       const initEntries = [];
       // Table info with currentHandId
@@ -129,39 +138,21 @@ export function createP2PDealer(p2p, config, localNotify) {
           type: 'hole', hand: handCount, session: gameId
         }});
       }
+      // Blinds betting state
+      initEntries.push({ key: gameKey(VDXF_KEYS.BETTING_STATE, handId), data: {
+        phase: game.phase, pot: game.pot, dealerSeat: game.dealerSeat,
+        players: game.players.map(p => ({ id: p.id, chips: p.chips, bet: p.bet }))
+      }});
       let wt = Date.now();
       await p2p.writeBatch(p2p.tableId, initEntries);
       dlog('Init batch written (' + initEntries.length + ' keys, ' + (Date.now()-wt) + 'ms)');
-
-      // ── PLAY THE HAND (betting rounds) ──
-      dlog('Playing hand...');
-      const game = createGame({ smallBlind, bigBlind, rake: 0 });
-      for (const p of activePlayers) addPlayer(game, p.id, p.chips);
-      game.dealerSeat = dealerSeatIdx % numPlayers;
-
-      startHand(game);
-      postBlinds(game);
-      for (let i = 0; i < numPlayers; i++) {
-        setHoleCards(game, i, holeCards[activePlayers[i].id]);
-      }
-
-      // Notify AFTER blinds posted so browser gets correct chip counts
-      // Update table_info with current handId so player knows which keys to poll
-      await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_table_info', {
-        smallBlind, bigBlind, buyin, maxPlayers: 9, status: 'playing', dealer: p2p.myId,
-        session: gameId, currentHandId: handId, handCount
-      });
 
       notify('cards_dealt', { holeCards, handId,
         gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, seat: gp.seat })),
         pot: game.pot, phase: game.phase, dealerSeat: game.dealerSeat
       });
 
-      // Write blinds state
-      await p2p.writeBettingState(handId, {
-        phase: game.phase, pot: game.pot, dealerSeat: game.dealerSeat,
-        players: game.players.map(p => ({ id: p.id, chips: p.chips, bet: p.bet }))
-      });
+      dlog('Playing hand...');
       // Community card crypto backend
       let revealPos = numPlayers * 2;
 
