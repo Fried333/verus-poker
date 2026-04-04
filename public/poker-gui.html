@@ -298,8 +298,9 @@ let mySeat = 0;
 // ══════════════════════════════════════
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host);
-  ws.onopen = () => console.log('Connected');
+  const wsPath = basePath.endsWith('/') ? basePath : basePath + '/';
+  ws = new WebSocket(proto + '//' + location.host + wsPath);
+  ws.onopen = () => console.log('Connected to ' + location.host + wsPath);
   ws.onmessage = e => {
     try {
       const m = JSON.parse(e.data);

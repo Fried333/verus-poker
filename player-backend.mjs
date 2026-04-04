@@ -60,6 +60,8 @@ export function createPlayerBackend(p2p, myId, tableId) {
   let acted = false;
   let actionPending = false; // true while waiting for user input (prevents re-trigger)
   let missedTurns = 0;
+  let handsWithoutCards = 0; // Track if we're being skipped (sat out by dealer)
+  let lastHandTime = 0; // Track when we last saw a new hand
   const MAX_LOG = 20;
 
   const T0 = Date.now();
@@ -205,6 +207,7 @@ export function createPlayerBackend(p2p, myId, tableId) {
       }
 
       state.message = 'Waiting for dealer to deal...';
+      lastHandTime = Date.now();
       notify();
 
       // ── Poll loop ──
@@ -213,7 +216,25 @@ export function createPlayerBackend(p2p, myId, tableId) {
           // 1. Check for new hand
           const tc = await p2p.read(tableId, KEYS.TABLE_CONFIG);
           if (tc && tc.currentHandId && tc.currentHandId !== state.handId && tc.currentHandId !== lastSettledHandId) {
+            // If we had a hand but never got cards, we might be sat out
+            if (state.handId && state.myCards.length === 0) {
+              handsWithoutCards++;
+              if (handsWithoutCards >= 2) {
+                log('Skipped ' + handsWithoutCards + ' hands — writing rejoin');
+                handsWithoutCards = 0;
+                try {
+                  await p2p.write(myId, KEYS.JOIN_REQUEST, {
+                    table: tableId, player: myId, session: state.session, ready: true, timestamp: Date.now()
+                  });
+                  log('Rejoin written');
+                } catch (e) { log('Rejoin failed: ' + e.message); }
+              }
+            } else {
+              handsWithoutCards = 0;
+            }
+
             log('New hand: ' + tc.currentHandId);
+            lastHandTime = Date.now();
             state.handId = tc.currentHandId;
             state.handCount = tc.handCount || (state.handCount + 1);
             state.phase = 'shuffling';
@@ -228,7 +249,20 @@ export function createPlayerBackend(p2p, myId, tableId) {
             notify();
           }
 
-          if (!state.handId) { await WAIT(2000); continue; }
+          if (!state.handId) {
+            // If no hand for 30s, re-write join in case we were sat out
+            if (lastHandTime > 0 && Date.now() - lastHandTime > 30000) {
+              log('No hand for 30s — re-writing join');
+              lastHandTime = Date.now(); // Reset so we don't spam
+              try {
+                await p2p.write(myId, KEYS.JOIN_REQUEST, {
+                  table: tableId, player: myId, session: state.session, ready: true, timestamp: Date.now()
+                });
+                log('Rejoin written');
+              } catch (e) { log('Rejoin failed: ' + e.message); }
+            }
+            await WAIT(2000); continue;
+          }
 
           // 2. Check for my cards
           if (state.myCards.length === 0) {

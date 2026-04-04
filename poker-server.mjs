@@ -1091,15 +1091,22 @@ if (USE_LOCAL) {
         }
       }
 
-      // Check if sat-out players have written a new join (wanting back in)
+      // Check if sat-out or busted players have written a new join (wanting back in)
       async function scanForSitBackIn() {
         for (const p of p2pDealer.getPlayers()) {
-          if (!p.sittingOut) continue;
+          if (!p.sittingOut && p.chips > 0) continue;
           try {
             const req = await p2p.read(p.id, KEYS.JOIN_REQUEST);
             if (req && req.session === sessionId && req.timestamp && req.timestamp > Date.now() - 60000) {
-              p2pDealer.sitBackIn(p.id);
-              dLog('system', p.id + ' is back in');
+              if (p.sittingOut) {
+                p2pDealer.sitBackIn(p.id);
+                dLog('system', p.id + ' is back in');
+              }
+              if (p.chips <= 0) {
+                p.chips = CONFIG.bigBlind * 100; // Reload to 200 (100 BB)
+                console.log('[P2P] ' + p.id + ' reloaded to ' + p.chips);
+                dLog('system', p.id + ' reloaded to ' + p.chips);
+              }
             }
           } catch {}
         }
