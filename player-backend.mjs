@@ -277,7 +277,7 @@ export function createPlayerBackend(p2p, myId, tableId) {
               actionPending = false;
               state.turn = bs.turn || null;
               state.validActions = [];
-              if (!state.message && state.turn) {
+              if (state.turn) {
                 state.message = 'Waiting for ' + state.turn + '...';
               }
               notify();

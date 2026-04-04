@@ -21,10 +21,11 @@ let handStartTime = 0;
 
 export function createP2PDealer(p2p, config, localNotify) {
   const { smallBlind, bigBlind, buyin } = config;
-  const players = []; // { id, seat, chips }
+  const players = []; // { id, seat, chips, sittingOut, timeouts }
   let handCount = 0;
   let dealerSeatIdx = 0;
   let gameId = null;
+  const MAX_TIMEOUTS = 1; // Sit out after this many consecutive timeouts (industry standard)
 
   function notify(event, data) {
     if (localNotify) localNotify(event, data);
@@ -47,7 +48,7 @@ export function createP2PDealer(p2p, config, localNotify) {
     },
 
     addPlayer(playerId, chips) {
-      players.push({ id: playerId, seat: players.length, chips: chips || buyin });
+      players.push({ id: playerId, seat: players.length, chips: chips || buyin, sittingOut: false, timeouts: 0 });
       console.log('[DEALER] ' + playerId + ' seated at seat ' + (players.length - 1));
     },
 
@@ -74,7 +75,7 @@ export function createP2PDealer(p2p, config, localNotify) {
       handCount++;
       const handId = gameId + '_h' + handCount;
       const numCards = 52;
-      const activePlayers = players.filter(p => p.chips > 0);
+      const activePlayers = players.filter(p => p.chips > 0 && !p.sittingOut);
       const numPlayers = activePlayers.length;
 
       if (numPlayers < 2) {
@@ -233,8 +234,21 @@ export function createP2PDealer(p2p, config, localNotify) {
         if (!action) {
           action = { action: validActions.includes(CHECK) ? CHECK : FOLD, amount: 0 };
           dlog(p.id + ' timed out → ' + action.action + ' (waited ' + (pollMs/1000).toFixed(1) + 's)');
+          // Track consecutive timeouts — sit out after MAX_TIMEOUTS
+          const pp = players.find(x => x.id === p.id);
+          if (pp) {
+            pp.timeouts = (pp.timeouts || 0) + 1;
+            if (pp.timeouts >= MAX_TIMEOUTS) {
+              pp.sittingOut = true;
+              dlog(p.id + ' SAT OUT after ' + pp.timeouts + ' timeout(s)');
+              notify('player_sat_out', { player: p.id, timeouts: pp.timeouts });
+            }
+          }
         } else {
           dlog(p.id + ': ' + action.action + (action.amount ? ' ' + action.amount : '') + ' (waited ' + (pollMs/1000).toFixed(1) + 's)');
+          // Reset timeout counter on any valid action
+          const pp = players.find(x => x.id === p.id);
+          if (pp) pp.timeouts = 0;
         }
 
         if (!validActions.includes(action.action)) {
@@ -320,6 +334,18 @@ export function createP2PDealer(p2p, config, localNotify) {
 
     getPlayers() { return players; },
     getHandCount() { return handCount; },
-    getGameId() { return gameId; }
+    getGameId() { return gameId; },
+
+    /** Sit a player back in (called when they rejoin/reconnect) */
+    sitBackIn(playerId) {
+      const p = players.find(x => x.id === playerId);
+      if (p && p.sittingOut) {
+        p.sittingOut = false;
+        p.timeouts = 0;
+        console.log('[DEALER] ' + playerId + ' sat back in');
+        return true;
+      }
+      return false;
+    }
   };
 }

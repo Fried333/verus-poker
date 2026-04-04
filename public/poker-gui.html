@@ -211,8 +211,11 @@ body {
 
 <div id="table-area">
   <div id="table-info">
-    <span id="ti-hand" style="color:#ffd700"></span>
-    <span id="ti-verify" style="color:#4caf50;margin-left:8px"></span>
+    <span id="ti-table" style="color:#4caf50"></span>
+    <span id="ti-blinds" style="margin-left:8px"></span>
+    <span id="ti-hand" style="margin-left:8px;color:#ffd700"></span>
+    <span id="ti-mode" style="margin-left:8px"></span>
+    <span id="ti-verify" style="margin-left:8px;color:#4caf50"></span>
   </div>
   <div id="felt">
     <div id="board"></div>
@@ -335,7 +338,10 @@ function render() {
   document.getElementById('hand-info').textContent = phaseText !== 'waiting' ? phaseText : '';
 
   // Table info bar
+  document.getElementById('ti-table').textContent = st.table || '';
+  document.getElementById('ti-blinds').textContent = st.smallBlind ? st.smallBlind + '/' + st.bigBlind : '';
   document.getElementById('ti-hand').textContent = st.handCount > 0 ? 'Hand #' + st.handCount : '';
+  document.getElementById('ti-mode').textContent = st.mode ? '(' + st.mode + ')' : '';
   document.getElementById('ti-verify').textContent = st.verified === true ? 'Verified' : st.verified === false ? 'FAILED' : '';
 
   // Board cards
@@ -466,7 +472,17 @@ function renderControls() {
     html += '</div></div>';
     el.innerHTML = html;
   } else {
-    el.innerHTML = '<span class="wait-text">' + esc(st.message || st.phase || 'Waiting...') + '</span>';
+    // Show last action + current wait status
+    let html = '';
+    // Always show the latest player action from action log
+    const lastAction = (st.actionLog || []).filter(a => !a.startsWith('---') && !a.includes('verified') && !a.includes(':') ).slice(-1)[0];
+    if (lastAction && !st.message?.includes('shuffling') && !st.message?.includes('next hand')) {
+      html += '<div style="color:#ffd54f;font-size:13px;font-weight:bold;margin-bottom:4px">' + esc(lastAction) + '</div>';
+    }
+    // Current status
+    const statusMsg = st.message || st.phase || 'Waiting...';
+    html += '<span class="wait-text">' + esc(statusMsg) + '</span>';
+    el.innerHTML = html;
   }
 }
 

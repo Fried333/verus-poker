@@ -150,6 +150,11 @@ function buildClientState() {
   }
 
   return {
+    table: TABLE_ID,
+    myId: MY_ID,
+    mode: 'p2p',
+    smallBlind: 1,
+    bigBlind: 2,
     phase: s.phase,
     pot: s.pot,
     handCount: s.handCount,

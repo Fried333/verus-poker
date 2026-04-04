@@ -1091,21 +1091,33 @@ if (USE_LOCAL) {
         }
       }
 
+      // Check if sat-out players have written a new join (wanting back in)
+      async function scanForSitBackIn() {
+        for (const p of p2pDealer.getPlayers()) {
+          if (!p.sittingOut) continue;
+          try {
+            const req = await p2p.read(p.id, KEYS.JOIN_REQUEST);
+            if (req && req.session === sessionId && req.timestamp && req.timestamp > Date.now() - 60000) {
+              p2pDealer.sitBackIn(p.id);
+              dLog('system', p.id + ' is back in');
+            }
+          } catch {}
+        }
+      }
+
       const gameLoop = async () => {
         while (true) {
-          // Scan for new players
+          // Scan for new players + sat-out players wanting back in
           await scanForJoins();
+          await scanForSitBackIn();
 
-          // Need at least 2 players (dealer is not a player)
-          if (seatedPlayers.size < 2) {
-            await new Promise(r => setTimeout(r, 3000));
-            continue;
-          }
-
-          // Play a hand
-          const activePlayers = p2pDealer.getPlayers().filter(p => p.chips > 0);
+          // Need at least 2 active players (not sitting out, with chips)
+          const activePlayers = p2pDealer.getPlayers().filter(p => p.chips > 0 && !p.sittingOut);
           if (activePlayers.length < 2) {
-            dLog('system', 'Waiting for more players with chips...');
+            const sittingOut = p2pDealer.getPlayers().filter(p => p.sittingOut);
+            if (sittingOut.length > 0) {
+              console.log('[P2P] Waiting — ' + sittingOut.map(p => p.id).join(', ') + ' sitting out');
+            }
             await new Promise(r => setTimeout(r, 5000));
             continue;
           }
@@ -1122,6 +1134,7 @@ if (USE_LOCAL) {
 
           // Between hands — scan for new players, wait a bit
           await scanForJoins();
+          await scanForSitBackIn();
           await new Promise(r => setTimeout(r, 3000));
         }
       };
