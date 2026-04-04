@@ -39,6 +39,7 @@ export function createPlayerBackend(p2p, myId, tableId) {
     validActions: [],
     toCall: 0,
     minRaise: 2,
+    dealerSeat: 0,
     winner: null,
     verified: null,
     message: 'Connecting...',
@@ -86,6 +87,37 @@ export function createPlayerBackend(p2p, myId, tableId) {
     onStateChange(fn) { _onStateChange = fn; },
     onNeedAction(fn) { _onNeedAction = fn; },
     onLog(fn) { _onLog = fn; },
+
+    /** Reload chips (reset to 200) — used when busted */
+    reload() {
+      const me = state.players.find(p => p.id === myId);
+      if (me) {
+        me.chips = 200;
+        state.busted = false;
+        state.message = 'Reloaded to 200 chips — click Sit In';
+        addActionLog(myId + ' reloaded');
+        log('Reloaded to 200 chips');
+        notify();
+      }
+    },
+
+    /** Sit back in after reload or sitting out */
+    async sitIn() {
+      state.busted = false;
+      state.message = 'Sitting back in — next hand';
+      addActionLog(myId + ' sat back in');
+      log('Sitting back in');
+      // Write a new join request so dealer sees we're back
+      try {
+        await p2p.write(myId, KEYS.JOIN_REQUEST, {
+          table: tableId, player: myId, session: state.session, ready: true, timestamp: Date.now()
+        });
+        log('Sit-in join written');
+      } catch (e) {
+        log('Sit-in write failed: ' + e.message);
+      }
+      notify();
+    },
 
     async submitAction(action) {
       log('Submitting action: ' + action.action + (action.amount ? ' ' + action.amount : ''));
@@ -219,6 +251,7 @@ export function createPlayerBackend(p2p, myId, tableId) {
             lastBSSeq = bs.seq !== undefined ? bs.seq : nextSeq;
             state.pot = bs.pot || state.pot;
             if (bs.phase) state.phase = bs.phase;
+            if (bs.dealerSeat !== undefined) state.dealerSeat = bs.dealerSeat;
 
             // Update players
             if (bs.players) {
@@ -344,7 +377,16 @@ export function createPlayerBackend(p2p, myId, tableId) {
             state.showdownCards = {}; state.handNames = {};
             state.turn = null; state.validActions = [];
             state.players.forEach(p => { p.bet = 0; p.folded = false; });
-            state.message = 'Waiting for next hand...';
+            // Check if we busted
+            const me = state.players.find(p => p.id === myId);
+            if (me && me.chips <= 0) {
+              state.busted = true;
+              state.message = 'Out of chips! Reload to continue.';
+              addActionLog(myId + ' busted');
+              log('BUSTED — 0 chips');
+            } else {
+              state.message = 'Waiting for next hand...';
+            }
             lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
             notify();
           }

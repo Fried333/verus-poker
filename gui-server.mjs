@@ -158,6 +158,8 @@ function buildClientState() {
     phase: s.phase,
     pot: s.pot,
     handCount: s.handCount,
+    dealerSeat: s.dealerSeat || 0,
+    busted: !!s.busted,
     board: s.board || [],
     myCards: handActive && !meFolded ? s.myCards : [],
     players,
@@ -189,6 +191,10 @@ wss.on('connection', ws => {
       const msg = JSON.parse(data.toString());
       if (msg.action === 'fold' || msg.action === 'check' || msg.action === 'call' || msg.action === 'raise' || msg.action === 'allin') {
         backend.submitAction({ action: msg.action, amount: msg.amount || 0 });
+      } else if (msg.action === 'reload') {
+        backend.reload();
+      } else if (msg.action === 'sitin') {
+        backend.sitIn();
       }
     } catch {}
   });

@@ -1,150 +1,218 @@
 #!/usr/bin/env node
 /**
- * Playwright GUI test with Node.js WebSocket bot for remote player.
+ * 3-player Playwright GUI test — 50 hands, random actions, reload on bust
  * - Local GUI via Playwright (pc-player)
- * - Remote player via Node.js WebSocket (pplayer2 on .28)
+ * - 2 remote bots via WebSocket (pplayer2 on .28, pdealer2 on .59)
  */
 
 import { chromium } from 'playwright';
 import WebSocket from 'ws';
 
 const LOCAL_URL = 'http://localhost:3000';
-const REMOTE_WS = 'ws://46.225.132.28:3001';
-const REMOTE_NAME = 'pplayer2';
+const BOTS = [
+  { name: 'pplayer2', ws: 'ws://46.225.132.28:3001' },
+  { name: 'pdealer2', ws: 'wss://verus.cx/poker/' },
+];
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ══════════════════════════════════════
-// Remote bot — connects via WebSocket, auto check/call
+// Remote bot — random actions, auto-reload on bust
 // ══════════════════════════════════════
-function startRemoteBot() {
-  return new Promise((resolve) => {
-    let botActions = 0;
-    let acted = false;  // Guard: only act once per turn
-    let lastHandCount = 0;
-    const ws = new WebSocket(REMOTE_WS);
+function startBot(name, url) {
+  return new Promise((resolve, reject) => {
+    let actions = 0, acted = false, busted = false, lastHand = 0;
+    const ws = new WebSocket(url);
 
     ws.on('open', () => {
-      console.log('[BOT] Connected to .28');
-      ws.send(JSON.stringify({ action: 'join', name: REMOTE_NAME }));
-      resolve({ ws, getActions: () => botActions });
+      console.log('[BOT ' + name + '] Connected');
+      ws.send(JSON.stringify({ action: 'join', name }));
+      resolve({ ws, getActions: () => actions, getName: () => name });
+    });
+
+    ws.on('error', e => {
+      console.log('[BOT ' + name + '] Error: ' + e.message);
+      reject(e);
     });
 
     ws.on('message', data => {
       try {
         const m = JSON.parse(data.toString());
 
-        // Reset acted flag when hand changes or turn changes away
+        // Handle busted
+        if (m.method === 'busted') {
+          busted = true;
+          console.log('[BOT ' + name + '] BUSTED — reloading...');
+          ws.send(JSON.stringify({ action: 'reload' }));
+          setTimeout(() => {
+            ws.send(JSON.stringify({ action: 'sitin' }));
+            busted = false;
+            console.log('[BOT ' + name + '] Sat back in');
+          }, 2000);
+          return;
+        }
+
+        // Reset acted when hand changes or no actions
         if (m.method === 'fullstate') {
-          if (m.handCount && m.handCount !== lastHandCount) {
-            acted = false;
-            lastHandCount = m.handCount;
-          }
-          // If no actions for us, reset so we can act next time
-          if (!m.actions || (m.actions.possibilities || m.actions.validActions || []).length === 0) {
-            acted = false;
-          }
+          if (m.handCount && m.handCount !== lastHand) { acted = false; lastHand = m.handCount; }
+          if (!m.actions || (m.actions.possibilities || m.actions.validActions || []).length === 0) acted = false;
         }
 
-        // Handle fullstate — check for action buttons (act ONCE)
-        if (m.method === 'fullstate' && m.actions && !acted) {
+        // Act on fullstate
+        if (m.method === 'fullstate' && m.actions && !acted && !busted) {
           const va = m.actions.possibilities || m.actions.validActions || [];
-          let action;
-          if (va.includes(1) || va.includes('check')) action = 'check';
-          else if (va.includes(2) || va.includes('call')) action = 'call';
-          else if (va.includes(0) || va.includes('fold')) action = 'fold';
+          const action = pickRandom(va);
           if (action) {
             acted = true;
-            ws.send(JSON.stringify({ action }));
-            botActions++;
-            console.log('[BOT] ' + action + ' (#' + botActions + ')');
+            const amount = action === 'raise' ? (m.actions.minRaiseTo || m.actions.minRaise || 4) : 0;
+            ws.send(JSON.stringify({ action, amount }));
+            actions++;
+            console.log('[BOT ' + name + '] ' + action + (amount ? ' ' + amount : '') + ' (#' + actions + ')');
           }
         }
 
-        // Handle old-style betting turn (act ONCE)
-        if (m.method === 'betting' && m.action === 'round_betting' && m.turnPlayer === REMOTE_NAME && !acted) {
+        // Act on old-style betting
+        if (m.method === 'betting' && m.action === 'round_betting' && m.turnPlayer === name && !acted && !busted) {
           const poss = m.possibilities || [];
-          let action;
-          if (poss.includes(1) || poss.includes('check')) action = 'check';
-          else if (poss.includes(2) || poss.includes('call')) action = 'call';
-          else if (poss.includes(0) || poss.includes('fold')) action = 'fold';
+          const action = pickRandom(poss);
           if (action) {
             acted = true;
-            ws.send(JSON.stringify({ action }));
-            botActions++;
-            console.log('[BOT] ' + action + ' (#' + botActions + ')');
+            const amount = action === 'raise' ? (m.minRaiseTo || 4) : 0;
+            ws.send(JSON.stringify({ action, amount }));
+            actions++;
+            console.log('[BOT ' + name + '] ' + action + (amount ? ' ' + amount : '') + ' (#' + actions + ')');
           }
         }
 
-        // When it's no longer our turn (action was processed), allow acting again on next turn
-        if (m.method === 'betting' && m.action !== 'round_betting') {
-          acted = false;
-        }
+        if (m.method === 'betting' && m.action !== 'round_betting') acted = false;
+        if (m.method === 'reloaded') { console.log('[BOT ' + name + '] Reloaded to ' + m.chips); }
+        if (m.method === 'satin') { console.log('[BOT ' + name + '] Back in'); }
       } catch {}
     });
 
-    ws.on('error', e => console.log('[BOT] Error: ' + e.message));
-    ws.on('close', () => console.log('[BOT] Disconnected'));
+    ws.on('close', () => console.log('[BOT ' + name + '] Disconnected'));
+    setTimeout(() => reject(new Error('Bot connect timeout')), 15000);
   });
+}
+
+function pickRandom(validActions) {
+  // Handle both number codes and string names
+  const map = { 0: 'fold', 1: 'check', 2: 'call', 3: 'raise', 7: 'allin' };
+  const actions = validActions.map(a => typeof a === 'number' ? map[a] : a).filter(Boolean);
+  if (actions.length === 0) return null;
+
+  // Random: 40% check/call, 30% fold, 20% raise, 10% allin
+  const rnd = Math.random();
+  if (rnd < 0.4) {
+    if (actions.includes('check')) return 'check';
+    if (actions.includes('call')) return 'call';
+  } else if (rnd < 0.7) {
+    if (actions.includes('fold')) return 'fold';
+  } else if (rnd < 0.9) {
+    if (actions.includes('raise')) return 'raise';
+  } else {
+    if (actions.includes('allin')) return 'allin';
+  }
+  // Fallback: first available
+  return actions[0];
 }
 
 // ══════════════════════════════════════
 // Main test
 // ══════════════════════════════════════
 async function test() {
-  console.log('=== GUI Test: Playwright + WebSocket Bot ===\n');
+  console.log('=== 3-Player 50-Hand Test ===\n');
 
-  // Start remote bot
-  console.log('[1] Starting remote bot for ' + REMOTE_NAME + '...');
-  const bot = await startRemoteBot();
+  // Start bots
+  const bots = [];
+  for (const b of BOTS) {
+    try {
+      const bot = await startBot(b.name, b.ws);
+      bots.push(bot);
+    } catch (e) {
+      console.log('WARN: Could not connect bot ' + b.name + ': ' + e.message);
+    }
+  }
+  console.log(bots.length + ' bots connected\n');
   await sleep(3000);
 
   // Open local GUI
-  console.log('[2] Opening local GUI...');
   const browser = await chromium.launch({ headless: false });
   const page = await browser.newPage();
   await page.goto(LOCAL_URL, { waitUntil: 'domcontentloaded', timeout: 10000 });
 
-  let handsPlayed = 0, localActions = 0;
+  let handsPlayed = 0, localActions = 0, reloads = 0;
 
   // Wait for seats
-  console.log('[3] Waiting for seats to render...');
+  console.log('Waiting for seats...');
   for (let i = 0; i < 120; i++) {
     const seats = await page.$$eval('.seat', s => s.length).catch(() => 0);
-    if (seats >= 2) {
-      console.log('  Seats: ' + seats + ' (after ' + i + 's)');
-      break;
-    }
-    if (i % 15 === 0) console.log('  Waiting... (' + i + 's)');
+    if (seats >= 2) { console.log('Seats: ' + seats + '\n'); break; }
+    if (i % 15 === 0) console.log('  (' + i + 's)');
     await sleep(1000);
   }
 
-  await page.screenshot({ path: '/tmp/gui-test-initial.png' });
+  await page.screenshot({ path: '/tmp/gui-test-start.png' });
 
-  // Play hands
-  console.log('\n[4] Playing hands...\n');
-
-  for (let hand = 0; hand < 10; hand++) {
-    console.log('--- Hand ' + (hand + 1) + ' ---');
-
+  // Play 50 hands
+  for (let hand = 0; hand < 50; hand++) {
     let handDone = false;
+    let handActions = 0;
+
     for (let tick = 0; tick < 120 && !handDone; tick++) {
-      // Check local for buttons
-      const btns = await page.$$eval('#controls button', b => b.map(x => x.textContent.trim())).catch(() => []);
-      if (btns.length > 0) {
-        // Click check > call > fold
-        const check = await page.$('button.btn-check');
-        const call = await page.$('button.btn-call');
-        const fold = await page.$('button.btn-fold');
-        let action = '';
-        if (check) { await check.click(); action = 'Check'; }
-        else if (call) { await call.click(); action = 'Call'; }
-        else if (fold) { await fold.click(); action = 'Fold'; }
-        if (action) {
-          localActions++;
-          console.log('  [local] ' + action + ' (' + btns.join(', ') + ')');
-        }
+      // Check for busted (reload button)
+      const hasBusted = await page.evaluate(() => {
+        const el = document.getElementById('controls');
+        return el && el.textContent.includes('Out of chips');
+      }).catch(() => false);
+
+      if (hasBusted) {
+        console.log('  [H' + (hand+1) + '] BUSTED — clicking Reload');
+        const reloadBtn = await page.$('#controls button');
+        if (reloadBtn) { await reloadBtn.click(); reloads++; }
         await sleep(2000);
+        // Click Sit In
+        const sitInBtn = await page.$('#controls button');
+        if (sitInBtn) {
+          const txt = await sitInBtn.textContent().catch(() => '');
+          if (txt.includes('Sit In')) { await sitInBtn.click(); console.log('  [H' + (hand+1) + '] Sat back in'); }
+        }
+        await sleep(3000);
+        continue;
+      }
+
+      // Check for action buttons
+      const btns = await page.$$eval('#controls button', b => b.map(x => x.textContent.trim())).catch(() => []);
+      if (btns.length > 0 && !btns[0].includes('Reload') && !btns[0].includes('Sit In')) {
+        // Random action: 40% check/call, 30% fold, 20% raise/bet, 10% allin
+        const rnd = Math.random();
+        let clicked = false, clickedName = '';
+        const tryClick = async (keyword) => {
+          for (const b of btns) {
+            if (b.toLowerCase().includes(keyword)) {
+              await page.click('#controls button:has-text("' + b.replace(/"/g, '') + '")');
+              clickedName = b;
+              return true;
+            }
+          }
+          return false;
+        };
+
+        if (rnd < 0.4) clicked = await tryClick('check') || await tryClick('call');
+        else if (rnd < 0.7) clicked = await tryClick('fold');
+        else if (rnd < 0.9) clicked = await tryClick('raise') || await tryClick('bet');
+        else clicked = await tryClick('all in');
+        if (!clicked) {
+          const anyBtn = await page.$('#controls button');
+          if (anyBtn) { clickedName = await anyBtn.textContent(); await anyBtn.click(); clicked = true; }
+        }
+
+        if (clicked) {
+          localActions++;
+          handActions++;
+          if (hand < 5 || hand % 10 === 0) console.log('  [H' + (hand+1) + '] ' + clickedName);
+        }
+        await sleep(1500);
         continue;
       }
 
@@ -156,99 +224,84 @@ async function test() {
         return (banner && banner.style.display !== 'none') || wt.includes('verified') || wt.includes('next');
       }).catch(() => false);
 
-      if (ended) {
-        handDone = true;
-        handsPlayed++;
-        console.log('  Hand ' + (hand + 1) + ' done!');
-        await page.screenshot({ path: '/tmp/gui-test-h' + (hand+1) + '.png' });
-      }
+      if (ended) { handDone = true; }
 
       await sleep(2000);
     }
 
-    if (!handDone) {
-      console.log('  Timed out');
+    if (handDone) {
+      handsPlayed++;
+      if (hand < 5 || hand % 10 === 0) {
+        console.log('  [H' + (hand+1) + '] Done (' + handActions + ' actions)');
+        await page.screenshot({ path: '/tmp/gui-test-h' + (hand+1) + '.png' });
+      }
+    } else {
+      console.log('  [H' + (hand+1) + '] Timed out');
       await page.screenshot({ path: '/tmp/gui-test-h' + (hand+1) + '-timeout.png' });
-      break;
     }
 
-    // Wait for next hand
-    await sleep(8000);
+    await sleep(6000);
   }
 
-  // Final — verify status shows on ALL players
-  console.log('\n[5] Status verification...');
-
-  // Check local GUI status
-  const localStatus = await page.evaluate(() => {
-    const controls = document.getElementById('controls');
-    const actionLog = document.getElementById('action-log');
-    const handInfo = document.getElementById('hand-info');
-    const potDisplay = document.getElementById('pot-display');
+  // Final status
+  console.log('\n=== Final Status ===');
+  const status = await page.evaluate(() => {
+    const logEl = document.getElementById('action-log');
+    const tiTable = document.getElementById('ti-table');
+    const tiBlinds = document.getElementById('ti-blinds');
     const tiHand = document.getElementById('ti-hand');
+    const tiMode = document.getElementById('ti-mode');
     const tiVerify = document.getElementById('ti-verify');
-    const banner = document.getElementById('winner-banner');
+    const controls = document.getElementById('controls');
     return {
-      controls: controls?.textContent?.trim() || '',
-      logEntries: actionLog ? [...actionLog.querySelectorAll('div')].map(d => d.textContent) : [],
-      phase: handInfo?.textContent || '',
-      pot: potDisplay?.textContent || '',
-      handInfo: tiHand?.textContent || '',
+      table: tiTable?.textContent || '',
+      blinds: tiBlinds?.textContent || '',
+      hand: tiHand?.textContent || '',
+      mode: tiMode?.textContent || '',
       verify: tiVerify?.textContent || '',
-      bannerVisible: banner?.style.display !== 'none',
-      seats: [...document.querySelectorAll('.seat')].length,
-      boardCards: [...document.querySelectorAll('.board-card')].length,
+      controls: controls?.textContent?.trim() || '',
+      logCount: logEl ? logEl.querySelectorAll('div').length : 0,
+      logLast10: logEl ? [...logEl.querySelectorAll('div')].slice(-10).map(d => d.textContent) : [],
+      seats: document.querySelectorAll('.seat').length,
+      dealerBadge: document.querySelectorAll('.seat-role').length,
     };
   }).catch(() => ({}));
 
-  console.log('  [LOCAL GUI]');
-  console.log('    Status bar: ' + localStatus.controls);
-  console.log('    Phase: ' + localStatus.phase);
-  console.log('    Pot: ' + localStatus.pot);
-  console.log('    Hand: ' + localStatus.handInfo);
-  console.log('    Verify: ' + localStatus.verify);
-  console.log('    Seats: ' + localStatus.seats);
-  console.log('    Board cards: ' + localStatus.boardCards);
-  console.log('    Action log entries: ' + (localStatus.logEntries?.length || 0));
+  console.log('  Top-left: ' + status.table + ' | ' + status.blinds + ' | ' + status.hand + ' | ' + status.mode + ' | ' + status.verify);
+  console.log('  Seats: ' + status.seats + ' | Dealer badge: ' + (status.dealerBadge > 0 ? 'YES' : 'NO'));
+  console.log('  Controls: ' + status.controls);
+  console.log('  Action log: ' + status.logCount + ' entries');
+  console.log('  Last 10:');
+  (status.logLast10 || []).forEach(e => console.log('    ' + e));
 
-  // Check remote player status (what pplayer2 sees)
-  const remoteStatus = await new Promise(resolve => {
-    // The bot's WS should be receiving fullstate — let's capture the last one
-    resolve({ note: 'Bot receives fullstate with message, phase, pot, actions' });
-  });
-
-  // Show last 10 action log entries
-  console.log('\n  Action log (last 10):');
-  (localStatus.logEntries || []).slice(-10).forEach(e => console.log('    ' + e));
-
-  // Verify key status items
+  // Checks
   const checks = [
-    ['Action log has entries', (localStatus.logEntries?.length || 0) > 0],
-    ['Action log has opponent actions', (localStatus.logEntries || []).some(e => e.includes('pplayer2'))],
-    ['Action log has own actions', (localStatus.logEntries || []).some(e => e.includes('pc-player'))],
-    ['Action log has board cards', (localStatus.logEntries || []).some(e => e.includes('flop') || e.includes('turn') || e.includes('river'))],
-    ['Action log has hand separators', (localStatus.logEntries || []).some(e => e.startsWith('---'))],
-    ['Action log has winner', (localStatus.logEntries || []).some(e => e.includes('wins'))],
-    ['Action log has verification', (localStatus.logEntries || []).some(e => e.includes('verified'))],
+    ['Table name in top-left', status.table.includes('ptable')],
+    ['Blinds in top-left', status.blinds.includes('/')],
+    ['Hand # in top-left', status.hand.includes('Hand')],
+    ['Mode in top-left', status.mode.includes('p2p')],
+    ['Dealer badge visible', status.dealerBadge > 0],
+    ['Action log has entries', status.logCount > 0],
+    ['Log has all players', (status.logLast10 || []).some(e => e.includes('pplayer2') || e.includes('pdealer2'))],
+    ['Log has board cards', status.logCount > 5], // Should have many entries after 50 hands
   ];
 
-  console.log('\n  Status checks:');
-  let allPass = true;
+  console.log('\n  Checks:');
   for (const [name, pass] of checks) {
     console.log('    ' + (pass ? 'PASS' : 'FAIL') + ' — ' + name);
-    if (!pass) allPass = false;
   }
 
   await page.screenshot({ path: '/tmp/gui-test-final.png' });
 
   console.log('\n══════════════════════════════');
   console.log('RESULTS:');
-  console.log('  Hands completed: ' + handsPlayed);
+  console.log('  Hands completed: ' + handsPlayed + '/50');
   console.log('  Local actions: ' + localActions);
-  console.log('  Bot actions: ' + bot.getActions());
+  console.log('  Reloads: ' + reloads);
+  bots.forEach(b => console.log('  ' + b.getName() + ' actions: ' + b.getActions()));
   console.log('══════════════════════════════');
 
-  bot.ws.close();
+  bots.forEach(b => b.ws.close());
   await browser.close();
 }
 

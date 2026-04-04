@@ -383,18 +383,18 @@ function render() {
 
     // Dealer badge
     let roleTag = '';
-    if (i === 0 && np > 1) roleTag = ''; // Could show D badge based on dealerSeat if available
+    if (p.seat === st.dealerSeat) roleTag = '<span class="seat-role">D</span>';
 
     if (isMe) {
       el.innerHTML =
         (cardsHtml ? '<div class="seat-cards">' + cardsHtml + '</div>' : '') +
-        '<div class="seat-label">' +
+        '<div class="seat-label">' + roleTag +
           '<div class="seat-name">' + esc(p.id) + '</div>' +
           '<div class="seat-chips">' + p.chips + '</div>' +
         '</div>';
     } else {
       el.innerHTML =
-        '<div class="seat-label">' +
+        '<div class="seat-label">' + roleTag +
           '<div class="seat-name">' + esc(p.id) + '</div>' +
           '<div class="seat-chips">' + p.chips + '</div>' +
         '</div>' +
@@ -443,6 +443,23 @@ function render() {
 function renderControls() {
   const el = document.getElementById('controls');
   if (!st) return;
+
+  // Busted — show reload button
+  if (st.busted) {
+    el.innerHTML =
+      '<span class="wait-text" style="color:#ef5350">Out of chips!</span>' +
+      '<button class="btn-call" onclick="doReload()" style="margin-left:10px">Reload 200</button>';
+    return;
+  }
+
+  // Reloaded but sitting out — show sit in button
+  const me = st.players.find(p => p.id === myId);
+  if (me && me.chips > 0 && st.message && st.message.includes('Sit In')) {
+    el.innerHTML =
+      '<span class="wait-text">' + me.chips + ' chips</span>' +
+      '<button class="btn-check" onclick="doSitIn()" style="margin-left:10px">Sit In</button>';
+    return;
+  }
 
   if (st.actions) {
     const va = st.actions.validActions;
@@ -499,6 +516,14 @@ function doRaise() {
   const amount = parseFloat(input.value) || 0;
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'raise', amount }));
   document.getElementById('controls').innerHTML = '<span class="wait-text">...</span>';
+}
+
+function doReload() {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'reload' }));
+}
+
+function doSitIn() {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'sitin' }));
 }
 
 // ══════════════════════════════════════
