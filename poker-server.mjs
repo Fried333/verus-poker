@@ -1091,19 +1091,35 @@ if (USE_LOCAL) {
         }
       }
 
+      // Track when each player busted so we can detect rejoin attempts after that
+      const bustTimestamps = new Map();
+
       // Check if sat-out or busted players have written a new join (wanting back in)
       async function scanForSitBackIn() {
         for (const p of p2pDealer.getPlayers()) {
+          // Track bust time
+          if (p.chips <= 0 && !bustTimestamps.has(p.id)) {
+            bustTimestamps.set(p.id, Date.now());
+          }
+
           if (!p.sittingOut && p.chips > 0) continue;
           try {
             const req = await p2p.read(p.id, KEYS.JOIN_REQUEST);
-            if (req && req.session === sessionId && req.timestamp && req.timestamp > Date.now() - 60000) {
+            if (!req || req.session !== sessionId) continue;
+
+            // Accept join if it's recent (5 min window) OR if it's after the player busted
+            const bustTime = bustTimestamps.get(p.id) || 0;
+            const isRecent = req.timestamp && req.timestamp > Date.now() - 300000;
+            const isAfterBust = req.timestamp && req.timestamp > bustTime;
+
+            if (isRecent || isAfterBust) {
               if (p.sittingOut) {
                 p2pDealer.sitBackIn(p.id);
                 dLog('system', p.id + ' is back in');
               }
               if (p.chips <= 0) {
                 p.chips = CONFIG.bigBlind * 100; // Reload to 200 (100 BB)
+                bustTimestamps.delete(p.id);
                 console.log('[P2P] ' + p.id + ' reloaded to ' + p.chips);
                 dLog('system', p.id + ' reloaded to ' + p.chips);
               }

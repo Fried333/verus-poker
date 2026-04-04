@@ -62,7 +62,6 @@ export function createPlayerBackend(p2p, myId, tableId) {
   let missedTurns = 0;
   let handsWithoutCards = 0; // Track if we're being skipped (sat out by dealer)
   let lastHandTime = 0; // Track when we last saw a new hand
-  const MAX_LOG = 20;
 
   const T0 = Date.now();
   function ts() { return ((Date.now() - T0) / 1000).toFixed(1) + 's'; }
@@ -79,7 +78,6 @@ export function createPlayerBackend(p2p, myId, tableId) {
 
   function addActionLog(msg) {
     state.actionLog.push(msg);
-    if (state.actionLog.length > MAX_LOG) state.actionLog.shift();
   }
 
   // ── Public API ──
@@ -250,9 +248,10 @@ export function createPlayerBackend(p2p, myId, tableId) {
           }
 
           if (!state.handId) {
-            // If no hand for 30s, re-write join in case we were sat out
-            if (lastHandTime > 0 && Date.now() - lastHandTime > 30000) {
-              log('No hand for 30s — re-writing join');
+            // If no hand for 15s, re-write join in case we were sat out or busted
+            const rejoinInterval = state.busted ? 10000 : 15000;
+            if (lastHandTime > 0 && Date.now() - lastHandTime > rejoinInterval) {
+              log('No hand for ' + (rejoinInterval/1000) + 's — re-writing join');
               lastHandTime = Date.now(); // Reset so we don't spam
               try {
                 await p2p.write(myId, KEYS.JOIN_REQUEST, {
