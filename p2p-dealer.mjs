@@ -227,7 +227,7 @@ export function createP2PDealer(p2p, config, localNotify) {
         action = await new Promise(resolve => {
           notify('need_action', { resolve, validActions, toCall, seat, playerId: p.id, pot: game.pot, minRaise: game.minRaise,
             phase: game.phase, handId, bsSeq, gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })) });
-          setTimeout(() => resolve(null), 120000);
+          setTimeout(() => resolve(null), 30000);
         });
 
         const pollMs = Date.now() - pollStart;
