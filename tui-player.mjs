@@ -22,8 +22,8 @@ const args = Object.fromEntries(
     return [k, v || true];
   })
 );
-const MY_ID = args.id || 'pc-player';
-const TABLE_ID = args.table || 'poker-table';
+const MY_ID = args.id || 'pdealer2';
+const TABLE_ID = args.table || 'ptable2';
 const WAIT = ms => new Promise(r => setTimeout(r, ms));
 
 // ══════════════════════════════════════
@@ -235,7 +235,7 @@ function promptAction() {
         console.log(DIM + '  (timed out — ' + defaultAct + ')' + RESET);
         resolve({ action: defaultAct, amount: 0 });
       }
-    }, 30000);
+    }, 120000);
   });
 }
 

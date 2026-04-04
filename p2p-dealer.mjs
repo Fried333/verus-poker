@@ -36,7 +36,7 @@ export function createP2PDealer(p2p, config, localNotify) {
       console.log('[DEALER] Opening table ' + p2p.tableId + ' session=' + gameId);
       // Write ONLY to base key (player polls this). Skip game-specific key to avoid UTXO conflict.
       await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_table_info', {
-        smallBlind, bigBlind, buyin, maxPlayers: 9, status: 'open', dealer: p2p.myId, session: gameId
+        smallBlind, bigBlind, buyin, maxPlayers: 9, status: 'open', dealer: p2p.myId, session: gameId, ts: Date.now()
       });
       await WAIT(2000);
     },
@@ -53,7 +53,7 @@ export function createP2PDealer(p2p, config, localNotify) {
 
     async waitForJoin(playerId, timeout) {
       console.log('[DEALER] Waiting for ' + playerId + ' to join...');
-      const join = await p2p.pollAction(playerId, gameId, null, timeout || 60000);
+      const join = await p2p.pollAction(playerId, gameId, null, timeout || 120000);
       if (join) {
         this.addPlayer(playerId, buyin);
         return true;
@@ -141,7 +141,7 @@ export function createP2PDealer(p2p, config, localNotify) {
       // Blinds betting state — unique key (s0)
       initEntries.push({ key: VDXF_KEYS.BETTING_STATE + '.' + handId + '.s0', data: {
         phase: game.phase, pot: game.pot, dealerSeat: game.dealerSeat, seq: 0,
-        players: game.players.map(p => ({ id: p.id, chips: p.chips, bet: p.bet }))
+        players: game.players.map(p => ({ id: p.id, seat: p.seat, chips: p.chips, bet: p.bet }))
       }});
       let wt = Date.now();
       await p2p.writeBatch(p2p.tableId, initEntries);
@@ -153,7 +153,8 @@ export function createP2PDealer(p2p, config, localNotify) {
       });
 
       dlog('Playing hand...');
-      let bsSeq = 0; // Unique sequence number for each BS write — prevents stale reads
+      let bsSeq = 0;
+      let lastActionInfo = null; // { player, action, amount } — included in next BS for display
       // Community card crypto backend
       let revealPos = numPlayers * 2;
 
@@ -196,34 +197,27 @@ export function createP2PDealer(p2p, config, localNotify) {
         const bsData = {
           phase: game.phase, pot: game.pot, turn: p.id, seat,
           validActions, toCall, minRaise: game.minRaise,
-          players: game.players.map(pp => ({ id: pp.id, chips: pp.chips, bet: pp.bet, folded: pp.folded }))
+          players: game.players.map(pp => ({ id: pp.id, seat: pp.seat, chips: pp.chips, bet: pp.bet, folded: pp.folded })),
+          lastAction: lastActionInfo
         };
 
-        // Only write to chain when it's a REMOTE player's turn
-        // Dealer's own turn is handled locally — no chain write needed
-        const isLocalPlayer = (p.id === p2p.myId);
+        // Write BS to chain for every player's turn (dealer is not a player)
+        bsSeq++;
+        const bsKey = VDXF_KEYS.BETTING_STATE + '.' + handId + '.s' + bsSeq;
+        bsData.seq = bsSeq;
 
-        if (!isLocalPlayer) {
-          bsSeq++;
-          // UNIQUE key per BS write — prevents getidentitycontent returning stale entry
-          const bsKey = VDXF_KEYS.BETTING_STATE + '.' + handId + '.s' + bsSeq;
-          bsData.seq = bsSeq; // Include seq so player knows which is latest
-
-          let wt = Date.now();
-          if (streetDealt) {
-            // Batch: board_cards + betting_state in 1 TX
-            const boardKey = gameKey(VDXF_KEYS.BOARD_CARDS, handId);
-            await p2p.writeBatch(p2p.tableId, [
-              { key: boardKey, data: { board: game.board.map(cardToString), phase: game.phase, hand: handCount, session: gameId } },
-              { key: bsKey, data: bsData }
-            ]);
-            dlog('Board+BS batch: ' + game.phase + ' turn=' + p.id + ' seq=' + bsSeq + ' (' + (Date.now()-wt) + 'ms)');
-          } else {
-            await p2p.write(p2p.tableId, bsKey, bsData);
-            dlog('BS written: turn=' + p.id + ' phase=' + game.phase + ' seq=' + bsSeq + ' (' + (Date.now()-wt) + 'ms)');
-          }
+        let wt = Date.now();
+        if (streetDealt) {
+          // Batch: board_cards + betting_state in 1 TX
+          const boardKey = gameKey(VDXF_KEYS.BOARD_CARDS, handId);
+          await p2p.writeBatch(p2p.tableId, [
+            { key: boardKey, data: { board: game.board.map(cardToString), phase: game.phase, hand: handCount, session: gameId } },
+            { key: bsKey, data: bsData }
+          ]);
+          dlog('Board+BS batch: ' + game.phase + ' turn=' + p.id + ' seq=' + bsSeq + ' (' + (Date.now()-wt) + 'ms)');
         } else {
-          dlog('Local turn: ' + p.id + ' phase=' + game.phase + ' (no chain write)');
+          await p2p.write(p2p.tableId, bsKey, bsData);
+          dlog('BS written: turn=' + p.id + ' phase=' + game.phase + ' seq=' + bsSeq + ' (' + (Date.now()-wt) + 'ms)');
         }
 
         // Wait for player action
@@ -232,7 +226,7 @@ export function createP2PDealer(p2p, config, localNotify) {
         action = await new Promise(resolve => {
           notify('need_action', { resolve, validActions, toCall, seat, playerId: p.id, pot: game.pot, minRaise: game.minRaise,
             phase: game.phase, handId, bsSeq, gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })) });
-          setTimeout(() => resolve(null), 30000);
+          setTimeout(() => resolve(null), 120000);
         });
 
         const pollMs = Date.now() - pollStart;
@@ -247,6 +241,7 @@ export function createP2PDealer(p2p, config, localNotify) {
           action = { action: FOLD, amount: 0 };
         }
         playerAction(game, seat, action.action, action.amount || 0);
+        lastActionInfo = { player: p.id, action: action.action, amount: action.amount || 0 };
         notify('action', { player: p.id, action: action.action, amount: action.amount,
           gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })),
           pot: game.pot, phase: game.phase });

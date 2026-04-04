@@ -48,11 +48,7 @@ void bet_permutation(int32_t *permis, int32_t numcards) {
     }
 }
 
-EMSCRIPTEN_KEEPALIVE
-void reset_permutations(void) {
-    permis_d_init = 0;
-    permis_b_init = 0;
-}
+// reset_permutations defined after deckgen_vendor (needs vendor_init)
 
 /**
  * deckgen_player — Player generates their deck
@@ -84,7 +80,19 @@ void deckgen_player(
 
 /**
  * deckgen_vendor — Dealer processes a player's cards
+ * IMPORTANT: randcards are generated ONCE and reused for all players (same hand).
+ * Call reset_permutations() between hands.
  */
+static struct pair256 vendor_randcards[CARDS_MAXCARDS];
+static int vendor_init = 0;
+
+EMSCRIPTEN_KEEPALIVE
+void reset_permutations(void) {
+    permis_d_init = 0;
+    permis_b_init = 0;
+    vendor_init = 0;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void deckgen_vendor(
     int32_t playerid,
@@ -93,12 +101,14 @@ void deckgen_vendor(
     int32_t numcards,
     uint8_t *in_playercards   // IN: player's blinded cards [numcards * 32]
 ) {
-    struct pair256 randcards[CARDS_MAXCARDS];
     bits256 tmp[CARDS_MAXCARDS];
 
-    // Generate dealer's random cards
-    for (int32_t i = 0; i < numcards; i++)
-        randcards[i].priv = curve25519_keypair(&randcards[i].prod);
+    // Generate dealer's random cards ONCE, reuse for all players
+    if (!vendor_init) {
+        for (int32_t i = 0; i < numcards; i++)
+            vendor_randcards[i].priv = curve25519_keypair(&vendor_randcards[i].prod);
+        vendor_init = 1;
+    }
 
     // Initialize dealer permutation once
     if (!permis_d_init) { bet_permutation(permis_d, numcards); permis_d_init = 1; }
@@ -107,15 +117,15 @@ void deckgen_vendor(
         bits256 playercard;
         memcpy(playercard.bytes, in_playercards + i * 32, 32);
 
-        bits256 xoverz = xoverz_donna(curve25519(randcards[i].priv, playercard));
+        bits256 xoverz = xoverz_donna(curve25519(vendor_randcards[i].priv, playercard));
         bits256 hash;
         vcalc_sha256(0, hash.bytes, xoverz.bytes, sizeof(xoverz));
-        tmp[i] = fmul_donna(curve25519_fieldelement(hash), randcards[i].priv);
+        tmp[i] = fmul_donna(curve25519_fieldelement(hash), vendor_randcards[i].priv);
     }
 
     for (int32_t i = 0; i < numcards; i++) {
         memcpy(out_finalcards + i * 32, tmp[permis_d[i]].bytes, 32);
-        memcpy(out_cardprods + i * 32, randcards[i].prod.bytes, 32);
+        memcpy(out_cardprods + i * 32, vendor_randcards[i].prod.bytes, 32);
     }
 }
 

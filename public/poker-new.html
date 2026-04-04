@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Verus Poker</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#1a1a2e; color:#fff; font-family:system-ui,-apple-system,sans-serif; height:100vh; overflow:hidden; }
+
+#table { position:relative; width:96%; max-width:1000px; aspect-ratio:2.2/1; margin:10px auto 0;
+  background:radial-gradient(ellipse at 50% 50%,#2d6a2d,#1a4a1a 60%,#0d2e0d);
+  border:8px solid #4a2a0a; border-radius:50%; box-shadow:inset 0 0 40px rgba(0,0,0,0.4); }
+
+.seat { position:absolute; transform:translate(-50%,-50%); text-align:center; z-index:5; }
+.seat-name { font-size:11px; font-weight:bold; background:rgba(0,0,0,0.8); border:2px solid #555;
+  border-radius:4px; padding:2px 8px; white-space:nowrap; }
+.seat-name.me { border-color:#4caf50; }
+.seat-name.active { border-color:#ff9800; background:rgba(255,152,0,0.2); }
+.seat-name.folded { opacity:0.4; }
+.seat-name.winner { border-color:#ffd700; background:rgba(255,215,0,0.2); }
+.seat-chips { font-size:10px; color:#aaa; }
+.seat-cards { display:flex; gap:2px; justify-content:center; margin:2px 0; }
+.card { width:40px; height:56px; border-radius:3px; overflow:hidden; }
+.card img { width:40px; height:56px; object-fit:none; }
+.card-back { width:40px; height:56px; background:#c62828; border:1px solid #fff; border-radius:3px; }
+.bet-chip { position:absolute; transform:translate(-50%,-50%); background:#ffd700; color:#000;
+  font-size:10px; font-weight:bold; width:22px; height:22px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center; z-index:3; }
+.dealer-btn { position:absolute; transform:translate(-50%,-50%); background:#ffd700; color:#000;
+  font-size:9px; font-weight:bold; width:18px; height:18px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center; z-index:4; }
+
+#pot { position:absolute; top:8%; left:50%; transform:translateX(-50%); color:#ffd700;
+  font-size:14px; font-weight:bold; z-index:6; }
+#phase { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); color:rgba(255,255,255,0.3);
+  font-size:12px; z-index:1; }
+#board { position:absolute; top:38%; left:50%; transform:translateX(-50%); display:flex; gap:4px; z-index:6; }
+.board-card { width:44px; height:62px; border-radius:3px; overflow:hidden; }
+.board-card img { width:44px; height:62px; object-fit:none; }
+
+#banner { position:absolute; top:25%; left:50%; transform:translateX(-50%); background:rgba(0,0,0,0.9);
+  border:2px solid #ffd700; border-radius:8px; padding:8px 20px; text-align:center; z-index:10; display:none; }
+#banner .title { color:#ffd700; font-size:16px; font-weight:bold; }
+#banner .detail { color:#aaa; font-size:12px; }
+
+#controls { position:fixed; bottom:0; left:0; right:0; background:rgba(0,0,0,0.8);
+  padding:8px; display:flex; justify-content:flex-end; align-items:center; gap:8px; min-height:50px; }
+#controls .msg { color:#aaa; font-size:13px; flex:1; }
+button { padding:6px 16px; border:none; border-radius:4px; font-weight:bold; cursor:pointer; font-size:13px; }
+.btn-fold { background:#e65100; color:#fff; }
+.btn-check { background:#4caf50; color:#fff; }
+.btn-call { background:#ff9800; color:#fff; }
+.btn-raise { background:#9c27b0; color:#fff; }
+.btn-allin { background:#c62828; color:#fff; }
+button:hover { filter:brightness(1.2); }
+
+#info { position:absolute; top:4px; left:8px; font-size:10px; color:#666; z-index:20; }
+#log { position:fixed; bottom:50px; left:0; width:300px; max-height:120px; overflow-y:auto;
+  background:rgba(0,0,0,0.6); font-size:11px; font-family:monospace; padding:4px; z-index:20; }
+.log-entry { color:#888; padding:1px 4px; }
+.log-action { color:#4caf50; }
+.log-system { color:#2196f3; }
+</style>
+</head>
+<body>
+<div id="info"></div>
+<div id="table">
+  <div id="pot"></div>
+  <div id="phase"></div>
+  <div id="board"></div>
+  <div id="banner"><div class="title"></div><div class="detail"></div></div>
+</div>
+<div id="log"></div>
+<div id="controls"><span class="msg">Connecting...</span></div>
+
+<script>
+const CARD_SVG = '/cards.bebfd660.svg';
+const SUITS = { 'c': 0, 'd': 1, 'h': 2, 's': 3 };
+const RANKS = { '2':0,'3':1,'4':2,'5':3,'6':4,'7':5,'8':6,'9':7,'T':8,'J':9,'Q':10,'K':11,'A':12 };
+const SEAT_POS = [
+  {x:50,y:90}, {x:15,y:70}, {x:10,y:30}, {x:30,y:8}, {x:50,y:5},
+  {x:70,y:8}, {x:90,y:30}, {x:85,y:70}, {x:60,y:90}
+];
+
+const basePath = location.pathname.replace(/\/play.*/, '/').replace(/\/poker-new.*/, '/');
+let ws, myId, mySeat = -1, lastState = null, logEntries = [];
+
+function cardImgHTML(name, w, h) {
+  if (!name || name === '??') return '<div class="card-back" style="width:'+w+'px;height:'+h+'px"></div>';
+  const rank = name.length === 3 ? 'T' : name[0];
+  const suit = name[name.length - 1];
+  const col = SUITS[suit] || 0;
+  const row = RANKS[rank] || 0;
+  const sw = 50, sh = 70;
+  const sx = col * sw, sy = row * sh;
+  return '<div style="width:'+w+'px;height:'+h+'px;overflow:hidden;border-radius:3px;background:#fff">' +
+    '<img src="'+basePath+'cards.bebfd660.svg" style="display:block;width:'+(sw*4)*(w/sw)+'px;height:'+(sh*13)*(h/sh)+'px;margin-left:-'+(sx*(w/sw))+'px;margin-top:-'+(sy*(h/sh))+'px">' +
+    '</div>';
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function addLog(type, msg) {
+  logEntries.push({ type, msg, ts: new Date().toLocaleTimeString() });
+  if (logEntries.length > 50) logEntries.shift();
+  const el = document.getElementById('log');
+  el.innerHTML = logEntries.map(e =>
+    '<div class="log-entry log-' + e.type + '">' + e.ts + ' ' + esc(e.msg) + '</div>'
+  ).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+function render(st) {
+  if (!st || !st.players) return;
+  const table = document.getElementById('table');
+
+  // Clear old seats
+  table.querySelectorAll('.seat,.bet-chip,.dealer-btn').forEach(e => e.remove());
+
+  // Find my seat
+  const me = st.players.find(p => p.id === st.myId);
+  mySeat = me ? me.seat : 0;
+
+  // Rotate so I'm at bottom (position 0)
+  const nonEmpty = st.players.filter(p => p.id);
+  const seatOrder = [];
+  const myIdx = nonEmpty.findIndex(p => p.id === st.myId);
+  for (let i = 0; i < nonEmpty.length; i++) {
+    seatOrder.push(nonEmpty[(myIdx + i) % nonEmpty.length]);
+  }
+
+  // Position mapping
+  const positions = SEAT_POS.slice(0, Math.max(nonEmpty.length, 2));
+
+  seatOrder.forEach((p, i) => {
+    const pos = positions[i] || { x: 50, y: 50 };
+    const isMe = p.id === st.myId;
+    const isActive = st.myTurn && isMe;
+    const isWinner = st.winner && st.winner.seats && st.winner.seats.includes(p.seat);
+
+    // Seat element
+    const el = document.createElement('div');
+    el.className = 'seat';
+    el.style.left = pos.x + '%';
+    el.style.top = pos.y + '%';
+
+    // Cards
+    let cardsHTML = '';
+    if (p.cards && p.cards.length > 0) {
+      cardsHTML = '<div class="seat-cards">' +
+        p.cards.map(c => '<div class="card">' + cardImgHTML(c, 40, 56) + '</div>').join('') +
+        '</div>';
+    }
+
+    // Name classes
+    let nameClass = 'seat-name';
+    if (isMe) nameClass += ' me';
+    if (isActive) nameClass += ' active';
+    if (p.folded) nameClass += ' folded';
+    if (isWinner) nameClass += ' winner';
+
+    if (isMe) {
+      el.innerHTML = (cardsHTML || '') +
+        '<div class="' + nameClass + '">' + esc(p.id) + '</div>' +
+        '<div class="seat-chips">' + p.chips + '</div>';
+    } else {
+      el.innerHTML =
+        '<div class="' + nameClass + '">' + esc(p.id) + '</div>' +
+        '<div class="seat-chips">' + p.chips + '</div>' +
+        (cardsHTML || '');
+    }
+    table.appendChild(el);
+
+    // Bet chip
+    if (p.bet > 0) {
+      const bx = pos.x + (50 - pos.x) * 0.5;
+      const by = pos.y + (45 - pos.y) * 0.5;
+      const chip = document.createElement('div');
+      chip.className = 'bet-chip';
+      chip.style.left = bx + '%';
+      chip.style.top = by + '%';
+      chip.textContent = p.bet;
+      table.appendChild(chip);
+    }
+
+    // Dealer button
+    if (p.seat === st.dealerSeat) {
+      const dx = pos.x + (50 - pos.x) * 0.3;
+      const dy = pos.y + (45 - pos.y) * 0.3 - 3;
+      const btn = document.createElement('div');
+      btn.className = 'dealer-btn';
+      btn.style.left = dx + '%';
+      btn.style.top = dy + '%';
+      btn.textContent = 'D';
+      table.appendChild(btn);
+    }
+  });
+
+  // Pot
+  document.getElementById('pot').textContent = st.pot > 0 ? 'Pot: ' + st.pot : '';
+
+  // Phase
+  document.getElementById('phase').textContent = st.phase || '';
+
+  // Board
+  const boardEl = document.getElementById('board');
+  boardEl.innerHTML = (st.board || []).map(c =>
+    '<div class="board-card">' + cardImgHTML(c, 44, 62) + '</div>'
+  ).join('');
+
+  // Winner banner
+  const banner = document.getElementById('banner');
+  if (st.winner && st.winner.seats && st.winner.seats.length > 0) {
+    const names = st.winner.seats.map(s => st.winner.names[s] || 'Seat ' + s);
+    const handName = st.winner.seats.map(s => st.winner.handNames?.[s]).filter(Boolean).join(', ');
+    banner.querySelector('.title').textContent = names.join(' & ') + ' wins!';
+    banner.querySelector('.detail').textContent = (handName ? handName + ' — ' : '') + '+' + st.winner.amount;
+    banner.style.display = 'block';
+  } else {
+    banner.style.display = 'none';
+  }
+
+  // Controls
+  const controls = document.getElementById('controls');
+  if (st.myTurn && st.validActions.length > 0) {
+    let html = '<span class="msg">' + (st.message ? esc(st.message) : 'Your turn') + '</span>';
+    if (st.validActions.includes('fold')) html += '<button class="btn-fold" onclick="act(\'fold\')">Fold</button>';
+    if (st.validActions.includes('check')) html += '<button class="btn-check" onclick="act(\'check\')">Check</button>';
+    if (st.validActions.includes('call')) html += '<button class="btn-call" onclick="act(\'call\')">Call ' + st.toCall + '</button>';
+    if (st.validActions.includes('raise')) {
+      html += '<input id="raise-amt" type="number" min="' + st.minRaise + '" value="' + st.minRaise + '" style="width:50px;padding:4px;border-radius:3px;border:1px solid #555;background:#222;color:#fff;text-align:center">';
+      html += '<button class="btn-raise" onclick="doRaise()">Raise</button>';
+    }
+    if (st.validActions.includes('allin')) html += '<button class="btn-allin" onclick="act(\'allin\')">All In</button>';
+    controls.innerHTML = html;
+  } else {
+    controls.innerHTML = '<span class="msg">' + esc(st.message || st.phase || 'Waiting...') + '</span>';
+  }
+
+  // Info
+  document.getElementById('info').textContent = 'Hand #' + (st.handCount || 0) + ' · ' + (st.phase || '') +
+    (st.verified !== null && st.verified !== undefined ? ' · ' + (st.verified ? '✓ Verified' : '✗ Failed') : '');
+}
+
+function act(action) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ action }));
+    addLog('action', 'You ' + action);
+    document.getElementById('controls').innerHTML = '<span class="msg">Sent ' + action + '...</span>';
+  }
+}
+
+function doRaise() {
+  const amt = parseInt(document.getElementById('raise-amt')?.value || '2');
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ action: 'raise', amount: amt }));
+    addLog('action', 'You raise ' + amt);
+    document.getElementById('controls').innerHTML = '<span class="msg">Sent raise ' + amt + '...</span>';
+  }
+}
+
+// Log state changes
+let lastMessage = '', lastPhase = '', lastHandCount = 0;
+function logChanges(st) {
+  if (st.message && st.message !== lastMessage) { addLog('action', st.message); lastMessage = st.message; }
+  if (st.handCount !== lastHandCount) {
+    addLog('system', 'Hand #' + st.handCount + ' — ' + (st.phase || 'starting'));
+    lastHandCount = st.handCount;
+  }
+  if (st.winner && st.winner.seats) {
+    const names = st.winner.seats.map(s => st.winner.names?.[s] || 'Seat ' + s);
+    addLog('system', names.join(' & ') + ' wins +' + st.winner.amount);
+  }
+}
+
+// Connect WebSocket for actions, poll /api/state for display
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + basePath);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ action: 'join', name: 'player' }));
+    addLog('system', 'Connected');
+  };
+  ws.onclose = () => { addLog('system', 'Disconnected — reconnecting...'); setTimeout(connect, 2000); };
+  ws.onerror = () => {};
+  ws.onmessage = () => {}; // Ignore server pushes — we poll /api/state instead
+}
+
+async function poll() {
+  try {
+    const res = await fetch(basePath + 'api/state');
+    const st = await res.json();
+    logChanges(st);
+    render(st);
+    lastState = st;
+  } catch (e) {}
+}
+
+// Start
+connect();
+setInterval(poll, 800);
+poll();
+addLog('system', 'Verus Poker — connecting...');
+</script>
+</body>
+</html>

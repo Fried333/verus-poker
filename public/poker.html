@@ -435,8 +435,8 @@ body {
 // ══════════════════════════════════════
 // CONFIG
 // ══════════════════════════════════════
-const CARD_SVG = '/cards.bebfd660.svg';
-const CARD_BACK = '/bg-red.44d92640.svg';
+const CARD_SVG = basePath + 'cards.bebfd660.svg';
+const CARD_BACK = basePath + 'bg-red.44d92640.svg';
 const DEALER_SVG = '/dealer.b4af8c3d.svg';
 const EXPECTED = 9;
 
@@ -501,6 +501,7 @@ function getPositions(total, mySeat) {
 // ══════════════════════════════════════
 let ws, seat = -1, myId = '', myCards = [], st = null;
 let winnerSeats = [], winAmount = 0, chipsBefore = {};
+let lastLoggedMessage = '';
 let turnTimer = null, turnDeadline = 0, turnTotal = 0;
 let isBusted = false;
 const name = new URLSearchParams(location.search).get('name') || 'Player';
@@ -510,9 +511,10 @@ function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 // ══════════════════════════════════════
 // WEBSOCKET
 // ══════════════════════════════════════
+const basePath = location.pathname.replace(/\/play.*/, '/').replace(/\/poker\.html.*/, '/');
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host);
+  ws = new WebSocket(proto + '//' + location.host + basePath);
   ws.onopen = () => ws.send(JSON.stringify({ action: 'join', name }));
   ws.onmessage = e => { try { handle(JSON.parse(e.data)); } catch(x) { console.error(x); } };
   ws.onclose = () => setTimeout(connect, 2000);
@@ -725,6 +727,12 @@ function handleFullState(m) {
   st.currentTurn = m.currentTurn;
   st.handCount = m.handCount;
 
+  // 1b. Log opponent actions and status
+  if (m.message && m.message !== lastLoggedMessage) {
+    log('action', m.message);
+    lastLoggedMessage = m.message;
+  }
+
   // 2. Cards
   myCards = m.myCards || [];
 
@@ -745,7 +753,9 @@ function handleFullState(m) {
     const minR = st.minRaise || 2;
     const maxR = Math.max(minR, myChips2 - st.toCall);
     const va = m.actions.possibilities;
-    let html = '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">';
+    let html = '';
+    if (m.message) html += '<div style="color:#aaa;font-size:12px;text-align:right;margin-bottom:2px">' + esc(m.message) + '</div>';
+    html += '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">';
     if (va.includes(3)) {
       html += '<div style="display:flex;align-items:center;gap:4px">';
       html += '<input id="raise-slider" type="range" min="'+minR+'" max="'+maxR+'" value="'+minR+'" step="1" oninput="document.getElementById(\'raise-input\').value=this.value" style="width:140px;accent-color:#e65100">';
@@ -766,8 +776,9 @@ function handleFullState(m) {
     if (el) el.innerHTML = '<span class="wait-text">' + (m.message || m.phase) + '</span>';
   } else if (!m.actions) {
     stopTurnTimer();
-    if (el && !el.querySelector('button')) {
-      el.innerHTML = '<span class="wait-text">Waiting...</span>';
+    if (el) {
+      const msg = m.message || 'Waiting...';
+      el.innerHTML = '<span class="wait-text">' + esc(msg) + '</span>';
     }
   }
 
@@ -890,7 +901,7 @@ function render() {
     el.style.top = pos.y + '%';
 
     let cardsHtml = '';
-    if (isMe && myCards.length > 0) {
+    if (isMe && myCards.length > 0 && p.playing !== 0) {
       cardsHtml += '<span id="felt-countdown" style="font-weight:bold;font-size:14px;color:#fff;margin-right:4px"></span>';
       for (const c of myCards) {
         cardsHtml += '<div class="seat-card">' + cardHTML(c) + '</div>';
@@ -1035,7 +1046,7 @@ async function loadLobby() {
   const sub = document.getElementById('lobby-sub');
   const seatsDiv = document.getElementById('lobby-seats');
   try {
-    const res = await fetch('/api/table');
+    const res = await fetch(basePath + 'api/table');
     const info = await res.json();
 
     const buyin = info.buyin || 0.5;
@@ -1052,9 +1063,7 @@ async function loadLobby() {
     // Render 9 seats
     seatsDiv.innerHTML = '';
     const occupied = {}; // seat → player name
-    // Dealer is always at a seat
-    if (info.dealer && info.role === 'player') occupied[1] = info.dealer;
-    if (info.role === 'dealer') occupied[0] = info.player;
+    // Don't pre-fill seats — players join dynamically
 
     for (let s = 0; s < 9; s++) {
       const pos = SEAT_POS_9[s];
@@ -1097,7 +1106,7 @@ async function doDeposit(amount) {
   actions.innerHTML = '<div style="color:#ffd700">Depositing ' + amount + ' CHIPS to escrow...</div>';
 
   try {
-    const res = await fetch('/api/deposit', {
+    const res = await fetch(basePath + 'api/deposit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount })
@@ -1126,7 +1135,7 @@ function joinGame() {
   // Tell server player is sitting down (triggers chain join in P2P mode)
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'sit' }));
   // Populate table info bar
-  fetch('/api/table').then(r=>r.json()).then(info => {
+  fetch(basePath + 'api/table').then(r=>r.json()).then(info => {
     const ti = id => document.getElementById(id);
     if (ti('ti-table')) ti('ti-table').textContent = info.table || '';
     if (ti('ti-blinds')) ti('ti-blinds').textContent = (info.config?.smallBlind||1) + '/' + (info.config?.bigBlind||2);
@@ -1153,7 +1162,7 @@ function updateTableInfo(hand, verified) {
 // Dealer goes straight to game, player sees lobby
 async function init() {
   try {
-    const res = await fetch('/api/table');
+    const res = await fetch(basePath + 'api/table');
     const info = await res.json();
     if (info.role === 'dealer') {
       joinGame(); // Dealer is already seated

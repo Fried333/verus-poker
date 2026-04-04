@@ -110,7 +110,8 @@ async function poll() {
     // Also check hand-specific keys if we know the handId
     if (lastSeen._handId) {
       const hid = lastSeen._handId;
-      for (const base of ['t_betting_state', 't_board_cards', 't_settlement_info']) {
+      // Check board_cards and settlement (single key per hand)
+      for (const base of ['t_board_cards', 't_settlement_info']) {
         const fullKey = 'chips.vrsc::poker.sg777z.' + base + '.' + hid;
         try {
           const kid = await resolveKey(fullKey);
@@ -126,11 +127,29 @@ async function poll() {
           let data;
           try { data = JSON.parse(Buffer.from(hex, 'hex').toString('utf8')); } catch { continue; }
           let summary = '';
-          if (base === 't_betting_state') summary = 'turn=' + (data.turn||'?') + ' phase=' + (data.phase||'?') + ' pot=' + (data.pot||0);
-          else if (base === 't_board_cards') summary = (data.phase||'?') + ': ' + (data.board||[]).join(' ');
-          else if (base === 't_settlement_info') summary = 'verified=' + data.verified;
+          if (base === 't_board_cards') summary = (data.phase||'?') + ': ' + (data.board||[]).join(' ');
+          else if (base === 't_settlement_info') summary = 'verified=' + data.verified + ' hand=' + data.hand;
           console.log(ts().padStart(8) + 's | OBSERVER | ' + (base+'.'+hid.substring(0,8)).padEnd(22) + ' | ' + summary);
         } catch {}
+      }
+      // Check sequential betting_state keys (s0, s1, s2, ...)
+      if (!lastSeen._bsSeq) lastSeen._bsSeq = {};
+      if (!lastSeen._bsSeq[hid]) lastSeen._bsSeq[hid] = -1;
+      for (let seq = lastSeen._bsSeq[hid] + 1; seq < lastSeen._bsSeq[hid] + 20; seq++) {
+        const fullKey = 'chips.vrsc::poker.sg777z.t_betting_state.' + hid + '.s' + seq;
+        try {
+          const kid = await resolveKey(fullKey);
+          const val = cmm[kid];
+          if (!val) break; // No more sequential keys
+          const last = Array.isArray(val) ? val[val.length - 1] : val;
+          const hex = typeof last === 'string' ? last : (typeof last === 'object' ? Object.values(last)[0] : null);
+          if (!hex) break;
+          let data;
+          try { data = JSON.parse(Buffer.from(hex, 'hex').toString('utf8')); } catch { break; }
+          lastSeen._bsSeq[hid] = seq;
+          const summary = 'seq=' + seq + ' turn=' + (data.turn||'?') + ' phase=' + (data.phase||'?') + ' pot=' + (data.pot||0);
+          console.log(ts().padStart(8) + 's | OBSERVER | ' + ('BS.s'+seq).padEnd(22) + ' | ' + summary);
+        } catch { break; }
       }
     }
 

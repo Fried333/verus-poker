@@ -111,6 +111,7 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
 
     const updateParams = { name: idName, contentmultimap: cmm };
     if (parent) updateParams.parent = parent;
+    console.log('[P2P-DEBUG] writeBatch params: name=' + idName + ' parent=' + (parent || 'NONE') + ' keys=' + Object.keys(cmm).length);
 
     try {
       const txid = await client.call('updateidentity', [updateParams]);
@@ -165,18 +166,17 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     try {
       const fullName = identityId.includes('.') ? identityId : identityId + '.CHIPS@';
       const keyId = await resolveVdxfId(vdxfKey);
-      const blocks = await getBlocks();
 
-      // Pass VDXF key directly to getidentitycontent — filters server-side, much faster
+      // PRIMARY: getidentitycontent with heightend=-1 (includes mempool, 0.5s cross-node)
       // Params: [identity, heightstart, heightend, txproofs, txproofheight, vdxfkey]
-      const r = await client.call('getidentitycontent', [fullName, Math.max(0, blocks - 50), -1, false, 0, keyId]);
+      const r = await client.call('getidentitycontent', [fullName, 0, -1, false, 0, keyId]);
       const cmm = r?.identity?.contentmultimap;
       if (cmm && cmm[keyId]) {
         const parsed = parseHex(extractHex(cmm[keyId]));
         if (parsed) return deserialize(parsed);
       }
 
-      // Fallback: getidentity (only shows latest TX's key, but fast)
+      // Fallback: getidentity — shows latest TX's keys only
       const id = await client.getIdentity(fullName);
       const cmm2 = id?.identity?.contentmultimap;
       if (cmm2 && cmm2[keyId]) {
@@ -187,7 +187,7 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     } catch (e) { return null; }
   }
 
-  async function poll(identityId, vdxfKey, lastKnown, timeoutMs = 60000) {
+  async function poll(identityId, vdxfKey, lastKnown, timeoutMs = 120000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const data = await read(identityId, vdxfKey);

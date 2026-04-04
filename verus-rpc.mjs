@@ -134,6 +134,7 @@ export function createClient(config = {}) {
 
       const updateParams = { name: idName, contentmultimap: { [vdxfId.vdxfid]: hexData } };
       if (parent) updateParams.parent = parent;
+      console.log('[RPC-DEBUG] writeToIdentity: name=' + idName + ' parent=' + (parent || 'NONE') + ' key=' + vdxfId.vdxfid.substring(0, 12));
 
       return call('updateidentity', [updateParams]);
     },

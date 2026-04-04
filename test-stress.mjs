@@ -33,14 +33,15 @@ function findRPC() {
   throw new Error('CHIPS config not found');
 }
 
-const MY_ID = 'pc-player';
-const TABLE_ID = 'poker-table';
+const MY_ID = process.argv.find(a => a.startsWith('--id='))?.split('=')[1] || 'pdealer2';
+const TABLE_ID = process.argv.find(a => a.startsWith('--table='))?.split('=')[1] || 'ptable2';
 const KEYS = {
   TABLE_CONFIG:  'chips.vrsc::poker.sg777z.t_table_info',
   JOIN_REQUEST:  'chips.vrsc::poker.sg777z.p_join_request',
   CARD_BV:       'chips.vrsc::poker.sg777z.card_bv',
   PLAYER_ACTION: 'chips.vrsc::poker.sg777z.p_betting_action',
   SETTLEMENT:    'chips.vrsc::poker.sg777z.t_settlement_info',
+  BETTING_STATE: 'chips.vrsc::poker.sg777z.t_betting_state',
 };
 
 // Stats
@@ -50,16 +51,19 @@ const stats = {
   actions: {}, streets: {}, errors: []
 };
 
+let actionCount = 0;
 function pickAction(valid, toCall, minRaise, chips) {
+  actionCount++;
   const r = Math.random();
-  if (r < 0.35 && valid.includes('check')) return { action: 'check', amount: 0 };
-  if (r < 0.35 && valid.includes('call')) return { action: 'call', amount: toCall };
+  // Never fold on first action (preflop) — we want to test deeper streets
+  const canFold = actionCount > 1;
+  if (r < 0.40 && valid.includes('check')) return { action: 'check', amount: 0 };
+  if (r < 0.40 && valid.includes('call')) return { action: 'call', amount: toCall };
   if (r < 0.65 && valid.includes('raise')) {
     const amt = Math.min(chips - toCall, Math.max(minRaise, Math.floor(Math.random() * minRaise * 3)));
     return { action: 'raise', amount: Math.max(minRaise, amt) };
   }
-  if (r < 0.85 && valid.includes('fold')) return { action: 'fold', amount: 0 };
-  if (valid.includes('allin')) return { action: 'allin', amount: 0 };
+  if (r < 0.80 && canFold && valid.includes('fold')) return { action: 'fold', amount: 0 };
   if (valid.includes('check')) return { action: 'check', amount: 0 };
   if (valid.includes('call')) return { action: 'call', amount: toCall };
   return { action: 'fold', amount: 0 };
@@ -67,7 +71,8 @@ function pickAction(valid, toCall, minRaise, chips) {
 
 async function playHand(p2p, handId, num) {
   const t0 = Date.now();
-  let lastBSJson = null, acted = false, myCards = [], board = [], myChips = 200;
+  actionCount = 0;
+  let lastBSJson = null, acted = false, lastActedSeq = -1, myCards = [], board = [], myChips = 200;
   let lastActTime = null, streetsHit = new Set();
 
   // Wait for cards (60s max)
@@ -89,10 +94,16 @@ async function playHand(p2p, handId, num) {
     const nextSeq = bsSeq + 1;
     const bsKey = KEYS.BETTING_STATE + '.' + handId + '.s' + nextSeq;
     const bs = await p2p.read(TABLE_ID, bsKey);
+    if (tick === 0) console.log('\n  [DEBUG] handId=' + handId + ' polling key=' + bsKey);
+    if (tick % 10 === 0) process.stdout.write(' [poll:s' + nextSeq + (bs ? '✓' : '∅') + ']');
     if (bs) {
-      bsSeq = bs.seq || nextSeq;
+      bsSeq = bs.seq !== undefined ? bs.seq : nextSeq;
       if (bs.phase) streetsHit.add(bs.phase);
       if (bs.players) { const me = bs.players.find(p => p.id === MY_ID); if (me) myChips = me.chips; }
+      process.stdout.write(' [s' + bsSeq + ':' + (bs.turn || '?') + '/' + (bs.phase || '?') + ']');
+
+      // Reset acted flag when we see a new BS sequence (new street or new turn)
+      if (bsSeq > (lastActedSeq || -1)) acted = false;
 
       if (bs.turn === MY_ID && bs.validActions && !acted) {
         if (lastActTime) stats.propagationTimes.push(Date.now() - lastActTime);
@@ -103,8 +114,9 @@ async function playHand(p2p, handId, num) {
         stats.actionWriteTimes.push(Date.now() - wt);
         lastActTime = Date.now();
         acted = true;
+        lastActedSeq = bsSeq;
         process.stdout.write(' ' + act.action[0]);
-      } else if (bs.turn !== MY_ID) { acted = false; }
+      }
     }
 
     const bc = await p2p.readBoardCards(handId);
@@ -143,16 +155,15 @@ async function main() {
   const info = await p2p.client.getInfo();
   console.log('Block: ' + info.blocks);
 
-  // Find session
-  const stale = new Set();
-  try { const s = await p2p.read(TABLE_ID, KEYS.SETTLEMENT); if (s?.session) stale.add(s.session); } catch {}
+  // Find session — poll until we see a table_info, then use whatever session is there
   let session = null;
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 90; i++) {
     const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
-    if (tc?.session && !stale.has(tc.session)) { session = tc.session; break; }
+    if (tc?.session) { session = tc.session; break; }
+    if (i % 10 === 0) console.log('Waiting for table...');
     await WAIT(1000);
   }
-  if (!session) { console.log('No session'); process.exit(1); }
+  if (!session) { console.log('No session found'); process.exit(1); }
   console.log('Session: ' + session);
 
   await p2p.write(MY_ID, KEYS.JOIN_REQUEST, { table: TABLE_ID, player: MY_ID, session, ready: true, timestamp: Date.now() });
