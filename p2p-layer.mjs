@@ -68,13 +68,21 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
       return txid;
     } catch (e) {
       if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
-        console.log('[P2P] UTXO conflict on ' + idName + ' — waiting...');
-        if (prevTx) await waitForTxSpendable(prevTx);
-        await new Promise(r => setTimeout(r, 1000));
-        const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
-        lastTxId.set(idName, txid);
-        lastWrite.set(idName, Date.now());
-        return txid;
+        // Retry up to 5 times with increasing delays
+        for (let retry = 0; retry < 5; retry++) {
+          console.log('[P2P] UTXO conflict on ' + idName + ' — retry ' + (retry + 1) + '/5');
+          if (prevTx) await waitForTxSpendable(prevTx);
+          await new Promise(r => setTimeout(r, 1500 + retry * 500));
+          try {
+            const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
+            lastTxId.set(idName, txid);
+            lastWrite.set(idName, Date.now());
+            return txid;
+          } catch (e2) {
+            if (!e2.message.includes('inputs-spent') && !e2.message.includes('conflict')) throw e2;
+          }
+        }
+        throw new Error('UTXO conflict persisted after 5 retries on ' + idName);
       }
       throw e;
     }
