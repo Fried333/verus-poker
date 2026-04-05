@@ -77,6 +77,11 @@ export function createPlayerBackend(p2p, myId, tableId) {
   }
 
   function addActionLog(msg) {
+    // Add hand separator before first real entry for this hand
+    if (!state._handLogged && state.handCount > 0 && !msg.startsWith('***')) {
+      state.actionLog.push('*** HAND #' + state.handCount + ' ***');
+      state._handLogged = true;
+    }
     state.actionLog.push(msg);
   }
 
@@ -313,7 +318,7 @@ export function createPlayerBackend(p2p, myId, tableId) {
               state.myCards = cr.cards;
               state.phase = 'preflop';
               state.message = '';
-              addActionLog('*** HAND #' + state.handCount + ' ***');
+              state._handLogged = false; // Will log separator on first action
               notify();
             }
           }
