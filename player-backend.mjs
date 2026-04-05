@@ -473,19 +473,13 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
               log('BUSTED — 0 chips');
             }
 
-            // Push settlement state (GUI will show winner banner on its own timer)
+            // Push settlement state — keep winner visible until next hand
+            state.phase = 'settled';
             notify();
 
-            // Reset immediately — don't block the poll loop
-            state.phase = 'waiting';
-            state.myCards = []; state.board = [];
-            state.winner = null; state.verified = null;
-            state.showdownCards = {}; state.handNames = {};
+            // Reset bets/folded but keep winner/board visible
             state.turn = null; state.validActions = [];
             state.players.forEach(p => { p.bet = 0; p.folded = false; });
-            if (!state.busted) state.message = '';
-            // Notify browser to clear the table
-            notify();
             if (!state.busted) state.message = '';
             lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
             // Don't notify again yet — let the winner stay visible until next hand
