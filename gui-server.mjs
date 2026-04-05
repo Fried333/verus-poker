@@ -197,7 +197,6 @@ wss.on('connection', ws => {
       } else if (msg.action === 'sitin') {
         backend.sitIn();
       }
-      }
     } catch {}
   });
 
