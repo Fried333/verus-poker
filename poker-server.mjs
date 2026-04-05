@@ -1082,10 +1082,11 @@ if (USE_LOCAL) {
             const isRecent = req && req.timestamp && req.timestamp > tableOpenTime && (Date.now() - req.timestamp) < 300000;
             const isCorrectTable = req && req.table === TABLE_ID;
             if (req && isCorrectTable && (hasSession || isRecent)) {
-              p2pDealer.addPlayer(pid, 200);
+              p2pDealer.addPlayer(pid, 200, req.seat);
               seatedPlayers.add(pid);
-              console.log('[P2P] ' + pid + ' joined! (' + seatedPlayers.size + ' remote players)');
-              dLog('system', pid + ' joined the table');
+              const actualSeat = p2pDealer.getPlayers().find(p => p.id === pid)?.seat;
+              console.log('[P2P] ' + pid + ' joined at seat ' + actualSeat + '! (' + seatedPlayers.size + ' remote players)');
+              dLog('system', pid + ' joined at seat ' + (actualSeat + 1));
             }
           } catch {}
         }

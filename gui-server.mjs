@@ -65,7 +65,8 @@ function findRPC() {
 // ══════════════════════════════════════
 const rpc = findRPC();
 const p2p = createP2PLayer(rpc, MY_ID, TABLE_ID);
-const backend = createPlayerBackend(p2p, MY_ID, TABLE_ID);
+let seatChoice = parseInt(args.seat) >= 0 ? parseInt(args.seat) : undefined;
+const backend = createPlayerBackend(p2p, MY_ID, TABLE_ID, { seat: seatChoice });
 
 // ══════════════════════════════════════
 // HTTP Server — serve static files from public/
@@ -195,6 +196,7 @@ wss.on('connection', ws => {
         backend.reload();
       } else if (msg.action === 'sitin') {
         backend.sitIn();
+      }
       }
     } catch {}
   });

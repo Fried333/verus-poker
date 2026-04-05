@@ -47,9 +47,18 @@ export function createP2PDealer(p2p, config, localNotify) {
       console.log('[DEALER] Self-seated at seat ' + (players.length - 1));
     },
 
-    addPlayer(playerId, chips) {
-      players.push({ id: playerId, seat: players.length, chips: chips || buyin, sittingOut: false, timeouts: 0 });
-      console.log('[DEALER] ' + playerId + ' seated at seat ' + (players.length - 1));
+    addPlayer(playerId, chips, preferredSeat) {
+      // Use preferred seat if available, otherwise next free seat
+      const usedSeats = new Set(players.map(p => p.seat));
+      let seat;
+      if (preferredSeat !== undefined && preferredSeat >= 0 && preferredSeat < 9 && !usedSeats.has(preferredSeat)) {
+        seat = preferredSeat;
+      } else {
+        seat = 0;
+        while (usedSeats.has(seat)) seat++;
+      }
+      players.push({ id: playerId, seat, chips: chips || buyin, sittingOut: false, timeouts: 0 });
+      console.log('[DEALER] ' + playerId + ' seated at seat ' + seat);
     },
 
     async waitForJoin(playerId, timeout) {

@@ -24,7 +24,7 @@ const KEYS = {
   SETTLEMENT:    'chips.vrsc::poker.sg777z.t_settlement_info',
 };
 
-export function createPlayerBackend(p2p, myId, tableId) {
+export function createPlayerBackend(p2p, myId, tableId, options = {}) {
   // ── State (single source of truth) ──
   const state = {
     phase: 'connecting',
@@ -114,9 +114,9 @@ export function createPlayerBackend(p2p, myId, tableId) {
       log('Sitting back in');
       // Write a new join request so dealer sees we're back
       try {
-        await p2p.write(myId, KEYS.JOIN_REQUEST, {
-          table: tableId, player: myId, session: state.session, ready: true, timestamp: Date.now()
-        });
+        const joinData = { table: tableId, player: myId, session: state.session, ready: true, timestamp: Date.now() };
+        if (options.seat !== undefined) joinData.seat = options.seat;
+        await p2p.write(myId, KEYS.JOIN_REQUEST, joinData);
         log('Sit-in join written');
       } catch (e) {
         log('Sit-in write failed: ' + e.message);
@@ -219,10 +219,12 @@ export function createPlayerBackend(p2p, myId, tableId) {
       state.message = 'Joining table...';
       notify();
       try {
-        await p2p.write(myId, KEYS.JOIN_REQUEST, {
+        const joinData = {
           table: tableId, player: myId, session, ready: true, timestamp: Date.now()
-        });
-        log('Join written');
+        };
+        if (options.seat !== undefined) joinData.seat = options.seat;
+        await p2p.write(myId, KEYS.JOIN_REQUEST, joinData);
+        log('Join written' + (options.seat !== undefined ? ' (seat ' + options.seat + ')' : ''));
       } catch (e) {
         log('Join write failed: ' + e.message);
       }
