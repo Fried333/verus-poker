@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
  * Cashier Runner — independent Stage III processor
- * Polls table for shuffle requests, runs cashierShuffle, writes results back.
- * Runs on .59 server with cashier1/cashier2 identities.
+ * Polls table for shuffle requests via chain, runs cashierShuffle.
+ * Card reveals served via WebSocket (instant) — chain for commitment only.
  *
- * Usage: node cashier-runner.mjs --id=cashier1 --table=ptable2
+ * Usage: node cashier-runner.mjs --id=cashier1 --table=ptable2 --wsport=4000
  */
 
+import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
 import { createP2PLayer } from './p2p-layer.mjs';
 import { cashierShuffle, verifyGame } from './protocol.mjs';
 import { readFileSync, existsSync } from 'fs';
@@ -25,6 +27,7 @@ const args = Object.fromEntries(
 );
 const MY_ID = args.id || 'cashier1';
 const TABLE_ID = args.table || 'ptable2';
+const WS_PORT = parseInt(args.wsport || '4000');
 
 const KEYS = {
   TABLE_CONFIG:   'chips.vrsc::poker.sg777z.t_table_info',
@@ -80,7 +83,7 @@ async function main() {
         }
       }
 
-      if (req && req.handId && req.handId !== lastProcessedHand) {
+      if (req && req.handId && req.handId !== lastProcessedHand && !activeHands.has(req.handId)) {
         // Skip stale requests (older than 60s)
         if (req.timestamp && Date.now() - req.timestamp > 60000) {
           console.log('[CASHIER ' + MY_ID + '] Skipping stale: ' + req.handId + ' (' + Math.round((Date.now() - req.timestamp) / 1000) + 's old)');

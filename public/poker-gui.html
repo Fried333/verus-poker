@@ -500,7 +500,6 @@ function renderControls() {
     const maxR = Math.max(minR, myChips - toCall);
 
     let html = '';
-    if (st.message) html += '<div style="color:#aaa;font-size:12px;text-align:right;margin-bottom:2px">' + esc(st.message) + '</div>';
     html += '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">';
     // Raise slider
     if (va.includes('raise')) {
