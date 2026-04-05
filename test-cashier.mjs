@@ -136,8 +136,7 @@ async function main() {
       card: decoded
     });
 
-    // Wait for cashier to finish writes before next hand (simulates real game pace)
-    await WAIT(10000);
+    // No artificial delay — each step triggers the next via polling
   }
 
   // Summary
