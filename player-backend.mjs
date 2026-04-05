@@ -241,7 +241,7 @@ export function createPlayerBackend(p2p, myId, tableId) {
             state.winner = null; state.verified = null;
             state.showdownCards = {}; state.handNames = {};
             state.message = 'Hand #' + state.handCount + ' — shuffling...';
-            addActionLog('--- Hand #' + state.handCount + ' ---');
+            addActionLog('*** HAND #' + state.handCount + ' ***');
             state.players.forEach(p => { p.bet = 0; p.folded = false; });
             lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
             notify();
@@ -380,19 +380,34 @@ export function createPlayerBackend(p2p, myId, tableId) {
               }
             }
 
+            // Showdown — show all non-folded hands
+            const allCards = st.allHoleCards || {};
+            const handNames = st.handNames || {};
+            const nonFolded = Object.entries(allCards).filter(([, cards]) => cards && cards[0]);
+            if (nonFolded.length > 1) {
+              addActionLog('*** SHOWDOWN ***');
+              for (const [seatStr, cards] of nonFolded) {
+                const s = Number(seatStr);
+                const p = state.players[s];
+                const hn = handNames[s] || '';
+                addActionLog((p ? p.id : 'Seat ' + s) + ' shows [' + cards.join(' ') + ']' + (hn ? ' (' + hn + ')' : ''));
+              }
+            }
+
             // Winner
             if (st.winners && st.winners.length > 0) {
               const winSeat = st.winners[0];
               const winPlayer = state.players[winSeat];
-              const handNames = st.handNames || {};
               state.winner = {
                 seats: st.winners,
                 name: winPlayer ? winPlayer.id : 'Seat ' + winSeat,
                 amount: st.winAmount || 0,
                 handName: handNames[winSeat] || '',
-                showdownCards: st.allHoleCards || {}
+                showdownCards: allCards
               };
-              addActionLog((winPlayer ? winPlayer.id : 'Seat ' + winSeat) + ' wins ' + (st.winAmount || 0) + (handNames[winSeat] ? ' — ' + handNames[winSeat] : ''));
+              const winCards = allCards[winSeat] ? allCards[winSeat].filter(Boolean) : [];
+              const winCardsStr = winCards.length > 0 ? ' [' + winCards.join(' ') + ']' : '';
+              addActionLog((winPlayer ? winPlayer.id : 'Seat ' + winSeat) + ' wins ' + (st.winAmount || 0) + winCardsStr + (handNames[winSeat] ? ' — ' + handNames[winSeat] : ''));
             }
 
             state.message = 'Hand #' + state.handCount + ' — verified';
