@@ -232,6 +232,30 @@ export function createPlayerBackend(p2p, myId, tableId) {
           // 1. Check for new hand
           const tc = await p2p.read(tableId, KEYS.TABLE_CONFIG);
           if (tc && tc.currentHandId && tc.currentHandId !== state.handId && tc.currentHandId !== lastSettledHandId) {
+            // Before switching hands, read settlement for current hand if we missed it
+            if (state.handId && state.verified === null) {
+              const missedStKey = KEYS.SETTLEMENT + '.' + state.handId;
+              const missedSt = await p2p.read(tableId, missedStKey);
+              if (missedSt && missedSt.verified !== undefined) {
+                log('Caught missed settlement for ' + state.handId);
+                if (missedSt.results) {
+                  for (const r of missedSt.results) {
+                    const gp = state.players.find(x => x.id === r.id);
+                    if (gp) gp.chips = r.chips;
+                  }
+                }
+                if (missedSt.winners && missedSt.winners.length > 0) {
+                  const ws = missedSt.winners[0];
+                  const wp = state.players[ws];
+                  const hn = missedSt.handNames || {};
+                  const wc = missedSt.allHoleCards && missedSt.allHoleCards[ws] ? missedSt.allHoleCards[ws].filter(Boolean) : [];
+                  addActionLog((wp ? wp.id : 'Seat ' + ws) + ' wins ' + (missedSt.winAmount || 0) + (wc.length ? ' [' + wc.join(' ') + ']' : '') + (hn[ws] ? ' — ' + hn[ws] : ''));
+                }
+                addActionLog('Hand #' + state.handCount + ' verified');
+                lastSettledHandId = state.handId;
+              }
+            }
+
             // If we had a hand but never got cards, we might be sat out
             if (state.handId && state.myCards.length === 0) {
               handsWithoutCards++;
@@ -289,6 +313,7 @@ export function createPlayerBackend(p2p, myId, tableId) {
               state.myCards = cr.cards;
               state.phase = 'preflop';
               state.message = '';
+              addActionLog('*** HAND #' + state.handCount + ' ***');
               notify();
             }
           }
@@ -298,10 +323,6 @@ export function createPlayerBackend(p2p, myId, tableId) {
           const bsKey = KEYS.BETTING_STATE + '.' + state.handId + '.s' + nextSeq;
           const bs = await p2p.read(tableId, bsKey);
           if (bs) {
-            // First BS for this hand — we're actually in it
-            if (lastBSSeq === -1) {
-              addActionLog('*** HAND #' + state.handCount + ' ***');
-            }
             lastBSSeq = bs.seq !== undefined ? bs.seq : nextSeq;
             state.pot = bs.pot || state.pot;
             if (bs.phase) state.phase = bs.phase;
@@ -432,36 +453,34 @@ export function createPlayerBackend(p2p, myId, tableId) {
             addActionLog('Hand #' + state.handCount + ' verified');
             lastSettledHandId = state.handId;
             state.handId = null;
-            notify();
 
-            // Show results then reset
-            await WAIT(4000);
-
-            state.phase = 'waiting';
-            state.myCards = []; state.board = [];
-            state.winner = null; state.verified = null;
-            state.showdownCards = {}; state.handNames = {};
-            state.turn = null; state.validActions = [];
-            state.players.forEach(p => { p.bet = 0; p.folded = false; });
             // Check if we busted
             const me = state.players.find(p => p.id === myId);
             if (me && me.chips <= 0) {
               state.busted = true;
-              state.message = 'Out of chips! Reload to continue.';
               addActionLog(myId + ' busted');
               log('BUSTED — 0 chips');
-            } else {
-              state.message = 'Waiting for next hand...';
             }
-            lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
+
+            // Push settlement state (GUI will show winner banner on its own timer)
             notify();
+
+            // Reset immediately — don't block the poll loop
+            state.phase = 'waiting';
+            state.myCards = []; state.board = [];
+            state.showdownCards = {}; state.handNames = {};
+            state.turn = null; state.validActions = [];
+            state.players.forEach(p => { p.bet = 0; p.folded = false; });
+            if (!state.busted) state.message = '';
+            lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
+            // Don't notify again yet — let the winner stay visible until next hand
           }
         } catch (e) {
           log('Poll error: ' + e.message);
           state.message = 'Error: ' + e.message;
           notify();
         }
-        await WAIT(1000);
+        await WAIT(500);
       }
     }
   };
