@@ -338,7 +338,9 @@ function render() {
   const felt = document.getElementById('felt');
   const activePlayers = st.players.filter(p => p.id);
   const np = activePlayers.length;
-  const positions = getPositions(np, mySeat);
+  // Find my INDEX in the active players array (not seat number)
+  const myIndex = activePlayers.findIndex(p => p.id === myId);
+  const positions = getPositions(np, myIndex >= 0 ? myIndex : 0);
   const cx = 50, cy = 45;
 
   // Clear old elements
