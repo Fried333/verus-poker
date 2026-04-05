@@ -424,6 +424,7 @@ export function createPlayerBackend(p2p, myId, tableId) {
 
             const allCards = st.allHoleCards || {};
             const handNames = st.handNames || {};
+            const bestHands = st.bestHands || {};
 
             // Winner
             if (st.winners && st.winners.length > 0) {
@@ -436,9 +437,20 @@ export function createPlayerBackend(p2p, myId, tableId) {
                 handName: handNames[winSeat] || '',
                 showdownCards: allCards
               };
-              const winCards = allCards[winSeat] ? allCards[winSeat].filter(Boolean) : [];
-              const winCardsStr = winCards.length > 0 ? ' [' + winCards.join(' ') + ']' : '';
-              addActionLog((winPlayer ? winPlayer.id : 'Seat ' + winSeat) + ' wins ' + (st.winAmount || 0) + winCardsStr + (handNames[winSeat] ? ' — ' + handNames[winSeat] : ''));
+
+              // Show all non-folded hands with best 5 cards (real showdown)
+              const nonFolded = Object.entries(allCards).filter(([, cards]) => cards && cards[0]);
+              if (nonFolded.length > 1) {
+                for (const [seatStr] of nonFolded) {
+                  const s = Number(seatStr);
+                  const p = state.players[s];
+                  const name = p ? p.id : 'Seat ' + s;
+                  const hn = handNames[s] || '';
+                  const best = bestHands[s] ? bestHands[s].join(' ') : '';
+                  addActionLog(name + ': ' + hn + (best ? ' [' + best + ']' : ''));
+                }
+              }
+              addActionLog((winPlayer ? winPlayer.id : 'Seat ' + winSeat) + ' wins ' + (st.winAmount || 0));
             }
 
             state.message = '';

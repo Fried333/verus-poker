@@ -47,9 +47,10 @@ async function autoPlay(page, name) {
           return null;
         };
         let action;
-        if (rnd < 0.35) action = await tryClick('check') || await tryClick('call');
-        else if (rnd < 0.6) action = await tryClick('fold');
-        else if (rnd < 0.85) action = await tryClick('raise') || await tryClick('bet');
+        // Heavy call/check to force showdowns
+        if (rnd < 0.6) action = await tryClick('check') || await tryClick('call');
+        else if (rnd < 0.75) action = await tryClick('raise') || await tryClick('bet');
+        else if (rnd < 0.85) action = await tryClick('fold');
         else action = await tryClick('all in');
         if (!action) { const a = await page.$('#controls button'); if (a) { action = await a.textContent().catch(() => '?'); await a.click().catch(() => {}); } }
         if (action) console.log('[' + name + '] ' + action);

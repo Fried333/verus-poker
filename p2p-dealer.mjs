@@ -5,7 +5,7 @@
  */
 
 import { playerInit, dealerShuffle, cashierShuffle, decodeCard, verifyGame } from './protocol.mjs';
-import { evaluateHand, cardToString } from './hand-eval.mjs';
+import { evaluateHand, evaluateHandWithCards, cardToString } from './hand-eval.mjs';
 import { VDXF_KEYS, gameKey } from './verus-rpc.mjs';
 import {
   createGame, addPlayer, startHand, postBlinds, playerAction,
@@ -287,10 +287,12 @@ export function createP2PDealer(p2p, config, localNotify) {
         if (amt > 0) { winners.push(Number(seat)); winAmount = amt; }
       }
       const nonFoldedCount = game.players.filter(p => !p.folded).length;
+      const bestHands = {}; // seat → best 5-card hand as strings
       for (const gp of game.players) {
         if (!gp.folded && gp.holeCards.length > 0 && game.board.length >= 3 && nonFoldedCount > 1) {
-          const score = evaluateHand([...gp.holeCards, ...game.board]);
-          handNames[gp.seat] = rankNames[Math.floor(score / 1e10)] || 'Unknown';
+          const result = evaluateHandWithCards([...gp.holeCards, ...game.board]);
+          handNames[gp.seat] = rankNames[Math.floor(result.score / 1e10)] || 'Unknown';
+          bestHands[gp.seat] = result.bestCards.map(cardToString);
         }
         if (nonFoldedCount > 1 && !gp.folded) {
           allHoleCards[gp.seat] = gp.holeCards.map(cardToString);
@@ -315,7 +317,7 @@ export function createP2PDealer(p2p, config, localNotify) {
         hand: handCount, verified: verification.valid, session: gameId,
         results: game.players.map(p => ({ id: p.id, chips: p.chips })),
         board: game.board.map(cardToString),
-        handNames, allHoleCards, winners, winAmount
+        handNames, bestHands, allHoleCards, winners, winAmount
       });
       dlog('Settlement written (' + (Date.now()-vt) + 'ms)');
       dlog('HAND TOTAL: ' + ((Date.now()-handT0)/1000).toFixed(1) + 's | chips: ' + game.players.map(p => p.id + '=' + p.chips).join(' '));

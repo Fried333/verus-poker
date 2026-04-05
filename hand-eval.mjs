@@ -65,6 +65,23 @@ export function evaluateHand(cards) {
   return best;
 }
 
+/** Returns { score, bestCards } — the best 5-card hand from 7 cards */
+export function evaluateHandWithCards(cards) {
+  if (cards.length === 5) return { score: evaluate5(cards), bestCards: [...cards] };
+  let best = -1;
+  let bestHand = null;
+  for (let i = 0; i < cards.length; i++) {
+    for (let j = i + 1; j < cards.length; j++) {
+      const hand = cards.filter((_, idx) => idx !== i && idx !== j);
+      if (hand.length === 5) {
+        const score = evaluate5(hand);
+        if (score > best) { best = score; bestHand = hand; }
+      }
+    }
+  }
+  return { score: best, bestCards: bestHand || cards.slice(0, 5) };
+}
+
 export function handRank(score) {
   return Math.floor(score / 1e10);
 }
