@@ -66,31 +66,42 @@ async function main() {
 
   while (true) {
     try {
-      // 1. Check for shuffle request on table
-      const req = await p2p.read(TABLE_ID, KEYS.SHUFFLE_REQ);
-      if (req) console.log('[CASHIER ' + MY_ID + '] Read shuffle req: handId=' + (req.handId || 'none') + ' last=' + lastProcessedHand);
+      // 1. Check for shuffle request — try base key first, then per-hand key
+      let req = await p2p.read(TABLE_ID, KEYS.SHUFFLE_REQ);
+
+      // If base key shows same hand we already did, check per-hand keys via table config
+      if (req && req.handId === lastProcessedHand) {
+        const tc = await p2p.read(TABLE_ID, KEYS.TABLE_CONFIG);
+        if (tc && tc.currentHandId && tc.currentHandId !== lastProcessedHand) {
+          // Table has moved on — check per-hand key
+          const perHandReq = await p2p.read(TABLE_ID, KEYS.SHUFFLE_REQ + '.' + tc.currentHandId);
+          if (perHandReq && perHandReq.handId) req = perHandReq;
+        }
+      }
 
       if (req && req.handId && req.handId !== lastProcessedHand) {
-        // Skip stale requests (older than 30s)
-        if (req.timestamp && Date.now() - req.timestamp > 30000) {
-          console.log('[CASHIER ' + MY_ID + '] Skipping stale request: ' + req.handId + ' (' + Math.round((Date.now() - req.timestamp) / 1000) + 's old)');
+        // Skip stale requests (older than 60s)
+        if (req.timestamp && Date.now() - req.timestamp > 60000) {
+          console.log('[CASHIER ' + MY_ID + '] Skipping stale: ' + req.handId + ' (' + Math.round((Date.now() - req.timestamp) / 1000) + 's old)');
           lastProcessedHand = req.handId;
           continue;
         }
         console.log('[CASHIER ' + MY_ID + '] Shuffle request: hand=' + req.handId + ' players=' + req.numPlayers);
 
-        // Read each player's blinded deck
+        // Read each player's blinded deck — keep trying until 50s (dealer times out at 60s)
         const blindedDecks = [];
+        const readStart = Date.now();
         for (let i = 0; i < req.numPlayers; i++) {
           const deckKey = 'chips.vrsc::poker.sg777z.t_shuffle_deck.' + req.handId + '.p' + i;
           let deckData = null;
-          for (let attempt = 0; attempt < 20; attempt++) {
+          while (Date.now() - readStart < 50000) {
             deckData = await p2p.read(TABLE_ID, deckKey);
             if (deckData && deckData.deck) break;
+            deckData = null;
             await WAIT(500);
           }
           if (!deckData || !deckData.deck) {
-            console.log('[CASHIER ' + MY_ID + '] Failed to read deck for player ' + i);
+            console.log('[CASHIER ' + MY_ID + '] Failed to read deck for player ' + i + ' after ' + Math.round((Date.now() - readStart) / 1000) + 's');
             continue;
           }
           blindedDecks.push(deckData.deck);
@@ -108,13 +119,14 @@ async function main() {
         const ms = Date.now() - t0;
         console.log('[CASHIER ' + MY_ID + '] Stage III done (' + ms + 'ms). Commitment: ' + cd.cashierCommitment.substring(0, 16) + '...');
 
-        // 3. Write result — sequential writes, 1 TX per key (safe for UTXO + size limits)
+        // 3. Write meta FIRST (dealer polls for this), then decks sequentially
         const t1 = Date.now();
         await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId, {
           cashier: MY_ID, handId: req.handId, session: req.session,
           sigma_Cashier: cd.sigma_Cashier, cashierCommitment: cd.cashierCommitment,
           numPlayers: req.numPlayers, timestamp: Date.now()
         });
+        // Write deck/b data — dealer will retry-read these
         for (let i = 0; i < req.numPlayers; i++) {
           await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
             { player: i, deck: cd.finalDecks[i] });
@@ -141,7 +153,7 @@ async function main() {
       if (e.stack) console.log(e.stack);
     }
 
-    await WAIT(2000);
+    await WAIT(1000);
   }
 }
 

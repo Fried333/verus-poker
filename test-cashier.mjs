@@ -60,8 +60,12 @@ async function main() {
 
     // Write shuffle request to table (sequential writes)
     const tWrite0 = Date.now();
-    await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_shuffle_request', {
-      handId, session: 'test', numPlayers, numCards, threshold, timestamp: Date.now()
+    const reqData = { handId, session: 'test', numPlayers, numCards, threshold, timestamp: Date.now() };
+    await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_shuffle_request', reqData);
+    await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_shuffle_request.' + handId, reqData);
+    // Also write table config so cashier can find handId via fallback
+    await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_table_info', {
+      currentHandId: handId, session: 'test', status: 'playing', timestamp: Date.now()
     });
     for (let i = 0; i < numPlayers; i++) {
       await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_shuffle_deck.' + handId + '.p' + i,
@@ -131,6 +135,9 @@ async function main() {
       shuffle: tShuffle, write: tWrite, poll: tPoll, read: tRead,
       card: decoded
     });
+
+    // Wait for cashier to finish writes before next hand (simulates real game pace)
+    await WAIT(10000);
   }
 
   // Summary
