@@ -201,10 +201,14 @@ export function createP2PDealer(p2p, config, localNotify) {
       for (let i = 0; i < numPlayers * 2; i++) holePositions.push(i);
       const holeBlindings = await requestBlindings(holePositions, 0);
       const d0 = { deck: cd.finalDecks[0], e: dd.e[0], key: playerData[0].sessionKey, init: playerData[0].initialDeck };
+      dlog('DEBUG: deck[0] type=' + typeof d0.deck[0] + ' blinding[0] type=' + typeof holeBlindings[0] + ' e type=' + typeof d0.e);
+      dlog('DEBUG: blinding keys=' + Object.keys(holeBlindings).join(',') + ' count=' + Object.keys(holeBlindings).length);
       for (let i = 0; i < numPlayers; i++) {
         const cards = [];
         for (let c = 0; c < 2; c++) {
-          cards.push(decodeCard(d0.deck[cardPos], holeBlindings[cardPos], d0.e, dd.d, d0.key, d0.init));
+          const raw = decodeCard(d0.deck[cardPos], holeBlindings[cardPos], d0.e, dd.d, d0.key, d0.init);
+          dlog('DEBUG: pos=' + cardPos + ' raw=' + raw + ' card=' + cardToString(raw));
+          cards.push(raw);
           cardPos++;
         }
         holeCards[activePlayers[i].id] = cards;
