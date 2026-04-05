@@ -394,7 +394,10 @@ export function createPlayerBackend(p2p, myId, tableId) {
           if (bc && bc.board && bc.board.length > state.board.length) {
             const phase = bc.phase || '';
             log('Board (' + phase + '): ' + bc.board.join(' '));
-            addActionLog(phase + ': ' + bc.board.join(' '));
+            // Only log board for flop/turn/river — showdown board is visible on table
+            if (phase !== 'showdown') {
+              addActionLog(phase + ': ' + bc.board.join(' '));
+            }
             state.board = bc.board;
             if (bc.phase) state.phase = bc.phase;
             notify();
@@ -419,19 +422,8 @@ export function createPlayerBackend(p2p, myId, tableId) {
               }
             }
 
-            // Showdown — show all non-folded hands
             const allCards = st.allHoleCards || {};
             const handNames = st.handNames || {};
-            const nonFolded = Object.entries(allCards).filter(([, cards]) => cards && cards[0]);
-            if (nonFolded.length > 1) {
-              addActionLog('*** SHOWDOWN ***');
-              for (const [seatStr, cards] of nonFolded) {
-                const s = Number(seatStr);
-                const p = state.players[s];
-                const hn = handNames[s] || '';
-                addActionLog((p ? p.id : 'Seat ' + s) + ' shows [' + cards.join(' ') + ']' + (hn ? ' (' + hn + ')' : ''));
-              }
-            }
 
             // Winner
             if (st.winners && st.winners.length > 0) {

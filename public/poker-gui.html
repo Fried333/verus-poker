@@ -450,8 +450,7 @@ function render() {
     if (entry.startsWith('***')) div.className = 'log-hand';
     else if (e.includes('wins')) div.className = 'log-winner';
     else if (e.includes('verified')) div.className = 'log-verified';
-    else if (e.includes('shows [')) div.className = 'log-showdown';
-    else if (e.includes('flop:') || e.includes('turn:') || e.includes('river:') || e.includes('showdown:')) div.className = 'log-board';
+    else if (e.includes('flop:') || e.includes('turn:') || e.includes('river:')) div.className = 'log-board';
     else if (e.includes('busted') || e.includes('reload') || e.includes('sat')) div.className = 'log-system';
     else div.className = 'log-action';
 
