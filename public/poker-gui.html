@@ -178,19 +178,18 @@ body {
 }
 #action-log div { padding: 1px 0; }
 /* Action log colors */
-.log-fold { color: #777; }
-.log-check { color: #ccc; }
-.log-call { color: #64b5f6; }
-.log-raise, .log-bet { color: #ffd54f; font-weight: bold; }
-.log-allin { color: #ef5350; font-weight: bold; }
+.log-action { color: #ccc; }
 .log-board { color: #81c784; }
 .log-winner { color: #66bb6a; font-weight: bold; }
+.log-showdown { color: #e0e0e0; }
 .log-verified { color: #ce93d8; }
 .log-hand { color: #555; font-style: italic; }
 .log-system { color: #666; font-style: italic; }
 /* Suit colors for inline cards */
-.suit-h, .suit-d { color: #ef5350; }
-.suit-c, .suit-s { color: #e0e0e0; }
+.suit-h { color: #ef5350; }
+.suit-d { color: #42a5f5; }
+.suit-c { color: #66bb6a; }
+.suit-s { color: #e0e0e0; }
 #controls {
   margin-left: auto;
   display: flex; align-items: center; justify-content: flex-end;
@@ -451,28 +450,16 @@ function render() {
     if (entry.startsWith('***')) div.className = 'log-hand';
     else if (e.includes('wins')) div.className = 'log-winner';
     else if (e.includes('verified')) div.className = 'log-verified';
-    else if (entry.startsWith('*** SHOWDOWN')) div.className = 'log-winner';
-    else if (e.includes('shows [')) div.className = 'log-check'; // showdown reveal — neutral
+    else if (e.includes('shows [')) div.className = 'log-showdown';
     else if (e.includes('flop:') || e.includes('turn:') || e.includes('river:') || e.includes('showdown:')) div.className = 'log-board';
-    else if (e.includes('all') && e.includes('in')) div.className = 'log-allin';
-    else if (e.includes('raise') || e.includes('bet')) div.className = 'log-raise';
-    else if (e.includes('call')) div.className = 'log-call';
-    else if (e.includes('fold')) div.className = 'log-fold';
-    else if (e.includes('check')) div.className = 'log-check';
     else if (e.includes('busted') || e.includes('reload') || e.includes('sat')) div.className = 'log-system';
-    else div.className = 'log-check';
+    else div.className = 'log-action';
 
-    // Render card suits with colors
+    // Render card suits with colors — ONLY match valid card names (2-9, T, J, Q, K, A + suit)
     div.innerHTML = esc(entry)
-      .replace(/\b(\w)([hdcs])\b/g, (m, rank, suit) => {
-        const cls = (suit === 'h' || suit === 'd') ? 'suit-h' : 'suit-s';
+      .replace(/\b(10|[2-9TJQKA])([hdcs])\b/g, (m, rank, suit) => {
         const sym = { h: '\u2665', d: '\u2666', c: '\u2663', s: '\u2660' }[suit];
-        return '<span class="' + cls + '">' + rank + sym + '</span>';
-      })
-      .replace(/\b(10)([hdcs])\b/g, (m, rank, suit) => {
-        const cls = (suit === 'h' || suit === 'd') ? 'suit-h' : 'suit-s';
-        const sym = { h: '\u2665', d: '\u2666', c: '\u2663', s: '\u2660' }[suit];
-        return '<span class="' + cls + '">' + rank + sym + '</span>';
+        return '<span class="suit-' + suit + '">' + rank + sym + '</span>';
       });
     logEl.appendChild(div);
   }
@@ -531,9 +518,8 @@ function renderControls() {
     html += '</div></div>';
     el.innerHTML = html;
   } else {
-    // Just show current wait status — action log handles the history
-    const statusMsg = st.message || st.phase || 'Waiting...';
-    el.innerHTML = '<span class="wait-text">' + esc(statusMsg) + '</span>';
+    // No buttons — clear controls (action log handles all status)
+    el.innerHTML = '';
   }
 }
 

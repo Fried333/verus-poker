@@ -127,12 +127,30 @@ export function createPlayerBackend(p2p, myId, tableId) {
       missedTurns = 0;
       state.turn = null;
       state.validActions = [];
-      state.message = 'You ' + action.action + (action.amount ? ' ' + action.amount : '');
+      state.message = '';
       addActionLog(myId + ' ' + action.action + (action.amount ? ' ' + action.amount : ''));
 
-      if (action.action === 'fold') {
-        const me = state.players.find(p => p.id === myId);
-        if (me) me.folded = true;
+      // Immediately update local state so UI reflects the action
+      const me = state.players.find(p => p.id === myId);
+      if (me) {
+        if (action.action === 'fold') {
+          me.folded = true;
+        } else if (action.action === 'call') {
+          const callAmt = Math.min(state.toCall - (me.bet || 0), me.chips);
+          me.chips -= callAmt;
+          me.bet = (me.bet || 0) + callAmt;
+          state.pot += callAmt;
+        } else if (action.action === 'raise' || action.action === 'bet') {
+          const raiseAmt = Math.min(action.amount || state.minRaise, me.chips);
+          me.chips -= raiseAmt;
+          me.bet = (me.bet || 0) + raiseAmt;
+          state.pot += raiseAmt;
+        } else if (action.action === 'allin') {
+          const allAmt = me.chips;
+          state.pot += allAmt;
+          me.bet = (me.bet || 0) + allAmt;
+          me.chips = 0;
+        }
       }
       notify();
 
@@ -241,7 +259,6 @@ export function createPlayerBackend(p2p, myId, tableId) {
             state.winner = null; state.verified = null;
             state.showdownCards = {}; state.handNames = {};
             state.message = 'Hand #' + state.handCount + ' — shuffling...';
-            addActionLog('*** HAND #' + state.handCount + ' ***');
             state.players.forEach(p => { p.bet = 0; p.folded = false; });
             lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
             notify();
@@ -281,6 +298,10 @@ export function createPlayerBackend(p2p, myId, tableId) {
           const bsKey = KEYS.BETTING_STATE + '.' + state.handId + '.s' + nextSeq;
           const bs = await p2p.read(tableId, bsKey);
           if (bs) {
+            // First BS for this hand — we're actually in it
+            if (lastBSSeq === -1) {
+              addActionLog('*** HAND #' + state.handCount + ' ***');
+            }
             lastBSSeq = bs.seq !== undefined ? bs.seq : nextSeq;
             state.pot = bs.pot || state.pot;
             if (bs.phase) state.phase = bs.phase;
@@ -303,11 +324,8 @@ export function createPlayerBackend(p2p, myId, tableId) {
             // Action log from opponent
             if (bs.lastAction && bs.lastAction.player !== myId) {
               const msg = bs.lastAction.player + ' ' + bs.lastAction.action + (bs.lastAction.amount ? ' ' + bs.lastAction.amount : '');
-              state.message = msg;
               addActionLog(msg);
               log(msg);
-            } else if (!bs.lastAction) {
-              state.message = '';
             }
 
             // Reset acted when new BS sequence arrives (different from what we acted on)
@@ -410,7 +428,7 @@ export function createPlayerBackend(p2p, myId, tableId) {
               addActionLog((winPlayer ? winPlayer.id : 'Seat ' + winSeat) + ' wins ' + (st.winAmount || 0) + winCardsStr + (handNames[winSeat] ? ' — ' + handNames[winSeat] : ''));
             }
 
-            state.message = 'Hand #' + state.handCount + ' — verified';
+            state.message = '';
             addActionLog('Hand #' + state.handCount + ' verified');
             lastSettledHandId = state.handId;
             state.handId = null;
