@@ -33,7 +33,8 @@ let LOCAL_PLAYERS = (process.argv.find(a => a.startsWith('--players='))?.split('
 const STATIC_DIR = '/root/pangea-poker/dist';
 const MAX_PLAYERS = 9;
 const MIN_PLAYERS = 2;      // Start hand when this many are seated
-const CONFIG = { smallBlind: 1, bigBlind: 2, rake: 0 };
+const CASHIER_IDS = (process.argv.find(a => a.startsWith('--cashiers='))?.split('=')[1] || '').split(',').filter(Boolean);
+const CONFIG = { smallBlind: 1, bigBlind: 2, rake: 0, cashiers: CASHIER_IDS };
 
 const MIME = {
   '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css',

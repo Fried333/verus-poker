@@ -20,12 +20,13 @@ function dlog(msg) { console.log('[D ' + dts() + 's] ' + msg); }
 let handStartTime = 0;
 
 export function createP2PDealer(p2p, config, localNotify) {
-  const { smallBlind, bigBlind, buyin } = config;
+  const { smallBlind, bigBlind, buyin, cashiers } = config;
   const players = []; // { id, seat, chips, sittingOut, timeouts }
   let handCount = 0;
   let dealerSeatIdx = 0;
   let gameId = null;
   const MAX_TIMEOUTS = 1; // Sit out after this many consecutive timeouts (industry standard)
+  const useCashiers = cashiers && cashiers.length > 0;
 
   function notify(event, data) {
     if (localNotify) localNotify(event, data);
@@ -99,14 +100,67 @@ export function createP2PDealer(p2p, config, localNotify) {
       dlog('Shuffling...');
       notify('shuffle_start', { hand: handCount, players: activePlayers });
 
-      // ── ALL 3 STAGES: Player init → Dealer shuffle → Cashier shuffle ──
+      // ── STAGE I + II: Player init → Dealer shuffle ──
       const playerData = [];
       for (let i = 0; i < numPlayers; i++) {
         playerData.push(playerInit(numCards, activePlayers[i].id));
       }
       const dd = dealerShuffle(playerData, numCards);
       const threshold = Math.max(2, Math.ceil(numPlayers / 2) + 1);
-      const cd = cashierShuffle(dd.blindedDecks, numPlayers, numCards, threshold);
+
+      // ── STAGE III: Cashier shuffle ──
+      let cd;
+      if (useCashiers) {
+        // Write shuffle request for external cashier nodes
+        // Split across keys — header + one key per player deck (each ~3.5KB)
+        dlog('Sending Stage III to cashier: ' + cashiers[0]);
+        const shuffleReqKey = 'chips.vrsc::poker.sg777z.t_shuffle_request';
+        await p2p.write(p2p.tableId, shuffleReqKey, {
+          handId, session: gameId, numPlayers, numCards, threshold,
+          timestamp: Date.now()
+        });
+        // Write each player's blinded deck separately
+        for (let i = 0; i < numPlayers; i++) {
+          const deckKey = 'chips.vrsc::poker.sg777z.t_shuffle_deck.' + handId + '.p' + i;
+          await p2p.write(p2p.tableId, deckKey, { player: i, deck: dd.blindedDecks[i] });
+        }
+
+        // Wait for first cashier to respond (poll their identity)
+        dlog('Waiting for cashier response...');
+        const cashierResultKey = 'chips.vrsc::poker.sg777z.c_shuffle_result.' + handId;
+        let cashierMeta = null;
+        for (let i = 0; i < 120; i++) { // 60s timeout
+          cashierMeta = await p2p.read(cashiers[0], cashierResultKey);
+          if (cashierMeta && cashierMeta.handId === handId) break;
+          cashierMeta = null;
+          await WAIT(500);
+        }
+
+        if (!cashierMeta) {
+          dlog('Cashier timeout — falling back to local Stage III');
+          cd = cashierShuffle(dd.blindedDecks, numPlayers, numCards, threshold);
+        } else {
+          dlog('Cashier response received from ' + cashierMeta.cashier + ', reading decks...');
+          // Read per-player decks and b values
+          const finalDecks = [];
+          const bValues = [];
+          for (let i = 0; i < numPlayers; i++) {
+            const deckData = await p2p.read(cashiers[0], cashierResultKey + '.deck.' + i);
+            const bData = await p2p.read(cashiers[0], cashierResultKey + '.b.' + i);
+            finalDecks.push(deckData ? deckData.deck : []);
+            bValues.push(bData ? bData.b : []);
+          }
+          cd = {
+            finalDecks, b: bValues,
+            sigma_Cashier: cashierMeta.sigma_Cashier,
+            cashierCommitment: cashierMeta.cashierCommitment
+          };
+          dlog('Cashier data assembled (' + numPlayers + ' player decks)');
+        }
+      } else {
+        // No external cashiers — do Stage III locally
+        cd = cashierShuffle(dd.blindedDecks, numPlayers, numCards, threshold);
+      }
 
       // ── DEAL HOLE CARDS (decode locally) ──
       let cardPos = 0;
