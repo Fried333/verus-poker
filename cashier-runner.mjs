@@ -120,19 +120,34 @@ async function main() {
         const ms = Date.now() - t0;
         console.log('[CASHIER ' + MY_ID + '] Stage III done (' + ms + 'ms). Commitment: ' + cd.cashierCommitment.substring(0, 16) + '...');
 
-        // 3. Write meta + blindedcards ONLY (per C code: cashier keeps b[] private)
+        // 3. Write meta + first deck as batch (saves 1 TX), rest sequential
         const t1 = Date.now();
-        await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId, {
+        const metaData = {
           cashier: MY_ID, handId: req.handId, session: req.session,
           cashierCommitment: cd.cashierCommitment,
           numPlayers: req.numPlayers, timestamp: Date.now()
-        });
-        // Write only the blinded cards (finalDecks) — NOT b values or sigma
-        for (let i = 0; i < req.numPlayers; i++) {
-          await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
-            { player: i, deck: cd.finalDecks[i] });
+        };
+        // Try batch: meta (250 bytes) + deck 0 (3.5KB) = ~3.75KB — should fit
+        try {
+          await p2p.writeBatch(MY_ID, [
+            { key: KEYS.CASHIER_RESULT + '.' + req.handId, data: metaData },
+            { key: KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.0', data: { player: 0, deck: cd.finalDecks[0] } }
+          ]);
+          // Write remaining decks
+          for (let i = 1; i < req.numPlayers; i++) {
+            await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
+              { player: i, deck: cd.finalDecks[i] });
+          }
+        } catch (e) {
+          // Batch too big — fall back to sequential
+          console.log('[CASHIER ' + MY_ID + '] Batch failed, writing sequentially: ' + e.message);
+          await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId, metaData);
+          for (let i = 0; i < req.numPlayers; i++) {
+            await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
+              { player: i, deck: cd.finalDecks[i] });
+          }
         }
-        console.log('[CASHIER ' + MY_ID + '] Decks written (' + (req.numPlayers + 1) + ' keys, ' + (Date.now() - t1) + 'ms)');
+        console.log('[CASHIER ' + MY_ID + '] Written (' + (Date.now() - t1) + 'ms)');
 
         // Store b values + sigma locally — revealed per-card during hand
         activeHands.set(req.handId, { b: cd.b, sigma: cd.sigma_Cashier });

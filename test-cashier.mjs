@@ -61,18 +61,20 @@ async function main() {
     // Write shuffle request to table (sequential writes)
     const tWrite0 = Date.now();
     const reqData = { handId, session: 'test', numPlayers, numCards, threshold, timestamp: Date.now() };
-    await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_shuffle_request', reqData);
-    await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_shuffle_request.' + handId, reqData);
-    // Also write table config so cashier can find handId via fallback
-    await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_table_info', {
-      currentHandId: handId, session: 'test', status: 'playing', timestamp: Date.now()
-    });
+    // Batch all small writes: base key + per-hand key + table config (1 TX)
+    await p2p.writeBatch(TABLE_ID, [
+      { key: 'chips.vrsc::poker.sg777z.t_shuffle_request', data: reqData },
+      { key: 'chips.vrsc::poker.sg777z.t_shuffle_request.' + handId, data: reqData },
+      { key: 'chips.vrsc::poker.sg777z.t_table_info', data: { currentHandId: handId, session: 'test', status: 'playing', timestamp: Date.now() } }
+    ]);
+    // Player decks separate (3.5KB each)
     for (let i = 0; i < numPlayers; i++) {
       await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_shuffle_deck.' + handId + '.p' + i,
         { player: i, deck: dd.blindedDecks[i] });
     }
     const tWrite = Date.now() - tWrite0;
-    console.log('  Dealer writes: ' + tWrite + 'ms (' + (numPlayers + 1) + ' TXs)');
+    const txCount = 1 + numPlayers; // 1 batch + N decks
+    console.log('  Dealer writes: ' + tWrite + 'ms (' + txCount + ' TXs)');
 
     // Wait for cashier response
     const tPoll0 = Date.now();
