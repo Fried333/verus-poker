@@ -141,35 +141,66 @@ export function createP2PDealer(p2p, config, localNotify) {
           cd = cashierShuffle(dd.blindedDecks, numPlayers, numCards, threshold);
         } else {
           dlog('Cashier response received from ' + cashierMeta.cashier + ', reading decks...');
-          // Read per-player decks and b values
+          // Read only finalDecks (blindedcards) — b values come per-card during hand
           const finalDecks = [];
-          const bValues = [];
           for (let i = 0; i < numPlayers; i++) {
-            const deckData = await p2p.read(cashiers[0], cashierResultKey + '.deck.' + i);
-            const bData = await p2p.read(cashiers[0], cashierResultKey + '.b.' + i);
+            let deckData = null;
+            for (let retry = 0; retry < 40; retry++) {
+              deckData = await p2p.read(cashiers[0], cashierResultKey + '.deck.' + i);
+              if (deckData && deckData.deck) break;
+              deckData = null;
+              await WAIT(500);
+            }
             finalDecks.push(deckData ? deckData.deck : []);
-            bValues.push(bData ? bData.b : []);
           }
-          cd = {
-            finalDecks, b: bValues,
-            sigma_Cashier: cashierMeta.sigma_Cashier,
-            cashierCommitment: cashierMeta.cashierCommitment
-          };
-          dlog('Cashier data assembled (' + numPlayers + ' player decks)');
+          cd = { finalDecks, cashierCommitment: cashierMeta.cashierCommitment };
+          dlog('Cashier decks received (' + numPlayers + ' players)');
         }
       } else {
         // No external cashiers — do Stage III locally
         cd = cashierShuffle(dd.blindedDecks, numPlayers, numCards, threshold);
       }
 
-      // ── DEAL HOLE CARDS (decode locally) ──
+      // ── Request blinding values from cashier for card positions ──
+      async function requestBlindings(positions, playerIdx) {
+        if (!useCashiers || !cashiers[0]) {
+          // Local mode: b values are in cd.b
+          const result = {};
+          for (const pos of positions) result[pos] = cd.b[playerIdx][pos];
+          return result;
+        }
+        const reqTimestamp = Date.now();
+        const revealKey = 'chips.vrsc::poker.sg777z.t_reveal_request.' + handId;
+        await p2p.write(p2p.tableId, revealKey, {
+          handId, positions, playerIdx, timestamp: reqTimestamp
+        });
+        dlog('Requested blindings for positions ' + positions.join(','));
+
+        // Poll for cashier's response
+        const resultKey = 'chips.vrsc::poker.sg777z.c_reveal_result.' + handId + '.' + reqTimestamp;
+        for (let i = 0; i < 60; i++) {
+          const result = await p2p.read(cashiers[0], resultKey);
+          if (result && result.blindings) return result.blindings;
+          await WAIT(500);
+        }
+        dlog('Blinding request timed out — falling back to local');
+        const result = {};
+        for (const pos of positions) result[pos] = cd.b ? cd.b[playerIdx][pos] : 0n;
+        return result;
+      }
+
+      // ── DEAL HOLE CARDS ──
       let cardPos = 0;
       const holeCards = {};
-      const d0 = { deck: cd.finalDecks[0], b: cd.b[0], e: dd.e[0], key: playerData[0].sessionKey, init: playerData[0].initialDeck };
+      // Request all hole card blindings at once (2 per player × numPlayers)
+      const holePositions = [];
+      for (let i = 0; i < numPlayers * 2; i++) holePositions.push(i);
+      const holeBlindings = await requestBlindings(holePositions, 0);
+      const d0 = { deck: cd.finalDecks[0], e: dd.e[0], key: playerData[0].sessionKey, init: playerData[0].initialDeck };
       for (let i = 0; i < numPlayers; i++) {
         const cards = [];
         for (let c = 0; c < 2; c++) {
-          cards.push(decodeCard(d0.deck[cardPos], d0.b[cardPos], d0.e, dd.d, d0.key, d0.init));
+          cards.push(decodeCard(d0.deck[cardPos], holeBlindings[cardPos], d0.e, dd.d, d0.key, d0.init));
           cardPos++;
         }
         holeCards[activePlayers[i].id] = cards;
@@ -227,9 +258,11 @@ export function createP2PDealer(p2p, config, localNotify) {
         // Deal community cards if entering new street
         let streetDealt = false;
         if (game.phase === 'flop' && game.board.length === 0) {
+          const flopPositions = [revealPos, revealPos + 1, revealPos + 2];
+          const flopBlindings = await requestBlindings(flopPositions, 0);
           const cards = [];
           for (let i = 0; i < 3; i++) {
-            cards.push(decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init));
+            cards.push(decodeCard(d0.deck[revealPos], flopBlindings[revealPos], d0.e, dd.d, d0.key, d0.init));
             revealPos++;
           }
           dealBoard(game, cards);
@@ -237,13 +270,15 @@ export function createP2PDealer(p2p, config, localNotify) {
           notify('community_cards', { phase: 'flop', cards, board: game.board });
           streetDealt = true;
         } else if (game.phase === 'turn' && game.board.length === 3) {
-          const idx = decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init);
+          const turnBlindings = await requestBlindings([revealPos], 0);
+          const idx = decodeCard(d0.deck[revealPos], turnBlindings[revealPos], d0.e, dd.d, d0.key, d0.init);
           dealBoard(game, [idx]); revealPos++;
           dlog('Turn decoded: ' + cardToString(game.board[3]));
           notify('community_cards', { phase: 'turn', board: game.board });
           streetDealt = true;
         } else if (game.phase === 'river' && game.board.length === 4) {
-          const idx = decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init);
+          const riverBlindings = await requestBlindings([revealPos], 0);
+          const idx = decodeCard(d0.deck[revealPos], riverBlindings[revealPos], d0.e, dd.d, d0.key, d0.init);
           dealBoard(game, [idx]); revealPos++;
           dlog('River decoded: ' + cardToString(game.board[4]));
           notify('community_cards', { phase: 'river', board: game.board });
@@ -334,7 +369,8 @@ export function createP2PDealer(p2p, config, localNotify) {
         const nonFolded = game.players.filter(p => !p.folded);
         if (nonFolded.length > 1) {
           while (game.board.length < 5) {
-            const idx = decodeCard(d0.deck[revealPos], d0.b[revealPos], d0.e, dd.d, d0.key, d0.init);
+            const sdBlindings = await requestBlindings([revealPos], 0);
+            const idx = decodeCard(d0.deck[revealPos], sdBlindings[revealPos], d0.e, dd.d, d0.key, d0.init);
             dealBoard(game, [idx]); revealPos++;
           }
           await p2p.writeBoardCards(handId, { board: game.board.map(cardToString), phase: 'showdown' });

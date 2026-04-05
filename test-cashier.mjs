@@ -95,31 +95,47 @@ async function main() {
     }
     console.log('  Cashier responded: ' + tPoll + 'ms (' + pollCount + ' polls)');
 
-    // Read cashier decks — retry since cross-node mempool propagation takes time
+    // Read cashier decks only (no b values — those come per-card)
     const tRead0 = Date.now();
     const finalDecks = [];
-    const bValues = [];
     for (let i = 0; i < numPlayers; i++) {
-      let deckData = null, bData = null;
-      for (let retry = 0; retry < 20; retry++) {
-        if (!deckData) deckData = await p2p.read(CASHIER_ID, cashierResultKey + '.deck.' + i);
-        if (!bData) bData = await p2p.read(CASHIER_ID, cashierResultKey + '.b.' + i);
-        if (deckData && bData) break;
+      let deckData = null;
+      while (Date.now() - tRead0 < 50000) {
+        deckData = await p2p.read(CASHIER_ID, cashierResultKey + '.deck.' + i);
+        if (deckData && deckData.deck) break;
+        deckData = null;
         await WAIT(500);
       }
       finalDecks.push(deckData ? deckData.deck : null);
-      bValues.push(bData ? bData.b : null);
     }
     const tRead = Date.now() - tRead0;
     console.log('  Read decks: ' + tRead + 'ms');
 
-    // Verify: try to decode first card
+    // Request blinding for card position 0 to verify decode
     let decoded = '?';
-    if (finalDecks[0] && bValues[0]) {
+    if (finalDecks[0]) {
       try {
-        const cd = { finalDecks, b: bValues, sigma_Cashier: cashierMeta.sigma_Cashier };
-        const cardIdx = decodeCard(cd.finalDecks[0][0], cd.b[0][0], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
-        decoded = cardToString(cardIdx);
+        const reqTs = Date.now();
+        await p2p.write(TABLE_ID, 'chips.vrsc::poker.sg777z.t_reveal_request.' + handId, {
+          handId, positions: [0], playerIdx: 0, timestamp: reqTs
+        });
+        const tReveal0 = Date.now();
+        let revealResult = null;
+        const revealKey = 'chips.vrsc::poker.sg777z.c_reveal_result.' + handId + '.' + reqTs;
+        for (let r = 0; r < 60; r++) {
+          revealResult = await p2p.read(CASHIER_ID, revealKey);
+          if (revealResult && revealResult.blindings) break;
+          revealResult = null;
+          await WAIT(500);
+        }
+        const tReveal = Date.now() - tReveal0;
+        if (revealResult && revealResult.blindings[0] !== undefined) {
+          const cardIdx = decodeCard(finalDecks[0][0], revealResult.blindings[0], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
+          decoded = cardToString(cardIdx);
+          console.log('  Card reveal: ' + tReveal + 'ms');
+        } else {
+          decoded = 'REVEAL TIMEOUT';
+        }
       } catch (e) {
         decoded = 'ERROR: ' + e.message;
       }

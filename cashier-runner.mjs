@@ -61,6 +61,7 @@ async function main() {
 
   let lastProcessedHand = null;
   let lastSession = null;
+  const activeHands = new Map(); // handId → { b, sigma, lastRevealId }
 
   console.log('[CASHIER ' + MY_ID + '] Watching table ' + TABLE_ID + '...\n');
 
@@ -119,32 +120,59 @@ async function main() {
         const ms = Date.now() - t0;
         console.log('[CASHIER ' + MY_ID + '] Stage III done (' + ms + 'ms). Commitment: ' + cd.cashierCommitment.substring(0, 16) + '...');
 
-        // 3. Write meta FIRST (dealer polls for this), then decks sequentially
+        // 3. Write meta + blindedcards ONLY (per C code: cashier keeps b[] private)
         const t1 = Date.now();
         await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId, {
           cashier: MY_ID, handId: req.handId, session: req.session,
-          sigma_Cashier: cd.sigma_Cashier, cashierCommitment: cd.cashierCommitment,
+          cashierCommitment: cd.cashierCommitment,
           numPlayers: req.numPlayers, timestamp: Date.now()
         });
-        // Write deck/b data — dealer will retry-read these
+        // Write only the blinded cards (finalDecks) — NOT b values or sigma
         for (let i = 0; i < req.numPlayers; i++) {
           await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
             { player: i, deck: cd.finalDecks[i] });
-          await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.b.' + i,
-            { player: i, b: cd.b[i] });
         }
-        console.log('[CASHIER ' + MY_ID + '] Result written (' + (req.numPlayers * 2 + 1) + ' keys, ' + (Date.now() - t1) + 'ms)');
+        console.log('[CASHIER ' + MY_ID + '] Decks written (' + (req.numPlayers + 1) + ' keys, ' + (Date.now() - t1) + 'ms)');
+
+        // Store b values + sigma locally — revealed per-card during hand
+        activeHands.set(req.handId, { b: cd.b, sigma: cd.sigma_Cashier });
 
         lastProcessedHand = req.handId;
         lastSession = req.session;
       }
 
-      // 4. Check for settlement — verify and vote
+      // 4. Check for card reveal requests
+      for (const [handId, handData] of activeHands) {
+        const revealKey = 'chips.vrsc::poker.sg777z.t_reveal_request.' + handId;
+        const revealReq = await p2p.read(TABLE_ID, revealKey);
+        if (revealReq && revealReq.positions && !revealReq._processed) {
+          // Check if we already responded to this exact request
+          const reqId = revealReq.timestamp || 0;
+          if (handData.lastRevealId === reqId) continue;
+          handData.lastRevealId = reqId;
+
+          const positions = revealReq.positions; // array of card positions to reveal
+          const playerIdx = revealReq.playerIdx || 0;
+          const blindings = {};
+          for (const pos of positions) {
+            if (handData.b[playerIdx] && handData.b[playerIdx][pos] !== undefined) {
+              blindings[pos] = handData.b[playerIdx][pos];
+            }
+          }
+          // Write blinding values back
+          const revealResultKey = 'chips.vrsc::poker.sg777z.c_reveal_result.' + handId + '.' + reqId;
+          await p2p.write(MY_ID, revealResultKey, {
+            handId, playerIdx, positions, blindings, timestamp: Date.now()
+          });
+          console.log('[CASHIER ' + MY_ID + '] Revealed ' + positions.length + ' cards for player ' + playerIdx);
+        }
+      }
+
+      // 5. Clean up settled hands
       if (lastSession) {
         const settlement = await p2p.read(TABLE_ID, KEYS.SETTLEMENT + '.' + lastProcessedHand);
         if (settlement && settlement.verified !== undefined) {
-          // Already settled — we could write a vote here
-          // For now just log
+          activeHands.delete(lastProcessedHand);
         }
       }
 
