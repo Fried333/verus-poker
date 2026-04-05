@@ -114,17 +114,16 @@ export function createP2PDealer(p2p, config, localNotify) {
         // Write shuffle request for external cashier nodes
         // Split across keys — header + one key per player deck (each ~3.5KB)
         dlog('Sending Stage III to cashier: ' + cashiers[0]);
-        // Batch write: header + all player decks in ONE TX
-        const entries = [];
-        entries.push({ key: 'chips.vrsc::poker.sg777z.t_shuffle_request', data: {
+        // Write header first, then each player deck as separate TX (UTXO safe)
+        await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_shuffle_request', {
           handId, session: gameId, numPlayers, numCards, threshold, timestamp: Date.now()
-        }});
+        });
         for (let i = 0; i < numPlayers; i++) {
-          entries.push({ key: 'chips.vrsc::poker.sg777z.t_shuffle_deck.' + handId + '.p' + i,
-            data: { player: i, deck: dd.blindedDecks[i] }
-          });
+          await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_shuffle_deck.' + handId + '.p' + i,
+            { player: i, deck: dd.blindedDecks[i] }
+          );
+          dlog('Deck ' + i + ' written');
         }
-        await p2p.writeBatch(p2p.tableId, entries);
 
         // Wait for first cashier to respond (poll their identity)
         dlog('Waiting for cashier response...');

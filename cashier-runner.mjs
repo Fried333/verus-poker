@@ -14,6 +14,9 @@ import { join } from 'path';
 
 const WAIT = ms => new Promise(r => setTimeout(r, ms));
 
+process.on('uncaughtException', (err) => { console.error('[CASHIER CRASH]', err.message, err.stack); });
+process.on('unhandledRejection', (err) => { console.error('[CASHIER UNHANDLED]', err?.message || err); });
+
 const args = Object.fromEntries(
   process.argv.slice(2).filter(a => a.startsWith('--')).map(a => {
     const [k, v] = a.substring(2).split('=');
@@ -99,23 +102,20 @@ async function main() {
         const ms = Date.now() - t0;
         console.log('[CASHIER ' + MY_ID + '] Stage III done (' + ms + 'ms). Commitment: ' + cd.cashierCommitment.substring(0, 16) + '...');
 
-        // 3. Write result — batch all keys in ONE TX
-        const resultEntries = [];
-        resultEntries.push({ key: KEYS.CASHIER_RESULT + '.' + req.handId, data: {
+        // 3. Write result — sequential writes, 1 TX per key (safe for UTXO + size limits)
+        const t1 = Date.now();
+        await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId, {
           cashier: MY_ID, handId: req.handId, session: req.session,
           sigma_Cashier: cd.sigma_Cashier, cashierCommitment: cd.cashierCommitment,
           numPlayers: req.numPlayers, timestamp: Date.now()
-        }});
+        });
         for (let i = 0; i < req.numPlayers; i++) {
-          resultEntries.push({ key: KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
-            data: { player: i, deck: cd.finalDecks[i] }
-          });
-          resultEntries.push({ key: KEYS.CASHIER_RESULT + '.' + req.handId + '.b.' + i,
-            data: { player: i, b: cd.b[i] }
-          });
+          await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
+            { player: i, deck: cd.finalDecks[i] });
+          await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.b.' + i,
+            { player: i, b: cd.b[i] });
         }
-        await p2p.writeBatch(MY_ID, resultEntries);
-        console.log('[CASHIER ' + MY_ID + '] Result written (' + resultEntries.length + ' keys, 1 TX)');
+        console.log('[CASHIER ' + MY_ID + '] Result written (' + (req.numPlayers * 2 + 1) + ' keys, ' + (Date.now() - t1) + 'ms)');
 
         lastProcessedHand = req.handId;
         lastSession = req.session;
@@ -132,6 +132,7 @@ async function main() {
 
     } catch (e) {
       console.log('[CASHIER ' + MY_ID + '] Error: ' + e.message);
+      if (e.stack) console.log(e.stack);
     }
 
     await WAIT(2000);
