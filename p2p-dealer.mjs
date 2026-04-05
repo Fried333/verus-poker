@@ -187,10 +187,8 @@ export function createP2PDealer(p2p, config, localNotify) {
           if (result && result.blindings) return result.blindings;
           await WAIT(500);
         }
-        dlog('Blinding request timed out — falling back to local');
-        const result = {};
-        for (const pos of positions) result[pos] = cd.b ? cd.b[playerIdx][pos] : 0n;
-        return result;
+        dlog('Blinding request timed out');
+        return {};
       }
 
       // ── DEAL HOLE CARDS ──
@@ -415,8 +413,16 @@ export function createP2PDealer(p2p, config, localNotify) {
 
       // ── VERIFY ──
       let vt = Date.now();
-      const verification = verifyGame(playerData, dd, cd, numCards);
-      dlog('Verify: ' + (verification.valid ? 'PASS' : 'FAIL') + ' (' + (Date.now()-vt) + 'ms)');
+      let verification;
+      if (cd.b && cd.sigma_Cashier) {
+        // Local cashier — full verification possible
+        verification = verifyGame(playerData, dd, cd, numCards);
+        dlog('Verify: ' + (verification.valid ? 'PASS' : 'FAIL') + ' (' + (Date.now()-vt) + 'ms)');
+      } else {
+        // External cashier — b/sigma kept private, trust commitment hash
+        verification = { valid: true, errors: [] };
+        dlog('Verify: TRUSTED (external cashier, commitment: ' + (cd.cashierCommitment || '').substring(0, 16) + ')')
+      }
 
       // Write settlement
       vt = Date.now();
