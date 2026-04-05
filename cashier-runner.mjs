@@ -99,20 +99,23 @@ async function main() {
         const ms = Date.now() - t0;
         console.log('[CASHIER ' + MY_ID + '] Stage III done (' + ms + 'ms). Commitment: ' + cd.cashierCommitment.substring(0, 16) + '...');
 
-        // 3. Write result — split per player to stay under size limits
-        const metaKey = KEYS.CASHIER_RESULT + '.' + req.handId;
-        await p2p.write(MY_ID, metaKey, {
+        // 3. Write result — batch all keys in ONE TX
+        const resultEntries = [];
+        resultEntries.push({ key: KEYS.CASHIER_RESULT + '.' + req.handId, data: {
           cashier: MY_ID, handId: req.handId, session: req.session,
           sigma_Cashier: cd.sigma_Cashier, cashierCommitment: cd.cashierCommitment,
           numPlayers: req.numPlayers, timestamp: Date.now()
-        });
+        }});
         for (let i = 0; i < req.numPlayers; i++) {
-          const deckKey = KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i;
-          await p2p.write(MY_ID, deckKey, { player: i, deck: cd.finalDecks[i] });
-          const bKey = KEYS.CASHIER_RESULT + '.' + req.handId + '.b.' + i;
-          await p2p.write(MY_ID, bKey, { player: i, b: cd.b[i] });
+          resultEntries.push({ key: KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
+            data: { player: i, deck: cd.finalDecks[i] }
+          });
+          resultEntries.push({ key: KEYS.CASHIER_RESULT + '.' + req.handId + '.b.' + i,
+            data: { player: i, b: cd.b[i] }
+          });
         }
-        console.log('[CASHIER ' + MY_ID + '] Result written (' + (req.numPlayers * 2 + 1) + ' keys)');
+        await p2p.writeBatch(MY_ID, resultEntries);
+        console.log('[CASHIER ' + MY_ID + '] Result written (' + resultEntries.length + ' keys, 1 TX)');
 
         lastProcessedHand = req.handId;
         lastSession = req.session;
