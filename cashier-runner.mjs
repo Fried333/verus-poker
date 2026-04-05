@@ -71,6 +71,12 @@ async function main() {
       if (req) console.log('[CASHIER ' + MY_ID + '] Read shuffle req: handId=' + (req.handId || 'none') + ' last=' + lastProcessedHand);
 
       if (req && req.handId && req.handId !== lastProcessedHand) {
+        // Skip stale requests (older than 30s)
+        if (req.timestamp && Date.now() - req.timestamp > 30000) {
+          console.log('[CASHIER ' + MY_ID + '] Skipping stale request: ' + req.handId + ' (' + Math.round((Date.now() - req.timestamp) / 1000) + 's old)');
+          lastProcessedHand = req.handId;
+          continue;
+        }
         console.log('[CASHIER ' + MY_ID + '] Shuffle request: hand=' + req.handId + ' players=' + req.numPlayers);
 
         // Read each player's blinded deck

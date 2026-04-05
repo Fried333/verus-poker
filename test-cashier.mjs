@@ -13,7 +13,7 @@ import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 
 const WAIT = ms => new Promise(r => setTimeout(r, ms));
-const HANDS = parseInt(process.argv.find(a => a.startsWith('--hands='))?.split('=')[1] || '5');
+const HANDS = parseInt(process.argv.find(a => a.startsWith('--hands='))?.split('=')[1] || '20');
 const TABLE_ID = 'ptable2';
 const CASHIER_ID = 'cashier1';
 
@@ -111,23 +111,7 @@ async function main() {
 
     // Verify: try to decode first card
     let decoded = '?';
-    console.log('  DEBUG: finalDecks[0]=' + (finalDecks[0] ? 'has ' + finalDecks[0].length + ' cards' : 'NULL'));
-    console.log('  DEBUG: bValues[0]=' + (bValues[0] ? 'has ' + bValues[0].length + ' values' : 'NULL'));
     if (finalDecks[0] && bValues[0]) {
-      // Debug: check types after chain round-trip
-      const fd0 = finalDecks[0][0];
-      const bv0 = bValues[0][0];
-      const e0 = dd.e[0];
-      const d0 = dd.d;
-      const sk = playerData[0].sessionKey;
-      console.log('  DEBUG types: fd0=' + typeof fd0 + ' bv0=' + typeof bv0 + ' e0=' + typeof e0 + ' d0=' + typeof d0 + ' sk=' + typeof sk);
-      console.log('  DEBUG vals: fd0=' + String(fd0).substring(0, 20) + ' bv0=' + String(bv0).substring(0, 20));
-
-      // Also try local cashier shuffle for comparison
-      const localCd = cashierShuffle(dd.blindedDecks, numPlayers, numCards, threshold);
-      const localCard = decodeCard(localCd.finalDecks[0][0], localCd.b[0][0], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
-      console.log('  LOCAL decode: ' + cardToString(localCard) + ' (type fd0=' + typeof localCd.finalDecks[0][0] + ' bv0=' + typeof localCd.b[0][0] + ')');
-
       try {
         const cd = { finalDecks, b: bValues, sigma_Cashier: cashierMeta.sigma_Cashier };
         const cardIdx = decodeCard(cd.finalDecks[0][0], cd.b[0][0], dd.e[0], dd.d, playerData[0].sessionKey, playerData[0].initialDeck);
