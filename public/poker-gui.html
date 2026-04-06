@@ -431,15 +431,15 @@ function render() {
     }
   }
 
-  // Winner banner — show for 4 seconds then auto-hide
+  // Winner banner — show when winner exists, hide otherwise
   const banner = document.getElementById('winner-banner');
-  if (st.winner) {
+  if (st.winner && st.phase === 'settled') {
     banner.querySelector('.wb-title').textContent = (st.winner.name || 'Winner') + ' wins!';
     banner.querySelector('.wb-detail').textContent =
       (st.winner.handName ? st.winner.handName + ' — ' : '') + '+' + st.winner.amount + ' chips';
     banner.style.display = 'block';
-    clearTimeout(window._bannerTimer);
-    window._bannerTimer = setTimeout(() => { banner.style.display = 'none'; }, 4000);
+  } else {
+    banner.style.display = 'none';
   }
 
   // Action log — color-coded by type

@@ -290,6 +290,7 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             state.winner = null; state.verified = null;
             state.showdownCards = {}; state.handNames = {};
             state.message = 'Hand #' + state.handCount + ' — shuffling...';
+            state.busted = false; // If we're dealt in, we have chips
             state.players.forEach(p => { p.bet = 0; p.folded = false; });
             lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
             notify();
@@ -346,6 +347,12 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
                 }
                 gp.chips = bp.chips; gp.bet = bp.bet || 0; gp.folded = !!bp.folded;
                 if (bp.seat !== undefined) gp.seat = bp.seat;
+              }
+              // Clear busted if we have chips now (reload worked)
+              const me = state.players.find(p => p.id === myId);
+              if (me && me.chips > 0 && state.busted) {
+                state.busted = false;
+                log('No longer busted — chips: ' + me.chips);
               }
             }
 
