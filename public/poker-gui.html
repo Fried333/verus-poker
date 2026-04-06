@@ -431,15 +431,19 @@ function render() {
     }
   }
 
-  // Winner banner — show when winner exists, hide otherwise
+  // Winner banner — show once on settlement, auto-hide after 5s
   const banner = document.getElementById('winner-banner');
-  if (st.winner && st.phase === 'settled') {
+  if (st.winner && st.phase === 'settled' && !window._bannerShownForHand) {
     banner.querySelector('.wb-title').textContent = (st.winner.name || 'Winner') + ' wins!';
     banner.querySelector('.wb-detail').textContent =
       (st.winner.handName ? st.winner.handName + ' — ' : '') + '+' + st.winner.amount + ' chips';
     banner.style.display = 'block';
-  } else {
+    window._bannerShownForHand = true;
+    clearTimeout(window._bannerTimer);
+    window._bannerTimer = setTimeout(() => { banner.style.display = 'none'; }, 5000);
+  } else if (!st.winner || st.phase !== 'settled') {
     banner.style.display = 'none';
+    if (st.phase === 'shuffling' || st.phase === 'preflop') window._bannerShownForHand = false;
   }
 
   // Action log — color-coded by type
