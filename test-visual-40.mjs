@@ -13,18 +13,18 @@ async function main() {
   await p28.goto('http://46.225.132.28:3001', { waitUntil: 'load' });
   await p59.goto('https://verus.cx/poker/', { waitUntil: 'load' });
   await sleep(5000);
-  
+
   const P = [['local', local], ['p28', p28], ['p59', p59]];
   let issues = [], acts = { local: 0, p28: 0, p59: 0 }, reloads = 0;
+  function getHandNum(text) { const m = (text || '').match(/\d+/); return m ? parseInt(m[0]) : 0; }
 
   for (let h = 1; h <= 40; h++) {
     process.stdout.write('H' + h + ': ');
 
-    // Poll until buttons appear — no timeout, just keep going
+    // Handle busted + wait for buttons
     let gotButtons = false;
     while (!gotButtons) {
       for (const [n, pg] of P) {
-        // Handle busted
         const ctrl = await pg.$eval('#controls', e => e.textContent.trim()).catch(() => '');
         if (ctrl.includes('Out of chips')) {
           await pg.click('#controls button').catch(() => {});
@@ -34,15 +34,14 @@ async function main() {
           continue;
         }
         const btns = await pg.$$eval('#controls button', b => b.map(x => x.textContent.trim())).catch(() => []);
-        if (btns.length > 0 && !btns[0].includes('Reload') && !btns[0].includes('Sit In')) {
-          gotButtons = true;
-          break;
-        }
+        if (btns.length > 0 && !btns[0].includes('Reload') && !btns[0].includes('Sit In')) { gotButtons = true; break; }
       }
       if (!gotButtons) await sleep(2000);
     }
 
-    // CHECKS
+    const startHand = getHandNum(await local.$eval('#ti-hand', e => e.textContent).catch(() => ''));
+
+    // CHECKS at hand start
     for (const [n, pg] of P) {
       const s = await pg.evaluate(() => ({
         banner: document.getElementById('winner-banner')?.style.display !== 'none',
@@ -52,12 +51,13 @@ async function main() {
       if (s.undef) issues.push('H' + h + ' ' + n + ': undefined in seat');
     }
 
-    // Play random
-    let done = false;
-    for (let a = 0; a < 20 && !done; a++) {
+    // Play random actions
+    for (let a = 0; a < 20; a++) {
+      let anyButtons = false;
       for (const [n, pg] of P) {
         const btns = await pg.$$eval('#controls button', b => b.map(x => x.textContent.trim())).catch(() => []);
         if (btns.length > 0 && !btns[0].includes('Reload') && !btns[0].includes('Sit In')) {
+          anyButtons = true;
           const rnd = Math.random();
           let btn;
           if (rnd < 0.35) btn = await pg.$('button.btn-check') || await pg.$('button.btn-call');
@@ -68,23 +68,31 @@ async function main() {
           if (btn) { await btn.click().catch(() => {}); acts[n]++; }
           await sleep(800);
         }
-        done = await pg.evaluate(() => {
-          const ban = document.getElementById('winner-banner');
-          return (ban && ban.style.display !== 'none') || document.getElementById('hand-info')?.textContent === 'settled';
-        }).catch(() => false);
-        if (done) break;
       }
-      if (!done) await sleep(2000);
+      if (!anyButtons) break; // No buttons on any page — hand probably ended
+      await sleep(1000);
     }
 
-    // Check log
+    // Wait for hand to end — poll until hand count changes (max 60s)
+    let done = false;
+    for (let i = 0; i < 30; i++) {
+      const curHand = getHandNum(await local.$eval('#ti-hand', e => e.textContent).catch(() => ''));
+      const banner = await local.evaluate(() => document.getElementById('winner-banner')?.style.display !== 'none').catch(() => false);
+      const phase = await local.$eval('#hand-info', e => e.textContent).catch(() => '');
+      if (curHand > startHand || banner || phase === 'settled') { done = true; break; }
+      await sleep(2000);
+    }
+
+    // Check log for undefined
     const logUndef = await local.evaluate(() => {
       const log = document.getElementById('action-log');
       return log ? [...log.querySelectorAll('div')].some(d => d.textContent.includes('undefined')) : false;
     }).catch(() => false);
     if (logUndef) issues.push('H' + h + ': undefined in log');
 
-    console.log(done ? 'ok' : 'timeout');
+    console.log(done ? 'ok' : 'TIMEOUT');
+    if (!done) issues.push('H' + h + ': hand never ended');
+
     if (issues.length > 0) {
       console.log('\nSTOPPED at hand ' + h + ':');
       issues.forEach(i => console.log('  ' + i));
