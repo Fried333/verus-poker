@@ -194,10 +194,12 @@ export function createP2PDealer(p2p, config, localNotify) {
       // ── DEAL HOLE CARDS ──
       let cardPos = 0;
       const holeCards = {};
-      // Request all hole card blindings at once (2 per player × numPlayers)
-      const holePositions = [];
-      for (let i = 0; i < numPlayers * 2; i++) holePositions.push(i);
-      const holeBlindings = await requestBlindings(holePositions, 0);
+      // Request ALL blindings upfront: hole cards + community cards (2N + 5 positions)
+      // DCV doesn't play so knowing future cards doesn't compromise security
+      const allPositions = [];
+      for (let i = 0; i < numPlayers * 2 + 5; i++) allPositions.push(i);
+      const allBlindings = await requestBlindings(allPositions, 0);
+      const holeBlindings = allBlindings;
       const d0 = { deck: cd.finalDecks[0], e: dd.e[0], key: playerData[0].sessionKey, init: playerData[0].initialDeck };
       dlog('DEBUG: deck[0] type=' + typeof d0.deck[0] + ' blinding[0] type=' + typeof holeBlindings[0] + ' e type=' + typeof d0.e);
       dlog('DEBUG: blinding keys=' + Object.keys(holeBlindings).join(',') + ' count=' + Object.keys(holeBlindings).length);
@@ -270,11 +272,10 @@ export function createP2PDealer(p2p, config, localNotify) {
         // Deal community cards if entering new street
         let streetDealt = false;
         if (game.phase === 'flop' && game.board.length === 0) {
-          const flopPositions = [revealPos, revealPos + 1, revealPos + 2];
-          const flopBlindings = await requestBlindings(flopPositions, 0);
           const cards = [];
           for (let i = 0; i < 3; i++) {
-            cards.push(decodeCard(d0.deck[revealPos], flopBlindings[revealPos], d0.e, dd.d, d0.key, d0.init));
+            const bl = allBlindings[revealPos];
+            cards.push(bl ? decodeCard(d0.deck[revealPos], bl, d0.e, dd.d, d0.key, d0.init) : -1);
             revealPos++;
           }
           dealBoard(game, cards);
@@ -282,15 +283,15 @@ export function createP2PDealer(p2p, config, localNotify) {
           notify('community_cards', { phase: 'flop', cards, board: game.board });
           streetDealt = true;
         } else if (game.phase === 'turn' && game.board.length === 3) {
-          const turnBlindings = await requestBlindings([revealPos], 0);
-          const idx = decodeCard(d0.deck[revealPos], turnBlindings[revealPos], d0.e, dd.d, d0.key, d0.init);
+          const bl = allBlindings[revealPos];
+          const idx = bl ? decodeCard(d0.deck[revealPos], bl, d0.e, dd.d, d0.key, d0.init) : -1;
           dealBoard(game, [idx]); revealPos++;
           dlog('Turn decoded: ' + cardToString(game.board[3]));
           notify('community_cards', { phase: 'turn', board: game.board });
           streetDealt = true;
         } else if (game.phase === 'river' && game.board.length === 4) {
-          const riverBlindings = await requestBlindings([revealPos], 0);
-          const idx = decodeCard(d0.deck[revealPos], riverBlindings[revealPos], d0.e, dd.d, d0.key, d0.init);
+          const bl = allBlindings[revealPos];
+          const idx = bl ? decodeCard(d0.deck[revealPos], bl, d0.e, dd.d, d0.key, d0.init) : -1;
           dealBoard(game, [idx]); revealPos++;
           dlog('River decoded: ' + cardToString(game.board[4]));
           notify('community_cards', { phase: 'river', board: game.board });
@@ -381,8 +382,8 @@ export function createP2PDealer(p2p, config, localNotify) {
         const nonFolded = game.players.filter(p => !p.folded);
         if (nonFolded.length > 1) {
           while (game.board.length < 5) {
-            const sdBlindings = await requestBlindings([revealPos], 0);
-            const idx = decodeCard(d0.deck[revealPos], sdBlindings[revealPos], d0.e, dd.d, d0.key, d0.init);
+            const bl = allBlindings[revealPos];
+            const idx = bl ? decodeCard(d0.deck[revealPos], bl, d0.e, dd.d, d0.key, d0.init) : -1;
             dealBoard(game, [idx]); revealPos++;
           }
           await p2p.writeBoardCards(handId, { board: game.board.map(cardToString), phase: 'showdown' });
