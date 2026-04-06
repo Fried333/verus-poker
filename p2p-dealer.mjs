@@ -204,9 +204,15 @@ export function createP2PDealer(p2p, config, localNotify) {
       for (let i = 0; i < numPlayers; i++) {
         const cards = [];
         for (let c = 0; c < 2; c++) {
-          const raw = decodeCard(d0.deck[cardPos], holeBlindings[cardPos], d0.e, dd.d, d0.key, d0.init);
-          dlog('DEBUG: pos=' + cardPos + ' raw=' + raw + ' card=' + cardToString(raw));
-          cards.push(raw);
+          const blinding = holeBlindings[cardPos];
+          if (blinding === undefined || blinding === null) {
+            dlog('ERROR: missing blinding for pos=' + cardPos);
+            cards.push(-1);
+          } else {
+            const raw = decodeCard(d0.deck[cardPos], blinding, d0.e, dd.d, d0.key, d0.init);
+            dlog('DEBUG: pos=' + cardPos + ' raw=' + raw + ' card=' + cardToString(raw));
+            cards.push(raw);
+          }
           cardPos++;
         }
         holeCards[activePlayers[i].id] = cards;
@@ -331,7 +337,7 @@ export function createP2PDealer(p2p, config, localNotify) {
         action = await new Promise(resolve => {
           notify('need_action', { resolve, validActions, toCall, seat, playerId: p.id, pot: game.pot, minRaise: game.minRaise,
             phase: game.phase, handId, bsSeq, gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })) });
-          setTimeout(() => resolve(null), 30000);
+          setTimeout(() => resolve(null), 120000);
         });
 
         const pollMs = Date.now() - pollStart;
