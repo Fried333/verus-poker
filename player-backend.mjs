@@ -356,11 +356,18 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
               }
             }
 
-            // Action log from opponent
-            if (bs.lastAction && bs.lastAction.player !== myId) {
-              const msg = bs.lastAction.player + ' ' + bs.lastAction.action + (bs.lastAction.amount ? ' ' + bs.lastAction.amount : '');
-              addActionLog(msg);
-              log(msg);
+            // Action log from opponent (or self if timed out)
+            if (bs.lastAction) {
+              const isMe = bs.lastAction.player === myId;
+              const timedOut = bs.lastAction.timeout;
+              let msg;
+              if (timedOut) {
+                msg = bs.lastAction.player + ' TIMED OUT' + (bs.lastAction.action === 'fold' ? ' (folded)' : ' (checked)');
+                if (isMe) state.message = 'You timed out!';
+              } else if (!isMe) {
+                msg = bs.lastAction.player + ' ' + bs.lastAction.action + (bs.lastAction.amount ? ' ' + bs.lastAction.amount : '');
+              }
+              if (msg) { addActionLog(msg); log(msg); }
             }
 
             // Reset acted when new BS sequence arrives (different from what we acted on)

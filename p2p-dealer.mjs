@@ -342,7 +342,7 @@ export function createP2PDealer(p2p, config, localNotify) {
 
         const pollMs = Date.now() - pollStart;
         if (!action) {
-          action = { action: validActions.includes(CHECK) ? CHECK : FOLD, amount: 0 };
+          action = { action: validActions.includes(CHECK) ? CHECK : FOLD, amount: 0, timeout: true };
           dlog(p.id + ' timed out → ' + action.action + ' (waited ' + (pollMs/1000).toFixed(1) + 's)');
           // Track consecutive timeouts — sit out after MAX_TIMEOUTS
           const pp = players.find(x => x.id === p.id);
@@ -365,7 +365,7 @@ export function createP2PDealer(p2p, config, localNotify) {
           action = { action: FOLD, amount: 0 };
         }
         playerAction(game, seat, action.action, action.amount || 0);
-        lastActionInfo = { player: p.id, action: action.action, amount: action.amount || 0 };
+        lastActionInfo = { player: p.id, action: action.action, amount: action.amount || 0, timeout: !!action.timeout };
         notify('action', { player: p.id, action: action.action, amount: action.amount,
           gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })),
           pot: game.pot, phase: game.phase });
