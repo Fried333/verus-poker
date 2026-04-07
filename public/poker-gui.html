@@ -159,12 +159,20 @@ body {
 .wb-title { color: var(--gold); font-size: 18px; font-weight: bold; }
 .wb-detail { color: #ccc; font-size: 13px; margin-top: 4px; }
 
+/* ══════ TURN TIMER ══════ */
+#turn-timer { position: absolute; bottom: 0; left: 0; right: 0; height: 4px; background: rgba(0,0,0,0.3); }
+#turn-timer-bar { height: 100%; background: #4caf50; transition: width 1s linear, background-color 0.5s; }
+#turn-timer-bar.warning { background: #ff9800; }
+#turn-timer-bar.critical { background: #f44336; }
+#turn-timer-text { position: absolute; bottom: 8px; right: 8px; font-size: 12px; color: #aaa; font-family: monospace; }
+
 /* ══════ BOTTOM BAR ══════ */
 #bottom-bar {
   display: flex;
   align-items: center;
   background: #0a1a0a;
   padding: 10px 14px;
+  position: relative;
   min-height: 70px;
   flex-shrink: 0;
 }
@@ -227,6 +235,8 @@ body {
     <span id="ti-table" style="color:#4caf50"></span>
     <span id="ti-blinds" style="margin-left:8px"></span>
     <span id="ti-hand" style="margin-left:8px;color:#ffd700"></span>
+    <span id="ti-handid" style="margin-left:8px;color:#888;font-size:10px"></span>
+    <span id="ti-session" style="margin-left:8px;color:#888;font-size:10px"></span>
     <span id="ti-mode" style="margin-left:8px"></span>
     <span id="ti-verify" style="margin-left:8px;color:#4caf50"></span>
   </div>
@@ -333,14 +343,27 @@ function connect() {
 // ══════════════════════════════════════
 // RENDER
 // ══════════════════════════════════════
+// Fixed positions for all 9 seats (used when showing empty seats for selection)
+const SEAT_POS_9 = [
+  {x:50,y:90},{x:15,y:78},{x:3,y:48},{x:10,y:14},{x:35,y:4},
+  {x:65,y:4},{x:90,y:14},{x:97,y:48},{x:85,y:78}
+];
+const MAX_SEATS = 9;
+
 function render() {
   if (!st) return;
   const felt = document.getElementById('felt');
   const activePlayers = st.players.filter(p => p.id);
   const np = activePlayers.length;
-  // Find my INDEX in the active players array (not seat number)
-  const myIndex = activePlayers.findIndex(p => p.id === myId);
-  const positions = getPositions(np, myIndex >= 0 ? myIndex : 0);
+  // Use FIXED 9-seat positions (SEAT_POS_9), rotated so my seat is at the bottom.
+  // This way occupied players and empty Sit Here buttons share the same layout —
+  // no overlapping. If I'm not seated, default rotation = no rotation (seat 0 bottom).
+  const me = activePlayers.find(p => p.id === myId);
+  const mySeatNum = me ? me.seat : 0;
+  function posForSeat(seat) {
+    const rotated = ((seat - mySeatNum) + MAX_SEATS) % MAX_SEATS;
+    return SEAT_POS_9[rotated];
+  }
   const cx = 50, cy = 45;
 
   // Clear old elements
@@ -350,13 +373,27 @@ function render() {
   document.getElementById('pot-display').textContent = st.pot > 0 ? 'Pot: ' + st.pot : '';
 
   // Hand info (phase text below board, not overlapping)
+  // Show big readable text for between-hand states so the user knows what's happening
   const phaseText = st.phase || '';
-  document.getElementById('hand-info').textContent = phaseText !== 'waiting' ? phaseText : '';
+  const handInfoEl = document.getElementById('hand-info');
+  if (phaseText === 'shuffling') {
+    handInfoEl.innerHTML = '<div style="font-size:18px;color:#ffd700;font-weight:bold">SHUFFLING' + (st.handCount ? ' Hand #' + st.handCount : '') + '...</div>';
+  } else if (phaseText === 'waiting' && (!st.players || st.players.length === 0)) {
+    handInfoEl.innerHTML = '<div style="font-size:14px;color:#888">Waiting for players...</div>';
+  } else if (phaseText === 'waiting') {
+    handInfoEl.innerHTML = '<div style="font-size:14px;color:#888">Waiting for next hand...</div>';
+  } else if (phaseText === 'settled') {
+    handInfoEl.innerHTML = '<div style="font-size:13px;color:#aaa">Hand settled</div>';
+  } else {
+    handInfoEl.textContent = phaseText !== 'waiting' ? phaseText : '';
+  }
 
   // Table info bar
   document.getElementById('ti-table').textContent = st.table || '';
   document.getElementById('ti-blinds').textContent = st.smallBlind ? st.smallBlind + '/' + st.bigBlind : '';
   document.getElementById('ti-hand').textContent = st.handCount > 0 ? 'Hand #' + st.handCount : '';
+  document.getElementById('ti-handid').textContent = st.handId ? 'id=' + st.handId : '';
+  document.getElementById('ti-session').textContent = st.session ? 'sess=' + st.session : '';
   document.getElementById('ti-mode').textContent = st.mode ? '(' + st.mode + ')' : '';
   document.getElementById('ti-verify').textContent = st.verified === true ? 'Verified' : st.verified === false ? 'FAILED' : '';
 
@@ -374,7 +411,7 @@ function render() {
   // Players
   for (let i = 0; i < np; i++) {
     const p = activePlayers[i];
-    const pos = positions[i];
+    const pos = posForSeat(p.seat);
     const isMe = p.id === myId;
     const isActive = st.actions && isMe; // my turn
     const isWinner = st.winner && st.winner.seats && st.winner.seats.includes(p.seat);
@@ -431,6 +468,26 @@ function render() {
     }
   }
 
+  // Empty seat slots — clickable when I'm sitting out / not yet seated.
+  // Uses the SAME posForSeat() rotation as the occupied players, so empty
+  // seats appear at the same positions as occupied ones (no overlap).
+  if (st.sittingOut) {
+    const occupiedSeats = new Set(activePlayers.map(p => p.seat).filter(s => s !== undefined));
+    for (let s = 0; s < MAX_SEATS; s++) {
+      if (occupiedSeats.has(s)) continue;
+      const pos = posForSeat(s);
+      const el = document.createElement('div');
+      el.className = 'seat empty-seat';
+      el.style.left = pos.x + '%';
+      el.style.top = pos.y + '%';
+      el.innerHTML =
+        '<button onclick="pickSeat(' + s + ')" style="background:rgba(0,0,0,0.5);border:2px dashed rgba(255,255,255,0.3);border-radius:6px;padding:8px 14px;cursor:pointer;color:#aaa;font-size:11px;min-width:64px;font-weight:bold">' +
+          'Sit Here<br><span style="font-size:9px;color:#888">seat ' + (s+1) + '</span>' +
+        '</button>';
+      felt.appendChild(el);
+    }
+  }
+
   // Winner banner — show once on settlement, auto-hide after 5s
   const banner = document.getElementById('winner-banner');
   if (st.winner && st.phase === 'settled' && !window._bannerShownForHand) {
@@ -470,6 +527,13 @@ function render() {
   }
   logEl.scrollTop = logEl.scrollHeight;
 
+  // Turn timer
+  if (st.actions && st.actions.turnStart) {
+    startTurnTimer(st.actions.turnStart, st.actions.turnTimeout || 120);
+  } else {
+    stopTurnTimer();
+  }
+
   // Controls
   renderControls();
 }
@@ -486,11 +550,14 @@ function renderControls() {
     return;
   }
 
-  // Reloaded but sitting out — show sit in button
+  // Sit-in button — only show if I am EXPLICITLY sitting out (clicked Sit Out
+  // or am not yet seated). Between-hands "waiting" state does NOT show this.
   const me = st.players.find(p => p.id === myId);
-  if (me && me.chips > 0 && st.message && st.message.includes('Sit In')) {
+  const inHand = st.myCards && st.myCards.length > 0;
+  const myTurn = !!st.actions;
+  if (st.sittingOut && me && me.chips > 0) {
     el.innerHTML =
-      '<span class="wait-text">' + me.chips + ' chips</span>' +
+      '<span class="wait-text">' + me.chips + ' chips — sitting out</span>' +
       '<button class="btn-check" onclick="doSitIn()" style="margin-left:10px">Sit In</button>';
     return;
   }
@@ -512,19 +579,69 @@ function renderControls() {
       html += '<input id="raise-input" type="number" min="'+minR+'" max="'+maxR+'" value="'+minR+'" step="1" oninput="if(document.getElementById(\'raise-slider\'))document.getElementById(\'raise-slider\').value=this.value" style="width:50px;padding:2px;border-radius:3px;border:1px solid #555;background:#222;color:#fff;text-align:center;font-size:12px">';
       html += '</div>';
     }
-    // Buttons
+    // Buttons row — All In is separated and confirmed to prevent misclicks
     html += '<div style="display:flex;gap:6px;align-items:center">';
     if (va.includes('fold')) html += '<button class="btn-fold" onclick="act(\'fold\')">Fold</button>';
     if (va.includes('check')) html += '<button class="btn-check" onclick="act(\'check\')">Check</button>';
     if (va.includes('call')) html += '<button class="btn-call" onclick="act(\'call\')">Call ' + Math.min(toCall, myChips) + '</button>';
-    if (va.includes('raise')) html += '<button class="btn-raise" onclick="doRaise()">' + (toCall ? 'Raise' : 'Bet') + '</button>';
-    if (va.includes('allin')) html += '<button class="btn-allin" onclick="act(\'allin\')">All In</button>';
+    if (va.includes('raise')) {
+      // First voluntary chips in on a street is a Bet; increasing an existing bet is a Raise.
+      // Check availability is the cleanest signal: if you can check, nothing's owed → Bet.
+      const isBet = va.includes('check');
+      html += '<button class="btn-raise" onclick="doRaise()">' + (isBet ? 'Bet' : 'Raise') + '</button>';
+    }
+    if (va.includes('allin')) {
+      // Visual separator (gap from raise input) to reduce misclicks
+      html += '<span style="display:inline-block;width:18px"></span>';
+      html += '<button class="btn-allin" onclick="act(\'allin\')" style="border:2px solid #d32f2f">All In</button>';
+    }
     html += '</div></div>';
     el.innerHTML = html;
+  } else if (me && me.chips > 0) {
+    // Not my turn (or between hands) — show a small Sit Out button so the
+    // user can preemptively sit out the next hand. (Sit In is handled above
+    // by the sittingOut branch.)
+    el.innerHTML = '<button class="btn-fold" onclick="doSitOut()" style="opacity:0.6;font-size:11px" title="Skip future hands until you click Sit In">Sit Out</button>';
   } else {
-    // No buttons — clear controls (action log handles all status)
+    // No chips and not busted — nothing actionable
     el.innerHTML = '';
   }
+}
+
+// ══════════════════════════════════════
+// TURN TIMER
+// ══════════════════════════════════════
+let timerInterval = null;
+
+function startTurnTimer(turnStart, turnTimeout) {
+  stopTurnTimer();
+  const bar = document.getElementById('bottom-bar');
+  if (!document.getElementById('turn-timer')) {
+    bar.insertAdjacentHTML('beforeend', '<div id="turn-timer"><div id="turn-timer-bar" style="width:100%"></div></div><div id="turn-timer-text"></div>');
+  }
+  const timerBar = document.getElementById('turn-timer-bar');
+  const timerText = document.getElementById('turn-timer-text');
+  timerBar.style.width = '100%';
+  timerBar.className = '';
+  timerInterval = setInterval(() => {
+    const elapsed = (Date.now() - turnStart) / 1000;
+    const remaining = Math.max(0, turnTimeout - elapsed);
+    const pct = (remaining / turnTimeout) * 100;
+    timerBar.style.width = pct + '%';
+    timerText.textContent = Math.ceil(remaining) + 's';
+    if (pct < 20) timerBar.className = 'critical';
+    else if (pct < 50) timerBar.className = 'warning';
+    else timerBar.className = '';
+    if (remaining <= 0) { stopTurnTimer(); timerText.textContent = 'TIMED OUT'; timerText.style.color = '#f44336'; }
+  }, 250);
+}
+
+function stopTurnTimer() {
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+  const b = document.getElementById('turn-timer-bar');
+  const t = document.getElementById('turn-timer-text');
+  if (b) b.style.width = '0%';
+  if (t) { t.textContent = ''; t.style.color = '#aaa'; }
 }
 
 // ══════════════════════════════════════
@@ -548,6 +665,14 @@ function doReload() {
 
 function doSitIn() {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'sitin' }));
+}
+
+function pickSeat(seatNum) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'sitin', seat: seatNum }));
+}
+
+function doSitOut() {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'sitout' }));
 }
 
 // ══════════════════════════════════════

@@ -39,6 +39,8 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
     validActions: [],
     toCall: 0,
     minRaise: 2,
+    turnStart: null,
+    turnTimeout: 120,
     dealerSeat: 0,
     winner: null,
     verified: null,
@@ -95,31 +97,76 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
 
     /** Reload chips (reset to 200) — used when busted */
     reload() {
-      const me = state.players.find(p => p.id === myId);
-      if (me) {
-        me.chips = 200;
-        state.busted = false;
-        state.message = 'Reloaded to 200 chips — click Sit In';
-        addActionLog(myId + ' reloaded');
-        log('Reloaded to 200 chips');
-        notify();
+      let me = state.players.find(p => p.id === myId);
+      if (!me) {
+        // Defensive: if I was somehow filtered out (e.g., ghost-player filter
+        // ran after I busted), re-add myself.
+        me = { id: myId, seat: 0, chips: 0, bet: 0, folded: false };
+        state.players.push(me);
+        log('Re-added self to players list');
       }
+      me.chips = 200;
+      state.busted = false;
+      // Mark as sitting out so the Sit In button shows up — player has to
+      // explicitly opt back in after reloading.
+      state.sittingOut = true;
+      state.sitOutAtHand = null;
+      state.message = 'Reloaded to 200 chips — click Sit In';
+      addActionLog(myId + ' reloaded');
+      log('Reloaded to 200 chips');
+      notify();
     },
 
-    /** Sit back in after reload or sitting out */
-    async sitIn() {
+    /** Sit back in after reload or sitting out — optional seat preference */
+    async sitIn(seat) {
       state.busted = false;
-      state.message = 'Sitting back in — next hand';
-      addActionLog(myId + ' sat back in');
-      log('Sitting back in');
+      state.sittingOut = false;
+      state.sitOutAtHand = null;
+      state.message = seat !== undefined ? ('Joining seat ' + (seat + 1) + '...') : 'Sitting back in — next hand';
+      addActionLog(myId + ' sat back in' + (seat !== undefined ? ' (seat ' + (seat + 1) + ')' : ''));
+      log('Sitting back in' + (seat !== undefined ? ' at seat ' + seat : ''));
       // Write a new join request so dealer sees we're back
       try {
+        // Re-read the table config to make sure we have the freshest session
+        const tc = await p2p.read(tableId, KEYS.TABLE_CONFIG);
+        if (tc && tc.session) state.session = tc.session;
         const joinData = { table: tableId, player: myId, session: state.session, ready: true, timestamp: Date.now() };
-        if (options.seat !== undefined) joinData.seat = options.seat;
+        if (seat !== undefined) joinData.seat = seat;
+        else if (options.seat !== undefined) joinData.seat = options.seat;
         await p2p.write(myId, KEYS.JOIN_REQUEST, joinData);
         log('Sit-in join written');
       } catch (e) {
         log('Sit-in write failed: ' + e.message);
+      }
+      notify();
+    },
+
+    /** Sit out — fold current hand if our turn, mark dealer-visible sit-out flag */
+    async sitOut() {
+      state.sittingOut = true;
+      state.message = 'Sitting out';
+      addActionLog(myId + ' sitting out');
+      log('Sitting out');
+      // If it's currently our turn → fold immediately so we're not stuck
+      if (state.turn === myId && state.validActions && state.validActions.length > 0) {
+        try {
+          await this.submitAction({ action: 'fold', amount: 0 });
+        } catch (e) {
+          log('Auto-fold on sit-out failed: ' + e.message);
+        }
+      }
+      // Write a sit-out marker to chain so the dealer knows to skip us next hand.
+      // Using JOIN_REQUEST with sitOut: true — dealer reads this and marks us
+      // sittingOut on its side, removing us from active players.
+      try {
+        const sitOutData = {
+          table: tableId, player: myId, session: state.session,
+          ready: false, sitOut: true, timestamp: Date.now()
+        };
+        await p2p.write(myId, KEYS.JOIN_REQUEST, sitOutData);
+        log('Sit-out marker written to chain');
+      } catch (e) {
+        log('Sit-out marker write failed: ' + e.message);
       }
       notify();
     },
@@ -159,15 +206,30 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
       }
       notify();
 
-      try {
-        await p2p.write(myId, KEYS.PLAYER_ACTION, {
-          action: action.action, amount: action.amount || 0,
-          session: state.session, player: myId, timestamp: Date.now()
-        });
-        log('Action written to chain');
-      } catch (e) {
-        log('Action write failed: ' + e.message);
-        state.message = 'Error: ' + e.message;
+      const actionPayload = {
+        action: action.action, amount: action.amount || 0,
+        session: state.session, player: myId, timestamp: Date.now()
+      };
+      let writeOk = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await p2p.write(myId, KEYS.PLAYER_ACTION, actionPayload);
+          await WAIT(300);
+          const readBack = await p2p.read(myId, KEYS.PLAYER_ACTION);
+          if (readBack && readBack.timestamp === actionPayload.timestamp) {
+            log('Action written and verified (attempt ' + (attempt + 1) + ')');
+            writeOk = true;
+            break;
+          }
+          log('Action not confirmed — retrying (' + (attempt + 1) + '/3)');
+        } catch (e) {
+          log('Action write attempt ' + (attempt + 1) + ' failed: ' + e.message);
+          if (attempt < 2) await WAIT(1000);
+        }
+      }
+      if (!writeOk) {
+        log('WARNING: Action may not have been written');
+        state.message = 'Action may not have sent';
         notify();
       }
     },
@@ -215,29 +277,127 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
         return;
       }
 
-      // ── Write join ──
-      state.message = 'Joining table...';
-      notify();
+      // ── Pre-seed players from latest BS (fixes blank table on connect) ──
+      // ONLY pre-seed from BS belonging to the CURRENT session. Otherwise we
+      // pick up stale data from a previous session.
+      // ALSO: if we find ourselves in the current session's player list, we
+      // default to NOT sitting out (we're already in the game). Otherwise we
+      // default to sittingOut so the user can choose a seat.
+      let alreadySeated = false;
       try {
-        const joinData = {
-          table: tableId, player: myId, session, ready: true, timestamp: Date.now()
-        };
-        if (options.seat !== undefined) joinData.seat = options.seat;
-        await p2p.write(myId, KEYS.JOIN_REQUEST, joinData);
-        log('Join written' + (options.seat !== undefined ? ' (seat ' + options.seat + ')' : ''));
-      } catch (e) {
-        log('Join write failed: ' + e.message);
-      }
+        const tc2 = await p2p.read(tableId, KEYS.TABLE_CONFIG);
+        if (tc2 && tc2.session === session && tc2.currentHandId) {
+          for (let trySeq = 20; trySeq >= 0; trySeq--) {
+            const bsKey = KEYS.BETTING_STATE + '.' + tc2.currentHandId + '.s' + trySeq;
+            const bs = await p2p.read(tableId, bsKey);
+            if (bs && bs.session && bs.session !== session) continue;
+            if (bs && bs.players) {
+              for (const bp of bs.players) {
+                if (!state.players.find(x => x.id === bp.id)) {
+                  state.players.push({ id: bp.id, seat: bp.seat !== undefined ? bp.seat : state.players.length, chips: bp.chips, bet: 0, folded: false });
+                }
+                if (bp.id === myId) alreadySeated = true;
+              }
+              state.pot = bs.pot || 0;
+              if (bs.dealerSeat !== undefined) state.dealerSeat = bs.dealerSeat;
+              log('Pre-seeded ' + state.players.length + ' players from BS (session match)' + (alreadySeated ? ' — I am already seated' : ''));
+              notify();
+              break;
+            }
+          }
+        } else if (tc2 && tc2.session && tc2.session !== session) {
+          log('Skipping pre-seed — chain table_info is from old session ' + tc2.session);
+        }
+      } catch (e) { log('Pre-seed failed: ' + e.message); }
 
-      state.message = 'Waiting for dealer to deal...';
+      // ── Sit-out default depends on whether we previously joined this session ──
+      // Check our OWN join request on chain. If we already joined the current
+      // session and didn't subsequently sit out, default to NOT sitting out.
+      let prevJoined = false;
+      try {
+        const myReq = await p2p.read(myId, KEYS.JOIN_REQUEST);
+        if (myReq && myReq.session === session && myReq.sitOut !== true) {
+          prevJoined = true;
+        }
+      } catch {}
+
+      if (prevJoined || alreadySeated) {
+        // We're already in the game — don't show Sit In button, just play
+        state.sittingOut = false;
+        state.message = '';
+        log('Already in game (prev join or seated) — joining directly');
+      } else {
+        // Fresh sit-down — wait for user to pick a seat
+        state.sittingOut = true;
+        state.message = 'Click Sit In to join the table';
+      }
       lastHandTime = Date.now();
+      log('Backend ready — sitting out (click Sit In to join)');
       notify();
 
       // ── Poll loop ──
       while (true) {
         try {
-          // 1. Check for new hand
+          // 0. Detect dealer session change (e.g., dealer was restarted)
+          // The session is cached at startup and never refreshes otherwise; if the
+          // dealer comes back with a new session our cached one is stale and the
+          // dealer will ignore our joins forever. Re-sync and rejoin automatically.
           const tc = await p2p.read(tableId, KEYS.TABLE_CONFIG);
+          if (tc && tc.session && tc.session !== state.session && !staleSession.has(tc.session)) {
+            log('Dealer session changed: ' + state.session + ' → ' + tc.session + ' — rejoining');
+            state.session = tc.session;
+            // Reset hand state — fresh session = fresh start
+            state.handId = null;
+            state.handCount = 0;
+            state.myCards = [];
+            state.board = [];
+            state.pot = 0;
+            state.turn = null;
+            state.validActions = [];
+            state.winner = null;
+            state.verified = null;
+            state.showdownCards = {};
+            state.handNames = {};
+            state.busted = false;
+            // Clear the players list — the new session has its own player list.
+            // Don't carry over players from the old session, otherwise the table
+            // shows stale "ghost" players that aren't really there anymore.
+            state.players = [];
+            lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
+            lastHandTime = Date.now();
+            // After a session change, default to sitting out — user must explicitly Sit In
+            state.sittingOut = true;
+            state.message = 'Dealer restarted — click Sit In to rejoin';
+            notify();
+          }
+
+          // Sync seated players from the dealer's lobby state. This lets us see
+          // who's sitting at which seat in real time, even between hands, before
+          // any betting state has been written.
+          if (tc && Array.isArray(tc.seatedPlayers)) {
+            const incoming = tc.seatedPlayers;
+            // Build a fresh players array preserving any local state we have
+            const newPlayers = incoming.map(sp => {
+              const existing = state.players.find(p => p.id === sp.id);
+              return {
+                id: sp.id,
+                seat: sp.seat,
+                chips: sp.chips !== undefined ? sp.chips : (existing ? existing.chips : 200),
+                bet: existing ? existing.bet : 0,
+                folded: existing ? existing.folded : false,
+              };
+            });
+            // Detect a change and update
+            const prevIds = state.players.map(p => p.id + ':' + p.seat).sort().join(',');
+            const newIds = newPlayers.map(p => p.id + ':' + p.seat).sort().join(',');
+            if (prevIds !== newIds) {
+              state.players = newPlayers;
+              log('Seated players updated: ' + newPlayers.map(p => p.id + '@' + p.seat).join(', '));
+              notify();
+            }
+          }
+
+          // 1. Check for new hand
           if (tc && tc.currentHandId && tc.currentHandId !== state.handId && tc.currentHandId !== lastSettledHandId) {
             // Before switching hands, read settlement for current hand if we missed it
             if (state.handId && state.verified === null) {
@@ -251,9 +411,19 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
                     if (gp) gp.chips = r.chips;
                   }
                 }
+                // Final action that ended the hand (e.g., fold)
+                if (missedSt.lastAction && missedSt.lastAction.player) {
+                  const la = missedSt.lastAction;
+                  if (la.timeout) {
+                    addActionLog(la.player + ' TIMED OUT' + (la.action === 'fold' ? ' (folded)' : ' (checked)'));
+                  } else {
+                    addActionLog(la.player + ' ' + la.action + (la.amount ? ' ' + la.amount : ''));
+                  }
+                }
                 if (missedSt.winners && missedSt.winners.length > 0) {
                   const ws = missedSt.winners[0];
-                  const wp = state.players[ws];
+                  // ws is a SEAT NUMBER, not an array index — look up by .seat
+                  const wp = state.players.find(p => p.seat === ws);
                   const hn = missedSt.handNames || {};
                   const wc = missedSt.allHoleCards && missedSt.allHoleCards[ws] ? missedSt.allHoleCards[ws].filter(Boolean) : [];
                   addActionLog((wp ? wp.id : 'Seat ' + ws) + ' wins ' + (missedSt.winAmount || 0) + (wc.length ? ' [' + wc.join(' ') + ']' : '') + (hn[ws] ? ' — ' + hn[ws] : ''));
@@ -297,18 +467,9 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
           }
 
           if (!state.handId) {
-            // If no hand for 15s, re-write join in case we were sat out or busted
-            const rejoinInterval = state.busted ? 10000 : 15000;
-            if (lastHandTime > 0 && Date.now() - lastHandTime > rejoinInterval) {
-              log('No hand for ' + (rejoinInterval/1000) + 's — re-writing join');
-              lastHandTime = Date.now(); // Reset so we don't spam
-              try {
-                await p2p.write(myId, KEYS.JOIN_REQUEST, {
-                  table: tableId, player: myId, session: state.session, ready: true, timestamp: Date.now()
-                });
-                log('Rejoin written');
-              } catch (e) { log('Rejoin failed: ' + e.message); }
-            }
+            // No active hand. We do NOT auto-rejoin here — the player joined
+            // explicitly at startup or via the Sit In button. If they want to
+            // come back after a sit-out or bust, they click Sit In.
             await WAIT(2000); continue;
           }
 
@@ -330,7 +491,9 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
           const nextSeq = (lastBSSeq || 0) + 1;
           const bsKey = KEYS.BETTING_STATE + '.' + state.handId + '.s' + nextSeq;
           const bs = await p2p.read(tableId, bsKey);
-          if (bs) {
+          if (bs && bs.session && bs.session !== state.session) {
+            log('Ignoring stale BS from session ' + bs.session + ' (current=' + state.session + ')');
+          } else if (bs) {
             lastBSSeq = bs.seq !== undefined ? bs.seq : nextSeq;
             state.pot = bs.pot || state.pot;
             if (bs.phase) state.phase = bs.phase;
@@ -338,6 +501,13 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
 
             // Update players
             if (bs.players) {
+              // First BS of new hand: remove ghost players from prior hands.
+              // BUT keep myself even if I'm not in this hand's BS (e.g., I busted
+              // and haven't sat back in yet) — otherwise reload() can't find me.
+              if (lastBSSeq <= 1) {
+                const bsIds = new Set(bs.players.map(bp => bp.id));
+                state.players = state.players.filter(p => bsIds.has(p.id) || p.id === myId);
+              }
               for (const bp of bs.players) {
                 let gp = state.players.find(x => x.id === bp.id);
                 if (!gp) {
@@ -379,13 +549,24 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
               state.validActions = bs.validActions;
               state.toCall = bs.toCall || 0;
               state.minRaise = bs.minRaise || 2;
+              // Player display timer starts NOW (when we first see the BS),
+              // NOT from the dealer's wall clock. This way slow propagation
+              // doesn't eat into the player's perceived think time.
+              // The dealer still enforces a longer hard timeout (90s) as a backstop.
+              state.turnStart = Date.now();
+              state.turnTimeout = bs.turnTimeout || 60;
 
               if (!actionPending) {
                 log('My turn! pot=' + state.pot + ' toCall=' + state.toCall);
                 actionPending = true;
 
-                // Auto-fold if inactive
-                if (missedTurns >= 2) {
+                // Auto-fold if sitting out (any hand, including current one)
+                if (state.sittingOut) {
+                  log('Auto-fold (sitting out)');
+                  await this.submitAction({ action: 'fold', amount: 0 });
+                }
+                // Auto-fold if inactive (timeouts piling up)
+                else if (missedTurns >= 2) {
                   log('Auto-fold (inactive)');
                   await this.submitAction({ action: 'fold', amount: 0 });
                 } else if (_onNeedAction) {
@@ -403,6 +584,8 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
               actionPending = false;
               state.turn = bs.turn || null;
               state.validActions = [];
+              state.turnStart = null;
+              state.turnTimeout = 120;
               if (state.turn) {
                 state.message = 'Waiting for ' + state.turn + '...';
               }
@@ -435,6 +618,18 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             state.showdownCards = st.allHoleCards || {};
             state.handNames = st.handNames || {};
 
+            // Log the action that ENDED the hand (e.g., the fold). This never
+            // appeared in any BS because the dealer's loop broke before writing
+            // the next BS — we get it from the settlement instead.
+            if (st.lastAction && st.lastAction.player) {
+              const la = st.lastAction;
+              if (la.timeout) {
+                addActionLog(la.player + ' TIMED OUT' + (la.action === 'fold' ? ' (folded)' : ' (checked)'));
+              } else {
+                addActionLog(la.player + ' ' + la.action + (la.amount ? ' ' + la.amount : ''));
+              }
+            }
+
             // Update chips
             if (st.results) {
               for (const r of st.results) {
@@ -450,7 +645,8 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             // Winner
             if (st.winners && st.winners.length > 0) {
               const winSeat = st.winners[0];
-              const winPlayer = state.players[winSeat];
+              // winSeat is a SEAT NUMBER, not an array index — look up by .seat
+              const winPlayer = state.players.find(p => p.seat === winSeat);
               state.winner = {
                 seats: st.winners,
                 name: winPlayer ? winPlayer.id : 'Seat ' + winSeat,
@@ -464,14 +660,31 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
               if (nonFolded.length > 1) {
                 for (const [seatStr] of nonFolded) {
                   const s = Number(seatStr);
-                  const p = state.players[s];
+                  // s is a SEAT NUMBER — look up by .seat
+                  const p = state.players.find(pp => pp.seat === s);
                   const name = p ? p.id : 'Seat ' + s;
                   const hn = handNames[s] || '';
                   const best = bestHands[s] ? bestHands[s].join(' ') : '';
                   addActionLog(name + ': ' + hn + (best ? ' [' + best + ']' : ''));
                 }
               }
-              addActionLog((winPlayer ? winPlayer.id : 'Seat ' + winSeat) + ' wins ' + (st.winAmount || 0));
+
+              // Per-pot announcements (PokerStars-style: "main pot", "side pot 1", etc.)
+              if (Array.isArray(st.potResults) && st.potResults.length > 0) {
+                for (const pot of st.potResults) {
+                  if (!pot.winners || pot.winners.length === 0 || pot.amount <= 0) continue;
+                  const label = pot.isMain ? 'main pot' : ('side pot ' + (pot.index));
+                  const share = Math.floor(pot.amount / pot.winners.length);
+                  const names = pot.winners.map(s => {
+                    const pp = state.players.find(x => x.seat === s);
+                    return pp ? pp.id : 'Seat ' + s;
+                  });
+                  addActionLog(names.join(' & ') + ' wins ' + label + ' (' + pot.amount + ')');
+                }
+              } else {
+                // Fallback to single-line winner display if potResults isn't available
+                addActionLog((winPlayer ? winPlayer.id : 'Seat ' + winSeat) + ' wins ' + (st.winAmount || 0));
+              }
             }
 
             state.message = '';
@@ -496,7 +709,22 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             state.players.forEach(p => { p.bet = 0; p.folded = false; });
             if (!state.busted) state.message = '';
             lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
-            // Don't notify again yet — let the winner stay visible until next hand
+
+            // After 5s, if no new hand has started yet, clear the visible state
+            // so the table looks "between hands" instead of stuck on the previous one.
+            setTimeout(() => {
+              if (state.phase === 'settled' && !state.handId) {
+                state.phase = 'waiting';
+                state.board = [];
+                state.myCards = [];
+                state.winner = null;
+                state.showdownCards = {};
+                state.handNames = {};
+                state.pot = 0;
+                state.message = state.busted ? 'Out of chips — click Reload' : 'Waiting for next hand...';
+                notify();
+              }
+            }, 5000);
           }
         } catch (e) {
           log('Poll error: ' + e.message);

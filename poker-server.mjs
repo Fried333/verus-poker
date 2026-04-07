@@ -1035,13 +1035,10 @@ if (USE_LOCAL) {
           sendTo(ws2, { method: 'busted' });
         }
       }
-      setTimeout(async () => {
-        if (p2pDealer && p2pDealer.getPlayers().filter(p => p.chips > 0).length >= 2) {
-          try { await p2pDealer.runHand(); } catch (e) { console.log('[P2P] Hand error: ' + e.message); }
-        } else {
-          console.log('[P2P] Not enough players with chips — waiting for reload');
-        }
-      }, 5000);
+      // (Next hand is started by the gameLoop, NOT here. Calling runHand again
+      // from this handler caused parallel runHand instances racing each other,
+      // which dealt two different sets of cards and made the user's hole cards
+      // appear to "change" mid-hand. Bug fix: delete the duplicate runHand call.)
     }
   }
 
@@ -1071,30 +1068,86 @@ if (USE_LOCAL) {
 
       // Scan for join requests from ANY player identity on chain
       async function scanForJoins() {
-        // Check known players first
-        const toCheck = otherIds.length > 0 ? [...otherIds] : [];
-        // Also check any player who writes a join request with our session
-        // For now, scan the known list + any extras found in previous hands
-        for (const pid of toCheck) {
+        // Check all known players from --players arg, in PARALLEL for fast sit-in detection
+        const toCheck = (otherIds.length > 0 ? [...otherIds] : []).filter(pid => !seatedPlayers.has(pid));
+        if (toCheck.length === 0) return;
+        let anyNew = false;
+        const reads = await Promise.all(toCheck.map(async pid => {
+          try { return [pid, await p2p.read(pid, KEYS.JOIN_REQUEST)]; }
+          catch { return [pid, null]; }
+        }));
+        for (const [pid, req] of reads) {
           if (seatedPlayers.has(pid)) continue;
+          const hasSession = req && req.session === sessionId;
+          const isRecent = req && req.timestamp && req.timestamp > tableOpenTime && (Date.now() - req.timestamp) < 300000;
+          const isCorrectTable = req && req.table === TABLE_ID;
+          if (req && isCorrectTable && (hasSession || isRecent)) {
+            p2pDealer.addPlayer(pid, 200, req.seat);
+            seatedPlayers.add(pid);
+            const actualSeat = p2pDealer.getPlayers().find(p => p.id === pid)?.seat;
+            console.log('[P2P] ' + pid + ' joined at seat ' + actualSeat + '! (' + seatedPlayers.size + ' remote players)');
+            dLog('system', pid + ' joined at seat ' + (actualSeat + 1));
+            anyNew = true;
+          }
+        }
+        // If anyone new joined, push a fresh table_info update so other players
+        // see the new seat layout immediately (between hands).
+        if (anyNew) {
           try {
-            const req = await p2p.read(pid, KEYS.JOIN_REQUEST);
-            const hasSession = req && req.session === sessionId;
-            const isRecent = req && req.timestamp && req.timestamp > tableOpenTime && (Date.now() - req.timestamp) < 300000;
-            const isCorrectTable = req && req.table === TABLE_ID;
-            if (req && isCorrectTable && (hasSession || isRecent)) {
-              p2pDealer.addPlayer(pid, 200, req.seat);
-              seatedPlayers.add(pid);
-              const actualSeat = p2pDealer.getPlayers().find(p => p.id === pid)?.seat;
-              console.log('[P2P] ' + pid + ' joined at seat ' + actualSeat + '! (' + seatedPlayers.size + ' remote players)');
-              dLog('system', pid + ' joined at seat ' + (actualSeat + 1));
-            }
-          } catch {}
+            await p2p.write(TABLE_ID, KEYS.TABLE_CONFIG, {
+              smallBlind: 1, bigBlind: 2, buyin: 200, maxPlayers: 9, status: 'lobby',
+              dealer: LOCAL_ID, session: sessionId, currentHandId: null, handCount: 0,
+              seatedPlayers: p2pDealer.getPlayers().map(p => ({ id: p.id, seat: p.seat, chips: p.chips }))
+            });
+          } catch (e) { console.log('[P2P] table_info lobby push failed: ' + e.message); }
         }
       }
 
       // Track when each player busted so we can detect rejoin attempts after that
       const bustTimestamps = new Map();
+      // Auto-kick a sat-out / busted player after this many hands without rejoin
+      const KICK_AFTER_HANDS = 5;
+
+      // Read each active player's JOIN_REQUEST in parallel; if they wrote a
+      // fresh sit-out marker (sitOut: true), mark them sittingOut on the dealer
+      // side so they're filtered from active players for the next hand.
+      async function scanForSitOut() {
+        if (!p2pDealer) return;
+        const active = p2pDealer.getPlayers().filter(p => !p.sittingOut && p.chips > 0);
+        if (active.length === 0) return;
+        const reads = await Promise.all(active.map(async p => {
+          try { return [p.id, await p2p.read(p.id, KEYS.JOIN_REQUEST)]; }
+          catch { return [p.id, null]; }
+        }));
+        for (const [pid, req] of reads) {
+          if (!req) continue;
+          if (req.sitOut === true && req.session === sessionId) {
+            p2pDealer.sitOut(pid);
+            dLog('system', pid + ' sat out (chain marker)');
+          }
+        }
+      }
+
+      function kickStaleSitOuts() {
+        if (!p2pDealer) return;
+        const handsNow = p2pDealer.getHandCount();
+        for (const p of [...p2pDealer.getPlayers()]) {
+          // Mark bust as a sit-out time too
+          if (p.chips <= 0 && p.sittingOutSinceHand == null) {
+            p.sittingOutSinceHand = handsNow;
+          }
+          if ((p.sittingOut || p.chips <= 0) && p.sittingOutSinceHand != null) {
+            const handsOut = handsNow - p.sittingOutSinceHand;
+            if (handsOut >= KICK_AFTER_HANDS) {
+              p2pDealer.removePlayer(p.id);
+              seatedPlayers.delete(p.id);
+              bustTimestamps.delete(p.id);
+              console.log('[P2P] ' + p.id + ' AUTO-KICKED after ' + handsOut + ' inactive hands (can rejoin via Sit In)');
+              dLog('system', p.id + ' kicked from table — can rejoin');
+            }
+          }
+        }
+      }
 
       // Check if sat-out or busted players have written a new join (wanting back in)
       async function scanForSitBackIn() {
@@ -1108,6 +1161,9 @@ if (USE_LOCAL) {
           try {
             const req = await p2p.read(p.id, KEYS.JOIN_REQUEST);
             if (!req || req.session !== sessionId) continue;
+            // If their latest JOIN_REQUEST is a sit-out marker (not a sit-in
+            // request), don't bring them back in.
+            if (req.sitOut === true) continue;
 
             // Accept join if it's recent (5 min window) OR if it's after the player busted
             const bustTime = bustTimestamps.get(p.id) || 0;
@@ -1132,9 +1188,10 @@ if (USE_LOCAL) {
 
       const gameLoop = async () => {
         while (true) {
-          // Scan for new players + sat-out players wanting back in
+          // Scan for new players + sat-out players wanting back in + active players sitting out
           await scanForJoins();
           await scanForSitBackIn();
+          await scanForSitOut();
 
           // Need at least 2 active players (not sitting out, with chips)
           const activePlayers = p2pDealer.getPlayers().filter(p => p.chips > 0 && !p.sittingOut);
@@ -1143,7 +1200,8 @@ if (USE_LOCAL) {
             if (sittingOut.length > 0) {
               console.log('[P2P] Waiting — ' + sittingOut.map(p => p.id).join(', ') + ' sitting out');
             }
-            await new Promise(r => setTimeout(r, 5000));
+            // Short poll while waiting for players — same cadence as action polling
+            await new Promise(r => setTimeout(r, 1000));
             continue;
           }
 
@@ -1157,9 +1215,11 @@ if (USE_LOCAL) {
             console.log(e.stack);
           }
 
-          // Between hands — scan for new players, wait a bit
+          // Between hands — kick stale sit-outs, scan for joins/sit-out changes
+          kickStaleSitOuts();
           await scanForJoins();
           await scanForSitBackIn();
+          await scanForSitOut();
           await new Promise(r => setTimeout(r, 3000));
         }
       };

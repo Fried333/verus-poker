@@ -416,6 +416,9 @@ export function calculatePots(game) {
 export function settleHand(game, evaluator) {
   const pots = calculatePots(game);
   const payouts = {};
+  // Per-pot results so the GUI can show "main pot wins X / side pot wins Y" properly.
+  // potResults: [{ index: 0, isMain: true, amount: N, eligible: [seats], winners: [seats] }, ...]
+  const potResults = [];
 
   // Initialize payouts
   for (const p of game.players) payouts[p.seat] = 0;
@@ -424,13 +427,19 @@ export function settleHand(game, evaluator) {
   const nonFolded = game.players.filter(p => !p.folded);
   if (nonFolded.length === 1) {
     payouts[nonFolded[0].seat] = game.pot;
+    potResults.push({
+      index: 0, isMain: true, amount: game.pot,
+      eligible: [nonFolded[0].seat], winners: [nonFolded[0].seat]
+    });
     applyRake(game, payouts);
     game.phase = SETTLED;
+    game.potResults = potResults;
     return payouts;
   }
 
   // Evaluate hands and award each pot
-  for (const pot of pots) {
+  for (let pi = 0; pi < pots.length; pi++) {
+    const pot = pots[pi];
     let bestScore = -1;
     let winners = [];
 
@@ -457,10 +466,16 @@ export function settleHand(game, evaluator) {
       // Give remainder to first winner (closest to dealer)
       if (remainder > 0) payouts[winners[0]] += remainder;
     }
+
+    potResults.push({
+      index: pi, isMain: pi === 0, amount: pot.amount,
+      eligible: [...pot.eligible], winners: [...winners]
+    });
   }
 
   applyRake(game, payouts);
   game.phase = SETTLED;
+  game.potResults = potResults;
   return payouts;
 }
 

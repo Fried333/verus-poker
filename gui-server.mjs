@@ -147,7 +147,7 @@ function buildClientState() {
 
   let actions = null;
   if (s.turn === MY_ID && s.validActions.length > 0 && !meFolded) {
-    actions = { validActions: s.validActions, toCall: s.toCall, minRaise: s.minRaise };
+    actions = { validActions: s.validActions, toCall: s.toCall, minRaise: s.minRaise, turnStart: s.turnStart, turnTimeout: s.turnTimeout || 120 };
   }
 
   return {
@@ -159,8 +159,11 @@ function buildClientState() {
     phase: s.phase,
     pot: s.pot,
     handCount: s.handCount,
+    handId: s.handId || null,
+    session: s.session || null,
     dealerSeat: s.dealerSeat || 0,
     busted: !!s.busted,
+    sittingOut: !!s.sittingOut,
     board: s.board || [],
     myCards: handActive && !meFolded ? s.myCards : [],
     players,
@@ -195,7 +198,9 @@ wss.on('connection', ws => {
       } else if (msg.action === 'reload') {
         backend.reload();
       } else if (msg.action === 'sitin') {
-        backend.sitIn();
+        backend.sitIn(msg.seat);
+      } else if (msg.action === 'sitout') {
+        backend.sitOut();
       }
     } catch {}
   });

@@ -50,42 +50,61 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     return false;
   }
 
+  // ──────────────────────────────────────────────
+  // Per-identity write mutex — strictly serializes
+  // every write(idName)/writeBatch(idName) so concurrent
+  // callers can't race on the same UTXO.
+  // ──────────────────────────────────────────────
+  const writeChains = new Map(); // idName → Promise (tail of the queue)
+  function withIdentityLock(idName, fn) {
+    const prev = writeChains.get(idName) || Promise.resolve();
+    const next = prev.then(fn, fn); // run regardless of prev result
+    // Store but allow GC: replace tail when this completes
+    const tail = next.catch(() => {}).finally(() => {
+      if (writeChains.get(idName) === tail) writeChains.delete(idName);
+    });
+    writeChains.set(idName, tail);
+    return next;
+  }
+
   async function write(identityId, vdxfKey, data) {
     const idName = identityId.replace('.CHIPS@', '');
-    const serialized = serialize(data);
+    return withIdentityLock(idName, async () => {
+      const serialized = serialize(data);
 
-    // Wait for previous write to THIS identity to be in mempool
-    const prevTx = lastTxId.get(idName);
-    if (prevTx) {
-      await waitForTxSpendable(prevTx);
-    }
-
-    try {
-      const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
-      lastTxId.set(idName, txid);
-      lastWrite.set(idName, Date.now());
-      console.log('[P2P] Written to ' + idName + ' tx=' + txid.substring(0, 12));
-      return txid;
-    } catch (e) {
-      if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
-        // Retry up to 5 times with increasing delays
-        for (let retry = 0; retry < 5; retry++) {
-          console.log('[P2P] UTXO conflict on ' + idName + ' — retry ' + (retry + 1) + '/5');
-          if (prevTx) await waitForTxSpendable(prevTx);
-          await new Promise(r => setTimeout(r, 1500 + retry * 500));
-          try {
-            const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
-            lastTxId.set(idName, txid);
-            lastWrite.set(idName, Date.now());
-            return txid;
-          } catch (e2) {
-            if (!e2.message.includes('inputs-spent') && !e2.message.includes('conflict')) throw e2;
-          }
-        }
-        throw new Error('UTXO conflict persisted after 5 retries on ' + idName);
+      // Wait for previous write to THIS identity to be in mempool
+      const prevTx = lastTxId.get(idName);
+      if (prevTx) {
+        await waitForTxSpendable(prevTx);
       }
-      throw e;
-    }
+
+      try {
+        const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
+        lastTxId.set(idName, txid);
+        lastWrite.set(idName, Date.now());
+        console.log('[P2P] Written to ' + idName + ' tx=' + txid.substring(0, 12));
+        return txid;
+      } catch (e) {
+        if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
+          // Retry up to 5 times with increasing delays
+          for (let retry = 0; retry < 5; retry++) {
+            console.log('[P2P] UTXO conflict on ' + idName + ' — retry ' + (retry + 1) + '/5');
+            if (prevTx) await waitForTxSpendable(prevTx);
+            await new Promise(r => setTimeout(r, 1500 + retry * 500));
+            try {
+              const txid = await client.writeToIdentity(idName, vdxfKey, serialized);
+              lastTxId.set(idName, txid);
+              lastWrite.set(idName, Date.now());
+              return txid;
+            } catch (e2) {
+              if (!e2.message.includes('inputs-spent') && !e2.message.includes('conflict')) throw e2;
+            }
+          }
+          throw new Error('UTXO conflict persisted after 5 retries on ' + idName);
+        }
+        throw e;
+      }
+    });
   }
 
   /**
@@ -94,51 +113,52 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
    */
   async function writeBatch(identityId, entries) {
     const idName = identityId.replace('.CHIPS@', '');
+    return withIdentityLock(idName, async () => {
+      // Wait for previous write to THIS identity
+      const prevTx = lastTxId.get(idName);
+      if (prevTx) {
+        await waitForTxSpendable(prevTx);
+      }
 
-    // Wait for previous write to THIS identity
-    const prevTx = lastTxId.get(idName);
-    if (prevTx) {
-      await waitForTxSpendable(prevTx);
-    }
+      // Resolve parent
+      let parent;
+      try {
+        const fullName = identityId.includes('.') ? identityId : identityId + '.CHIPS@';
+        const idInfo = await client.getIdentity(fullName);
+        parent = idInfo.identity?.parent;
+      } catch (e) {}
 
-    // Resolve parent
-    let parent;
-    try {
-      const fullName = identityId.includes('.') ? identityId : identityId + '.CHIPS@';
-      const idInfo = await client.getIdentity(fullName);
-      parent = idInfo.identity?.parent;
-    } catch (e) {}
+      // Build contentmultimap with ALL keys
+      const cmm = {};
+      for (const entry of entries) {
+        const vdxfId = await resolveVdxfId(entry.key);
+        const hexData = Buffer.from(JSON.stringify(serialize(entry.data))).toString('hex');
+        cmm[vdxfId] = hexData;
+      }
 
-    // Build contentmultimap with ALL keys
-    const cmm = {};
-    for (const entry of entries) {
-      const vdxfId = await resolveVdxfId(entry.key);
-      const hexData = Buffer.from(JSON.stringify(serialize(entry.data))).toString('hex');
-      cmm[vdxfId] = hexData;
-    }
+      const updateParams = { name: idName, contentmultimap: cmm };
+      if (parent) updateParams.parent = parent;
+      console.log('[P2P-DEBUG] writeBatch params: name=' + idName + ' parent=' + (parent || 'NONE') + ' keys=' + Object.keys(cmm).length);
 
-    const updateParams = { name: idName, contentmultimap: cmm };
-    if (parent) updateParams.parent = parent;
-    console.log('[P2P-DEBUG] writeBatch params: name=' + idName + ' parent=' + (parent || 'NONE') + ' keys=' + Object.keys(cmm).length);
-
-    try {
-      const txid = await client.call('updateidentity', [updateParams]);
-      lastTxId.set(idName, txid);
-      lastWrite.set(idName, Date.now());
-      console.log('[P2P] Batch written to ' + idName + ' (' + entries.length + ' keys) tx=' + txid.substring(0, 12));
-      return txid;
-    } catch (e) {
-      if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
-        console.log('[P2P] UTXO conflict on batch ' + idName + ' — retrying...');
-        if (prevTx) await waitForTxSpendable(prevTx);
-        await new Promise(r => setTimeout(r, 1000));
+      try {
         const txid = await client.call('updateidentity', [updateParams]);
         lastTxId.set(idName, txid);
         lastWrite.set(idName, Date.now());
+        console.log('[P2P] Batch written to ' + idName + ' (' + entries.length + ' keys) tx=' + txid.substring(0, 12));
         return txid;
+      } catch (e) {
+        if (e.message.includes('inputs-spent') || e.message.includes('conflict')) {
+          console.log('[P2P] UTXO conflict on batch ' + idName + ' — retrying...');
+          if (prevTx) await waitForTxSpendable(prevTx);
+          await new Promise(r => setTimeout(r, 1000));
+          const txid = await client.call('updateidentity', [updateParams]);
+          lastTxId.set(idName, txid);
+          lastWrite.set(idName, Date.now());
+          return txid;
+        }
+        throw e;
       }
-      throw e;
-    }
+    });
   }
 
   // Cache VDXF ID lookups

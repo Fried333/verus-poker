@@ -58,8 +58,19 @@ export function createP2PDealer(p2p, config, localNotify) {
         seat = 0;
         while (usedSeats.has(seat)) seat++;
       }
-      players.push({ id: playerId, seat, chips: chips || buyin, sittingOut: false, timeouts: 0 });
+      players.push({ id: playerId, seat, chips: chips || buyin, sittingOut: false, timeouts: 0, sittingOutSinceHand: null });
       console.log('[DEALER] ' + playerId + ' seated at seat ' + seat);
+    },
+
+    /** Remove a player from the table entirely (auto-kick after N sat-out hands) */
+    removePlayer(playerId) {
+      const idx = players.findIndex(p => p.id === playerId);
+      if (idx >= 0) {
+        const removed = players.splice(idx, 1)[0];
+        console.log('[DEALER] ' + playerId + ' removed from table (was at seat ' + removed.seat + ')');
+        return true;
+      }
+      return false;
     },
 
     async waitForJoin(playerId, timeout) {
@@ -111,22 +122,42 @@ export function createP2PDealer(p2p, config, localNotify) {
       // ── STAGE III: Cashier shuffle ──
       let cd;
       if (useCashiers) {
-        // Write shuffle request for external cashier nodes
-        // Split across keys — header + one key per player deck (each ~3.5KB)
-        dlog('Sending Stage III to cashier: ' + cashiers[0]);
-        // Batch small writes: base key + per-hand key (440 bytes total, 1 TX)
-        const reqData = { handId, session: gameId, numPlayers, numCards, threshold, timestamp: Date.now() };
-        await p2p.writeBatch(p2p.tableId, [
+        // OPTIMIZATION: only send the cards the hand will actually use to the cashier.
+        // For Texas Hold'em with N players: 2N hole cards + 5 community = 2N+5 cards.
+        // The dealer's full 52-card permutation has already been applied, so positions
+        // 0..(2N+4) are a uniformly-random sample from the deck. Slicing here cuts
+        // each deck from ~3.5KB JSON to ~800 bytes — small enough to batch all 3
+        // decks + the shuffle request in a single chain tx.
+        const cardsNeeded = numPlayers * 2 + 5;  // 11 for 3 players, 9 for 2, etc.
+        const slicedDecks = dd.blindedDecks.map(d => d.slice(0, cardsNeeded));
+
+        dlog('Sending Stage III to cashier: ' + cashiers[0] + ' (' + cardsNeeded + ' cards/player)');
+        // Tell the cashier to use the smaller card count via reqData
+        const reqData = { handId, session: gameId, numPlayers, numCards: cardsNeeded, threshold, timestamp: Date.now() };
+        // Build a single batch with the shuffle request + all 3 player decks.
+        // Total size: ~500B request + 3 × ~1.5KB decks ≈ 5KB — fits one tx.
+        const initialBatch = [
           { key: 'chips.vrsc::poker.sg777z.t_shuffle_request', data: reqData },
           { key: 'chips.vrsc::poker.sg777z.t_shuffle_request.' + handId, data: reqData }
-        ]);
-        dlog('Request batch written (1 TX)');
-        // Player decks separate (3.5KB each, too big to batch)
+        ];
         for (let i = 0; i < numPlayers; i++) {
-          await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_shuffle_deck.' + handId + '.p' + i,
-            { player: i, deck: dd.blindedDecks[i] }
-          );
-          dlog('Deck ' + i + ' written');
+          initialBatch.push({
+            key: 'chips.vrsc::poker.sg777z.t_shuffle_deck.' + handId + '.p' + i,
+            data: { player: i, deck: slicedDecks[i] }
+          });
+        }
+        try {
+          await p2p.writeBatch(p2p.tableId, initialBatch);
+          dlog('Request + ' + numPlayers + ' decks batched (1 TX, ' + cardsNeeded + ' cards each)');
+        } catch (e) {
+          // Fallback: if the combined batch is too big, fall back to separate writes
+          dlog('Batch too big, falling back to sequential writes: ' + e.message);
+          await p2p.writeBatch(p2p.tableId, initialBatch.slice(0, 2));
+          for (let i = 0; i < numPlayers; i++) {
+            await p2p.write(p2p.tableId, 'chips.vrsc::poker.sg777z.t_shuffle_deck.' + handId + '.p' + i,
+              { player: i, deck: slicedDecks[i] });
+            dlog('Deck ' + i + ' written');
+          }
         }
 
         // Wait for first cashier to respond (poll their identity)
@@ -145,20 +176,21 @@ export function createP2PDealer(p2p, config, localNotify) {
           cd = cashierShuffle(dd.blindedDecks, numPlayers, numCards, threshold);
         } else {
           dlog('Cashier response received from ' + cashierMeta.cashier + ', reading decks...');
-          // Read only finalDecks (blindedcards) — b values come per-card during hand
-          const finalDecks = [];
-          for (let i = 0; i < numPlayers; i++) {
-            let deckData = null;
+          // Read all finalDecks in parallel — the cashier writes them all in one
+          // batch now, so they're available simultaneously.
+          const readDeck = async (i) => {
             for (let retry = 0; retry < 40; retry++) {
-              deckData = await p2p.read(cashiers[0], cashierResultKey + '.deck.' + i);
-              if (deckData && deckData.deck) break;
-              deckData = null;
+              const deckData = await p2p.read(cashiers[0], cashierResultKey + '.deck.' + i);
+              if (deckData && deckData.deck) return deckData.deck;
               await WAIT(500);
             }
-            finalDecks.push(deckData ? deckData.deck : []);
-          }
+            return [];
+          };
+          const finalDecks = await Promise.all(
+            Array.from({ length: numPlayers }, (_, i) => readDeck(i))
+          );
           cd = { finalDecks, cashierCommitment: cashierMeta.cashierCommitment };
-          dlog('Cashier decks received (' + numPlayers + ' players)');
+          dlog('Cashier decks received (' + numPlayers + ' players, parallel)');
         }
       } else {
         // No external cashiers — do Stage III locally
@@ -166,6 +198,7 @@ export function createP2PDealer(p2p, config, localNotify) {
       }
 
       // ── Request blinding values from cashier for card positions ──
+      // Retries up to 3 times with fresh request each attempt; throws on total failure
       async function requestBlindings(positions, playerIdx) {
         if (!useCashiers || !cashiers[0]) {
           // Local mode: b values are in cd.b
@@ -173,22 +206,38 @@ export function createP2PDealer(p2p, config, localNotify) {
           for (const pos of positions) result[pos] = cd.b[playerIdx][pos];
           return result;
         }
-        const reqTimestamp = Date.now();
-        const revealKey = 'chips.vrsc::poker.sg777z.t_reveal_request.' + handId;
-        await p2p.write(p2p.tableId, revealKey, {
-          handId, positions, playerIdx, timestamp: reqTimestamp
-        });
-        dlog('Requested blindings for positions ' + positions.join(','));
+        const MAX_ATTEMPTS = 3;
+        const POLL_ITERS = 40; // 40 * 500ms = 20s per attempt
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          const reqTimestamp = Date.now();
+          const revealKey = 'chips.vrsc::poker.sg777z.t_reveal_request.' + handId;
+          try {
+            await p2p.write(p2p.tableId, revealKey, {
+              handId, positions, playerIdx, timestamp: reqTimestamp
+            });
+          } catch (e) {
+            dlog('Reveal request write failed (attempt ' + attempt + '): ' + e.message);
+            await WAIT(2000);
+            continue;
+          }
+          dlog('Requested blindings for positions ' + positions.join(',') + ' (attempt ' + attempt + ')');
 
-        // Poll for cashier's response
-        const resultKey = 'chips.vrsc::poker.sg777z.c_reveal_result.' + handId + '.' + reqTimestamp;
-        for (let i = 0; i < 60; i++) {
-          const result = await p2p.read(cashiers[0], resultKey);
-          if (result && result.blindings) return result.blindings;
-          await WAIT(500);
+          // Poll for cashier's response
+          const resultKey = 'chips.vrsc::poker.sg777z.c_reveal_result.' + handId + '.' + reqTimestamp;
+          for (let i = 0; i < POLL_ITERS; i++) {
+            const result = await p2p.read(cashiers[0], resultKey);
+            if (result && result.blindings) {
+              // Verify we got blindings for every requested position
+              const missing = positions.filter(p => result.blindings[p] === undefined);
+              if (missing.length === 0) return result.blindings;
+              dlog('Cashier responded but missing positions: ' + missing.join(','));
+              break; // partial response — try again
+            }
+            await WAIT(500);
+          }
+          dlog('Blinding request attempt ' + attempt + '/' + MAX_ATTEMPTS + ' timed out');
         }
-        dlog('Blinding request timed out');
-        return {};
+        throw new Error('Cashier reveal failed after ' + MAX_ATTEMPTS + ' attempts (positions: ' + positions.join(',') + ')');
       }
 
       // ── DEAL HOLE CARDS ──
@@ -250,6 +299,7 @@ export function createP2PDealer(p2p, config, localNotify) {
       // Blinds betting state — unique key (s0)
       initEntries.push({ key: VDXF_KEYS.BETTING_STATE + '.' + handId + '.s0', data: {
         phase: game.phase, pot: game.pot, dealerSeat: game.dealerSeat, seq: 0,
+        session: gameId,
         players: game.players.map(p => ({ id: p.id, seat: p.seat, chips: p.chips, bet: p.bet }))
       }});
       let wt = Date.now();
@@ -308,7 +358,12 @@ export function createP2PDealer(p2p, config, localNotify) {
         // BATCH: board + BS in ONE TX if new street was dealt
         const bsData = {
           phase: game.phase, pot: game.pot, turn: p.id, seat,
+          session: gameId,
           validActions, toCall, minRaise: game.minRaise,
+          // Dealer enforces a 90s hard timeout (player display shows 60s).
+          // The 30s difference is buffer for chain propagation lag, so slow
+          // players still get a fair perceived 60s of think time.
+          turnStart: Date.now(), turnTimeout: 60, dealerHardTimeout: 90,
           players: game.players.map(pp => ({ id: pp.id, seat: pp.seat, chips: pp.chips, bet: pp.bet, folded: pp.folded })),
           lastAction: lastActionInfo
         };
@@ -338,7 +393,8 @@ export function createP2PDealer(p2p, config, localNotify) {
         action = await new Promise(resolve => {
           notify('need_action', { resolve, validActions, toCall, seat, playerId: p.id, pot: game.pot, minRaise: game.minRaise,
             phase: game.phase, handId, bsSeq, gamePlayers: game.players.map(gp => ({ id: gp.id, chips: gp.chips, bet: gp.bet, folded: gp.folded })) });
-          setTimeout(() => resolve(null), 120000);
+          // 90s hard timeout = player's 60s display + 30s buffer for chain propagation
+          setTimeout(() => resolve(null), 90000);
         });
 
         const pollMs = Date.now() - pollStart;
@@ -351,6 +407,7 @@ export function createP2PDealer(p2p, config, localNotify) {
             pp.timeouts = (pp.timeouts || 0) + 1;
             if (pp.timeouts >= MAX_TIMEOUTS) {
               pp.sittingOut = true;
+              pp.sittingOutSinceHand = handCount;
               dlog(p.id + ' SAT OUT after ' + pp.timeouts + ' timeout(s)');
               notify('player_sat_out', { player: p.id, timeouts: pp.timeouts });
             }
@@ -437,15 +494,25 @@ export function createP2PDealer(p2p, config, localNotify) {
         hand: handCount, verified: verification.valid, session: gameId,
         results: game.players.map(p => ({ id: p.id, chips: p.chips })),
         board: game.board.map(cardToString),
-        handNames, bestHands, allHoleCards, winners, winAmount
+        handNames, bestHands, allHoleCards, winners, winAmount,
+        // Per-pot results so the GUI can show "main pot wins X / side pot wins Y"
+        potResults: game.potResults || [],
+        // The action that ended the hand (often a fold) — never written to a BS
+        // because the loop breaks. Players need this to show the final action.
+        lastAction: lastActionInfo
       });
       dlog('Settlement written (' + (Date.now()-vt) + 'ms)');
       dlog('HAND TOTAL: ' + ((Date.now()-handT0)/1000).toFixed(1) + 's | chips: ' + game.players.map(p => p.id + '=' + p.chips).join(' '));
 
-      // Update player chips
+      // Update player chips; mark sittingOutSinceHand on bust so kick counter starts
       for (const gp of game.players) {
         const p = players.find(x => x.id === gp.id);
-        if (p) p.chips = gp.chips;
+        if (p) {
+          p.chips = gp.chips;
+          if (p.chips <= 0 && p.sittingOutSinceHand == null) {
+            p.sittingOutSinceHand = handCount;
+          }
+        }
       }
 
       notify('hand_complete', { hand: handCount, verified: verification.valid, players });
@@ -464,7 +531,20 @@ export function createP2PDealer(p2p, config, localNotify) {
       if (p && p.sittingOut) {
         p.sittingOut = false;
         p.timeouts = 0;
+        p.sittingOutSinceHand = null;
         console.log('[DEALER] ' + playerId + ' sat back in');
+        return true;
+      }
+      return false;
+    },
+
+    /** Mark a player as sitting out (called when they wrote sit-out marker to chain) */
+    sitOut(playerId) {
+      const p = players.find(x => x.id === playerId);
+      if (p && !p.sittingOut) {
+        p.sittingOut = true;
+        p.sittingOutSinceHand = handCount;
+        console.log('[DEALER] ' + playerId + ' sat out');
         return true;
       }
       return false;

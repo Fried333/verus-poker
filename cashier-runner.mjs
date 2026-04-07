@@ -11,7 +11,7 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { createP2PLayer } from './p2p-layer.mjs';
 import { cashierShuffle, verifyGame } from './protocol.mjs';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { join } from 'path';
 
 const WAIT = ms => new Promise(r => setTimeout(r, ms));
@@ -53,6 +53,53 @@ function findRPC() {
   throw new Error('CHIPS daemon config not found');
 }
 
+// ──────────────────────────────────────
+// Disk persistence — survive crashes mid-hand
+// ──────────────────────────────────────
+const STATE_DIR = join(process.env.HOME, '.verus-poker', 'cashier-' + MY_ID + '-' + TABLE_ID);
+function ensureStateDir() {
+  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
+}
+// BigInt-safe JSON: tag BigInts as {$bn: hex} on save, restore on load
+function bnReplacer(_key, value) {
+  if (typeof value === 'bigint') return { $bn: value.toString(16) };
+  return value;
+}
+function bnReviver(_key, value) {
+  if (value && typeof value === 'object' && typeof value.$bn === 'string') {
+    return BigInt('0x' + value.$bn);
+  }
+  return value;
+}
+function persistHand(handId, handData) {
+  ensureStateDir();
+  const file = join(STATE_DIR, handId + '.json');
+  try {
+    writeFileSync(file, JSON.stringify(handData, bnReplacer));
+  } catch (e) {
+    console.log('[CASHIER] persist error: ' + e.message);
+  }
+}
+function deleteHand(handId) {
+  try { unlinkSync(join(STATE_DIR, handId + '.json')); } catch {}
+}
+function loadAllHands() {
+  ensureStateDir();
+  const map = new Map();
+  for (const f of readdirSync(STATE_DIR)) {
+    if (!f.endsWith('.json')) continue;
+    try {
+      const data = JSON.parse(readFileSync(join(STATE_DIR, f), 'utf8'), bnReviver);
+      const handId = f.replace(/\.json$/, '');
+      map.set(handId, data);
+      console.log('[CASHIER] Reloaded hand ' + handId + ' from disk');
+    } catch (e) {
+      console.log('[CASHIER] Failed to reload ' + f + ': ' + e.message);
+    }
+  }
+  return map;
+}
+
 async function main() {
   console.log('[CASHIER ' + MY_ID + '] Starting...');
 
@@ -62,10 +109,17 @@ async function main() {
   const info = await p2p.client.getInfo();
   console.log('[CASHIER ' + MY_ID + '] Chain: block ' + info.blocks);
 
+  // Reload any in-flight hands from disk (crash recovery)
+  const activeHands = loadAllHands();
   let lastProcessedHand = null;
   let lastSession = null;
-  const activeHands = new Map(); // handId → { b, sigma, lastRevealId }
+  if (activeHands.size > 0) {
+    console.log('[CASHIER ' + MY_ID + '] Recovered ' + activeHands.size + ' in-flight hand(s) from disk');
+    // Set lastProcessedHand to the most recent so we don't re-process
+    for (const handId of activeHands.keys()) lastProcessedHand = handId;
+  }
 
+  console.log('[CASHIER ' + MY_ID + '] State dir: ' + STATE_DIR);
   console.log('[CASHIER ' + MY_ID + '] Watching table ' + TABLE_ID + '...\n');
 
   while (true) {
@@ -84,8 +138,10 @@ async function main() {
       }
 
       if (req && req.handId && req.handId !== lastProcessedHand && !activeHands.has(req.handId)) {
-        // Skip stale requests (older than 60s)
-        if (req.timestamp && Date.now() - req.timestamp > 60000) {
+        // Skip stale requests (older than 5 minutes — accounts for slow chain
+        // propagation between un-peered daemons. If a hand request takes more
+        // than 5 minutes to reach us, the dealer has almost certainly given up.)
+        if (req.timestamp && Date.now() - req.timestamp > 300000) {
           console.log('[CASHIER ' + MY_ID + '] Skipping stale: ' + req.handId + ' (' + Math.round((Date.now() - req.timestamp) / 1000) + 's old)');
           lastProcessedHand = req.handId;
           continue;
@@ -123,38 +179,46 @@ async function main() {
         const ms = Date.now() - t0;
         console.log('[CASHIER ' + MY_ID + '] Stage III done (' + ms + 'ms). Commitment: ' + cd.cashierCommitment.substring(0, 16) + '...');
 
-        // 3. Write meta + first deck as batch (saves 1 TX), rest sequential
+        // 2b. Persist b[] to disk IMMEDIATELY — before chain writes (which take ~26s)
+        // This closes the crash window between Stage III and the post-write persist
+        const handStateEarly = { b: cd.b, sigma: cd.sigma_Cashier };
+        activeHands.set(req.handId, handStateEarly);
+        persistHand(req.handId, handStateEarly);
+        console.log('[CASHIER ' + MY_ID + '] Persisted b[] to disk (pre-chain-write)');
+
+        // 3. Write meta + ALL decks in one batch (now possible because decks are
+        //    small — only 11 cards instead of 52, ~1.5KB each).
+        //    Total batch: ~250B meta + 3 × ~1.5KB decks ≈ 5KB. Fits one TX.
         const t1 = Date.now();
         const metaData = {
           cashier: MY_ID, handId: req.handId, session: req.session,
           cashierCommitment: cd.cashierCommitment,
           numPlayers: req.numPlayers, timestamp: Date.now()
         };
-        // Try batch: meta (250 bytes) + deck 0 (3.5KB) = ~3.75KB — should fit
+        const outBatch = [
+          { key: KEYS.CASHIER_RESULT + '.' + req.handId, data: metaData }
+        ];
+        for (let i = 0; i < req.numPlayers; i++) {
+          outBatch.push({
+            key: KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
+            data: { player: i, deck: cd.finalDecks[i] }
+          });
+        }
         try {
-          await p2p.writeBatch(MY_ID, [
-            { key: KEYS.CASHIER_RESULT + '.' + req.handId, data: metaData },
-            { key: KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.0', data: { player: 0, deck: cd.finalDecks[0] } }
-          ]);
-          // Write remaining decks
-          for (let i = 1; i < req.numPlayers; i++) {
-            await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
-              { player: i, deck: cd.finalDecks[i] });
-          }
+          await p2p.writeBatch(MY_ID, outBatch);
+          console.log('[CASHIER ' + MY_ID + '] All decks batched in 1 TX (' + req.numPlayers + ' decks)');
         } catch (e) {
-          // Batch too big — fall back to sequential
-          console.log('[CASHIER ' + MY_ID + '] Batch failed, writing sequentially: ' + e.message);
-          await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId, metaData);
-          for (let i = 0; i < req.numPlayers; i++) {
+          // Fallback: too big — split meta+deck0 vs the rest
+          console.log('[CASHIER ' + MY_ID + '] Batch failed, falling back: ' + e.message);
+          await p2p.writeBatch(MY_ID, outBatch.slice(0, 2));
+          for (let i = 1; i < req.numPlayers; i++) {
             await p2p.write(MY_ID, KEYS.CASHIER_RESULT + '.' + req.handId + '.deck.' + i,
               { player: i, deck: cd.finalDecks[i] });
           }
         }
         console.log('[CASHIER ' + MY_ID + '] Written (' + (Date.now() - t1) + 'ms)');
 
-        // Store b values + sigma locally — revealed per-card during hand
-        activeHands.set(req.handId, { b: cd.b, sigma: cd.sigma_Cashier });
-
+        // (Already persisted above — this is the post-chain-write checkpoint, no-op)
         lastProcessedHand = req.handId;
         lastSession = req.session;
       }
@@ -186,12 +250,16 @@ async function main() {
         }
       }
 
-      // 5. Clean up settled hands
-      if (lastSession) {
-        const settlement = await p2p.read(TABLE_ID, KEYS.SETTLEMENT + '.' + lastProcessedHand);
-        if (settlement && settlement.verified !== undefined) {
-          activeHands.delete(lastProcessedHand);
-        }
+      // 5. Clean up settled hands — check ALL active hands, not just last
+      for (const handId of Array.from(activeHands.keys())) {
+        try {
+          const settlement = await p2p.read(TABLE_ID, KEYS.SETTLEMENT + '.' + handId);
+          if (settlement && settlement.verified !== undefined) {
+            activeHands.delete(handId);
+            deleteHand(handId);
+            console.log('[CASHIER ' + MY_ID + '] Cleaned up settled hand ' + handId);
+          }
+        } catch {}
       }
 
     } catch (e) {
