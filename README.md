@@ -65,15 +65,53 @@ cd verus-poker
 npm install
 ```
 
-You also need to register the VerusIDs you'll use. On each machine that will run a process, the local Verus wallet must control the matching identity. Example identities used in development:
+### Creating the VerusIDs you'll need
 
-| Identity | Role |
-|---|---|
-| `ptable2.CHIPS@` | The poker table (dealer writes to this) |
-| `pdealer2.CHIPS@`, `pplayer2.CHIPS@`, `pc-player.CHIPS@` | Players |
-| `cashier1.CHIPS@` | Cashier |
+Every role in the game needs its own VerusID on the CHIPS chain:
 
-Substitute your own identity names everywhere below.
+| Role | What it does | Where the wallet must live |
+|---|---|---|
+| **Table** | Holds public game state (table info, hands, betting state, settlement) | Dealer machine |
+| **Dealer** | Owns the table, orchestrates hands. *(In some setups the dealer does not need its own player identity.)* | Dealer machine |
+| **Cashier** | Performs final shuffle stage and serves card reveals | Cashier machine |
+| **Player** (one per seat) | Submits actions (call/raise/fold) to its own identity | That player's machine |
+
+A VerusID can only be updated by the wallet holding its primary spending key. So whichever machine will be writing to a given identity must be the one that registers it (or you must transfer it there).
+
+#### Step 1 — Get a CHIPS wallet address with funds
+
+```bash
+# On each machine
+verus -chain=CHIPS getnewaddress
+# Send a small amount of CHIPS to this address (a few coins is enough for many hands)
+```
+
+#### Step 2 — Register an identity
+
+```bash
+verus -chain=CHIPS registeridentity '{
+  "name": "myplayer1",
+  "primaryaddresses": ["<your CHIPS R-address from step 1>"],
+  "minimumsignatures": 1,
+  "privateaddress": ""
+}' 100
+```
+
+The trailing `100` is a fee paid in CHIPS. Wait one block, then verify:
+
+```bash
+verus -chain=CHIPS getidentity myplayer1.CHIPS@
+```
+
+Repeat on each machine for each role you need. For a 3-player table running on three different boxes you'd register:
+
+- `mytable.CHIPS@` on the dealer machine
+- `mycashier.CHIPS@` on the cashier machine
+- `myplayer1.CHIPS@`, `myplayer2.CHIPS@`, `myplayer3.CHIPS@` — one per player machine
+
+Substitute these names everywhere `--id`, `--table`, `--players`, or `--cashiers` appears in the commands below.
+
+> **Recovery / backup**: VerusIDs are controlled by their primary signing keys. If you lose the wallet that registered an identity, you lose the ability to update it — unless you set a separate **revocation/recovery authority** at registration time (an existing identity that can revoke or recover yours). For test play this isn't critical; for serious use, always set a recovery identity and `backupwallet` after registration. Restoring `wallet.dat` to a fresh daemon restores full control.
 
 ---
 
@@ -85,9 +123,9 @@ A full game requires three processes (or more, depending on how many players you
 
 ```bash
 node poker-server.mjs --local --role=dealer \
-  --table=ptable2 \
-  --players=pplayer2,pdealer2,pc-player \
-  --cashiers=cashier1 \
+  --table=mytable \
+  --players=myplayer1,myplayer2,myplayer3 \
+  --cashiers=mycashier \
   --port=3000
 ```
 
@@ -104,7 +142,7 @@ The dealer writes a `t_table_info` record to the table identity, opens a session
 ### 2. Cashier
 
 ```bash
-node cashier-runner.mjs --id=cashier1 --table=ptable2
+node cashier-runner.mjs --id=mycashier --table=mytable
 ```
 
 Polls the table identity for shuffle requests, runs Stage III, writes the result back, and serves card-reveal blindings on demand. Persists in-flight state to disk in `~/.verus-poker/cashier-<id>-<table>/` so it can recover from crashes mid-hand.
@@ -114,14 +152,14 @@ Polls the table identity for shuffle requests, runs Stage III, writes the result
 Each player runs their own GUI server, owning their own identity:
 
 ```bash
-# Player 1
-node gui-server.mjs --id=pplayer2 --table=ptable2 --port=3001
+# Player 1's machine
+node gui-server.mjs --id=myplayer1 --table=mytable --port=3001
 
-# Player 2 (different machine, different daemon, different identity)
-node gui-server.mjs --id=pdealer2 --table=ptable2 --port=3001
+# Player 2's machine
+node gui-server.mjs --id=myplayer2 --table=mytable --port=3001
 
-# Player 3
-node gui-server.mjs --id=pc-player --table=ptable2 --port=3000
+# Player 3's machine
+node gui-server.mjs --id=myplayer3 --table=mytable --port=3001
 ```
 
 Then open the URL printed by each GUI server in a browser. Click an empty seat to sit in, the dealer will pick up the join from chain and start a hand once it has enough players.
@@ -156,14 +194,15 @@ A handful of utilities for benchmarking and reliability testing:
 
 ```bash
 # Single-daemon round trip
-node test-mempool-read.mjs --id=cashier1
+node test-mempool-read.mjs --id=mycashier
 
 # Cross-daemon (run write on one host, read on another)
-node test-mempool-cross.mjs --mode=write --id=pc-player
+node test-mempool-cross.mjs --mode=write --id=myplayer1
 # copy the printed nonce, then on another host:
-node test-mempool-cross.mjs --mode=read --id=pc-player --nonce=<nonce>
+node test-mempool-cross.mjs --mode=read --id=myplayer1 --nonce=<nonce>
 
 # Full 3-host matrix (writer × reader for all 6 directions)
+# Edit the host paths/identities at the top of run-mempool-matrix.sh first
 ./run-mempool-matrix.sh
 ```
 
