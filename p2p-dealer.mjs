@@ -844,5 +844,53 @@ export function createP2PDealer(p2p, config, localNotify) {
 
       return { ok: false, reason: 'timeout waiting for signatures' };
     },
+
+    /**
+     * Trigger a phase rotation to a new roster.
+     *
+     * 1. Compose and publish a cashout for the current phase using `currentStacks`
+     * 2. Wait for player partials and finalize (broadcast settlement TX)
+     * 3. Open a new phase with the new roster
+     * 4. Wait for new deposits + publish phase_confirmed
+     *
+     * This is the synchronous "settle then restart" rotation. Players who
+     * are continuing must verify, sign, and re-deposit.
+     *
+     * Returns the new phase descriptor on success or { error } on failure.
+     */
+    async rotatePhase(currentStacks, newRoster, newThreshold, settlementTimeoutMs = 120000, depositTimeoutMs = 120000) {
+      if (!currentPhase || !currentPhase.confirmed) {
+        throw new Error('no confirmed current phase to rotate from');
+      }
+
+      const oldPhase = currentPhase.phase;
+      console.log('[DEALER] Phase rotation: settling ' + oldPhase + ' then opening new phase');
+
+      // Step 1+2: settle the current phase
+      try {
+        await this.composeCashout(currentStacks);
+      } catch (e) {
+        return { error: 'composeCashout failed: ' + e.message };
+      }
+
+      const final = await this.finalizeCashout(settlementTimeoutMs);
+      if (!final.ok) {
+        return { error: 'finalizeCashout failed: ' + final.reason };
+      }
+      console.log('[DEALER] Old phase settled (tx ' + final.txid + ')');
+
+      // Step 3: open the new phase
+      const newPhase = await this.openPhase(newRoster, newThreshold);
+      console.log('[DEALER] New phase opened: ' + newPhase.phase);
+
+      // Step 4: wait for deposits in the new phase
+      const ok = await this.waitForPhaseDeposits(depositTimeoutMs);
+      if (!ok) {
+        return { error: 'new phase deposits timed out' };
+      }
+
+      console.log('[DEALER] Phase rotation complete: ' + oldPhase + ' -> ' + newPhase.phase);
+      return newPhase;
+    },
   };
 }
