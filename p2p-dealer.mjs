@@ -693,5 +693,156 @@ export function createP2PDealer(p2p, config, localNotify) {
       console.log('[DEALER] Phase deposits did not all arrive within timeout');
       return false;
     },
+
+    /**
+     * Compose a cashout proposal for the current phase.
+     *
+     * stacks: { playerId: amount, ... } — final chip stack per player from
+     *   the latest betting state. The dealer (or whoever's calling this) is
+     *   responsible for passing the correct stacks. Players will verify against
+     *   their own view of the betting state before signing.
+     *
+     * The cashout proposal includes:
+     * - Explicit JSON payouts list (id, payAddr, amount per player)
+     * - The unsigned settlement TX template that spends the multisig
+     * - Reference info so players can verify
+     *
+     * Publishes the cashout to the table identity at t_cashout.<phase>.
+     * Returns the cashout descriptor.
+     */
+    async composeCashout(stacks, bettingStateRef = null) {
+      if (!currentPhase || !currentPhase.confirmed) {
+        throw new Error('no confirmed phase to cash out');
+      }
+
+      const fee = 0.0001;
+
+      // Build the payouts list, validating each entry against the manifest
+      const payouts = [];
+      for (const signer of currentPhase.signers) {
+        const amount = stacks[signer.id];
+        if (typeof amount !== 'number' || amount < 0) {
+          throw new Error(`missing or invalid stack for ${signer.id}: ${amount}`);
+        }
+        payouts.push({
+          id: signer.id,
+          payAddr: signer.payAddr,
+          amount: Math.round(amount * 1e8) / 1e8,
+        });
+      }
+
+      // Sum invariant check (sum + fee should equal current multisig balance)
+      const totalPayout = payouts.reduce((s, p) => s + p.amount, 0);
+      const currentBalance = await p2p.getAddressBalance(currentPhase.multisigAddr);
+      const expectedTotal = Math.round((totalPayout + fee) * 1e8) / 1e8;
+      const balanceRounded = Math.round(currentBalance * 1e8) / 1e8;
+      if (Math.abs(expectedTotal - balanceRounded) > 0.0001) {
+        throw new Error(`sum invariant violated: payouts (${totalPayout}) + fee (${fee}) = ${expectedTotal} != balance (${balanceRounded})`);
+      }
+
+      // Compose the unsigned settlement TX
+      const txPayouts = payouts
+        .filter(p => p.amount > 0)  // skip zero-amount outputs (some chains reject dust)
+        .map(p => ({ address: p.payAddr, amount: p.amount }));
+      const unsignedHex = await p2p.composeSettlementTx(currentPhase.multisigAddr, txPayouts, fee);
+
+      const cashout = {
+        type: 'cashout',
+        phase: currentPhase.phase,
+        table: p2p.tableId,
+        multisigAddr: currentPhase.multisigAddr,
+        multisigBalance: balanceRounded,
+        bettingStateRef,
+        payouts,
+        fee,
+        unsignedTxHex: unsignedHex,
+        timestamp: Date.now(),
+      };
+
+      const cashoutKey = 'chips.vrsc::poker.sg777z.t_cashout.' + currentPhase.phase;
+      await p2p.write(p2p.tableId, cashoutKey, cashout);
+      console.log('[DEALER] Cashout proposal published for phase ' + currentPhase.phase);
+      console.log('[DEALER]   payouts: ' + payouts.map(p => p.id + '=' + p.amount).join(', '));
+
+      return cashout;
+    },
+
+    /**
+     * Read all cashout signature partials from the players for the current phase.
+     * Returns a map of playerId → signed hex (or null if not yet signed).
+     */
+    async readCashoutPartials(phase) {
+      if (!currentPhase) throw new Error('no current phase');
+      const partials = {};
+      for (const signer of currentPhase.signers) {
+        const key = 'chips.vrsc::poker.sg777z.p_cashout_sig.' + phase;
+        try {
+          const sig = await p2p.read(signer.id, key);
+          if (sig && sig.signedHex) {
+            partials[signer.id] = sig;
+          }
+        } catch (e) {
+          // Player hasn't signed yet or doesn't have the key
+        }
+      }
+      return partials;
+    },
+
+    /**
+     * Wait for the threshold of cashout signatures, combine the partials,
+     * and broadcast the complete settlement TX.
+     *
+     * Returns { ok: true, txid } on success or { ok: false, reason } on failure.
+     */
+    async finalizeCashout(timeoutMs = 300000) {
+      if (!currentPhase) throw new Error('no current phase');
+      const phase = currentPhase.phase;
+
+      console.log('[DEALER] Waiting for ' + currentPhase.threshold + ' of ' + currentPhase.signers.length + ' signatures on phase ' + phase);
+      const start = Date.now();
+
+      while (Date.now() - start < timeoutMs) {
+        const partials = await this.readCashoutPartials(phase);
+        const partialCount = Object.keys(partials).length;
+
+        if (partialCount >= currentPhase.threshold) {
+          console.log('[DEALER] Got ' + partialCount + ' signatures, attempting to combine and broadcast');
+          // Combine the partials
+          const partialHexes = Object.values(partials).map(p => p.signedHex);
+          try {
+            const combined = await p2p.combinePartials(partialHexes);
+            if (!combined.complete) {
+              console.log('[DEALER] Combined sig not yet complete (have ' + partialCount + ', need ' + currentPhase.threshold + '), waiting');
+              await WAIT(3000);
+              continue;
+            }
+
+            const txid = await p2p.broadcastSettlement(combined.hex);
+            console.log('[DEALER] Settlement broadcast: ' + txid);
+
+            // Publish cashout_settled
+            const settledKey = 'chips.vrsc::poker.sg777z.t_cashout_settled.' + phase;
+            await p2p.write(p2p.tableId, settledKey, {
+              type: 'cashout_settled',
+              phase,
+              settlementTxId: txid,
+              timestamp: Date.now(),
+            });
+
+            // Mark current phase as settled
+            currentPhase.settled = true;
+            currentPhase.settlementTxId = txid;
+
+            return { ok: true, txid };
+          } catch (e) {
+            console.log('[DEALER] Combine/broadcast failed: ' + e.message + ' — will retry');
+          }
+        }
+
+        await WAIT(3000);
+      }
+
+      return { ok: false, reason: 'timeout waiting for signatures' };
+    },
   };
 }

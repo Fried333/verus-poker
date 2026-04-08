@@ -867,5 +867,236 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
       }
       return null;
     },
+
+    /**
+     * Read the cashout proposal published by the dealer for a phase.
+     */
+    async readCashoutProposal(phase) {
+      const key = PHASE_KEYS.CASHOUT + '.' + phase;
+      return await p2p.read(tableId, key);
+    },
+
+    /**
+     * Verify a cashout proposal against the phase manifest, the player's
+     * own pay address, and (optionally) a stacks oracle (the latest betting
+     * state if available).
+     *
+     * stacksOracle: { playerId: expectedAmount, ... } — what each player
+     *   SHOULD be paid based on the on-chain betting state. The player verifies
+     *   the cashout matches this. If null, only the structural checks are run
+     *   (roster, addresses, sum invariant) — not the amount-vs-stacks check.
+     *
+     * Returns { ok: true } or { ok: false, reason: '...' }.
+     */
+    async verifyCashoutProposal(cashout, manifest, expectedPayAddr, stacksOracle = null) {
+      // 1. Schema and basic checks
+      if (!cashout || cashout.type !== 'cashout') {
+        return { ok: false, reason: 'wrong type' };
+      }
+      if (cashout.phase !== manifest.phase) {
+        return { ok: false, reason: `phase mismatch: cashout=${cashout.phase} manifest=${manifest.phase}` };
+      }
+      if (cashout.multisigAddr !== manifest.multisigAddr) {
+        return { ok: false, reason: 'multisig address mismatch' };
+      }
+      if (!Array.isArray(cashout.payouts)) {
+        return { ok: false, reason: 'missing payouts array' };
+      }
+
+      // 2. ROSTER CHECK: cashout payouts must match manifest signers exactly
+      const manifestIds = new Set(manifest.signers.map(s => s.id));
+      const payoutIds = new Set(cashout.payouts.map(p => p.id));
+
+      // 2a. No outsiders
+      for (const payoutId of payoutIds) {
+        if (!manifestIds.has(payoutId)) {
+          return { ok: false, reason: `unauthorized recipient: ${payoutId}` };
+        }
+      }
+      // 2b. No insiders silently dropped
+      for (const signerId of manifestIds) {
+        if (!payoutIds.has(signerId)) {
+          return { ok: false, reason: `missing signer in payouts: ${signerId}` };
+        }
+      }
+      // 2c. No duplicates
+      if (cashout.payouts.length !== manifest.signers.length) {
+        return { ok: false, reason: 'duplicate or extra entries' };
+      }
+
+      // 3. ADDRESS CHECK: each payout's payAddr must match the manifest
+      for (const payout of cashout.payouts) {
+        const manifestEntry = manifest.signers.find(s => s.id === payout.id);
+        if (payout.payAddr !== manifestEntry.payAddr) {
+          return {
+            ok: false,
+            reason: `${payout.id}: payAddr mismatch (manifest=${manifestEntry.payAddr}, cashout=${payout.payAddr})`,
+          };
+        }
+      }
+
+      // 4. SELF-CHECK: my own entry must use my own pay address
+      const myPayout = cashout.payouts.find(p => p.id === myId);
+      if (!myPayout) {
+        return { ok: false, reason: 'I am not in the payouts list' };
+      }
+      if (myPayout.payAddr !== expectedPayAddr) {
+        return { ok: false, reason: `my payAddr in cashout (${myPayout.payAddr}) does not match my actual (${expectedPayAddr})` };
+      }
+
+      // 5. AMOUNT CHECK (against stacks oracle if provided)
+      if (stacksOracle) {
+        for (const payout of cashout.payouts) {
+          const expected = stacksOracle[payout.id];
+          if (typeof expected !== 'number') {
+            return { ok: false, reason: `${payout.id} not in stacks oracle` };
+          }
+          if (Math.abs(payout.amount - expected) > 0.00000001) {
+            return { ok: false, reason: `${payout.id}: expected ${expected}, got ${payout.amount}` };
+          }
+        }
+      }
+
+      // 6. SUM INVARIANT
+      const totalPayout = cashout.payouts.reduce((s, p) => s + p.amount, 0);
+      const expectedTotal = totalPayout + cashout.fee;
+      if (Math.abs(expectedTotal - cashout.multisigBalance) > 0.00000001) {
+        return {
+          ok: false,
+          reason: `sum mismatch: payouts=${totalPayout} + fee=${cashout.fee} != balance=${cashout.multisigBalance}`,
+        };
+      }
+
+      // 7. UNSIGNED TX MUST MATCH JSON
+      if (!cashout.unsignedTxHex) {
+        return { ok: false, reason: 'missing unsignedTxHex' };
+      }
+      let decoded;
+      try {
+        decoded = await p2p.decodeRawTx(cashout.unsignedTxHex);
+      } catch (e) {
+        return { ok: false, reason: 'failed to decode unsignedTxHex: ' + e.message };
+      }
+
+      // Check outputs match payouts (skipping zero-amount payouts which were filtered out of the TX)
+      const nonZeroPayouts = cashout.payouts.filter(p => p.amount > 0);
+      if (decoded.vout.length !== nonZeroPayouts.length) {
+        return { ok: false, reason: `tx vout count ${decoded.vout.length} != non-zero payouts ${nonZeroPayouts.length}` };
+      }
+      for (const v of decoded.vout) {
+        const addrs = v.scriptPubKey?.addresses || [];
+        const addr = addrs[0];
+        const matchingPayout = nonZeroPayouts.find(p => p.payAddr === addr);
+        if (!matchingPayout) {
+          return { ok: false, reason: `tx output to unknown address ${addr}` };
+        }
+        if (Math.abs(v.value - matchingPayout.amount) > 0.00000001) {
+          return { ok: false, reason: `tx output ${addr}: amount ${v.value} != ${matchingPayout.amount}` };
+        }
+      }
+
+      // 8. INPUTS MUST MATCH MULTISIG UTXOS
+      const msUtxos = await p2p.getAddressUtxos(cashout.multisigAddr);
+      for (const vin of decoded.vin) {
+        const matching = msUtxos.find(u => u.txid === vin.txid && u.vout === vin.vout);
+        if (!matching) {
+          return { ok: false, reason: `tx input ${vin.txid}:${vin.vout} not found at multisig` };
+        }
+      }
+
+      return { ok: true, myPayout };
+    },
+
+    /**
+     * Sign a cashout proposal (after verification has passed) and publish
+     * the partial signature to my own identity.
+     *
+     * Returns { ok: true, txid: ..., signedHex: ..., complete: ... }.
+     */
+    async signAndPublishCashout(cashout) {
+      const signed = await p2p.signSettlementTx(cashout.unsignedTxHex);
+      if (!signed.hex) {
+        throw new Error('signing failed: no hex returned');
+      }
+      // Publish the partial sig to my own identity under p_cashout_sig.<phase>
+      const sigKey = PHASE_KEYS.CASHOUT_SIG + '.' + cashout.phase;
+      await p2p.write(myId, sigKey, {
+        type: 'cashout_sig',
+        phase: cashout.phase,
+        cashoutTimestamp: cashout.timestamp,
+        signedHex: signed.hex,
+        complete: signed.complete,
+        timestamp: Date.now(),
+      });
+      console.log('[PLAYER ' + myId + '] Signed cashout for phase ' + cashout.phase + ' (complete=' + signed.complete + ')');
+      return { ok: true, signedHex: signed.hex, complete: signed.complete };
+    },
+
+    /**
+     * Convenience: read the cashout proposal, verify it, sign it, publish.
+     * This is the typical end-to-end flow when a player is online at settlement time.
+     */
+    async respondToCashout(phase, manifest, expectedPayAddr, stacksOracle = null) {
+      const cashout = await this.readCashoutProposal(phase);
+      if (!cashout) {
+        return { ok: false, reason: 'no cashout proposal found' };
+      }
+      const verify = await this.verifyCashoutProposal(cashout, manifest, expectedPayAddr, stacksOracle);
+      if (!verify.ok) {
+        console.log('[PLAYER ' + myId + '] REFUSING cashout: ' + verify.reason);
+        return { ok: false, reason: verify.reason };
+      }
+      const result = await this.signAndPublishCashout(cashout);
+      return result;
+    },
+
+    /**
+     * Read the cashout_settled record for a phase, indicating the settlement
+     * TX was broadcast.
+     */
+    async readCashoutSettled(phase) {
+      const key = 'chips.vrsc::poker.sg777z.t_cashout_settled.' + phase;
+      return await p2p.read(tableId, key);
+    },
+
+    // ══════════════════════════════════════
+    // LOBBY: scan known tables for pending cashouts that need my signature
+    // ══════════════════════════════════════
+
+    /**
+     * Given a list of (table, phase) pairs the player has been part of, return
+     * any pending cashouts that need this player's signature (i.e., the cashout
+     * proposal exists but this player hasn't yet published a partial sig for it,
+     * AND the cashout hasn't been settled).
+     */
+    async scanPendingCashouts(tablesAndPhases) {
+      const pending = [];
+      for (const { table, phase } of tablesAndPhases) {
+        const tableP2p = (table === tableId)
+          ? p2p  // already on the right tableId
+          : p2p; // simplified — production code would need a per-table p2p handle
+
+        const cashoutKey = PHASE_KEYS.CASHOUT + '.' + phase;
+        const cashout = await tableP2p.read(table, cashoutKey);
+        if (!cashout || cashout.type !== 'cashout') continue;
+
+        // Already settled?
+        const settledKey = 'chips.vrsc::poker.sg777z.t_cashout_settled.' + phase;
+        const settled = await tableP2p.read(table, settledKey);
+        if (settled && settled.type === 'cashout_settled') continue;
+
+        // Already signed by me?
+        const sigKey = PHASE_KEYS.CASHOUT_SIG + '.' + phase;
+        const mySig = await p2p.read(myId, sigKey);
+        if (mySig && mySig.signedHex) continue;
+
+        // Am I a signer of this cashout?
+        const myPayout = cashout.payouts.find(p => p.id === myId);
+        if (!myPayout) continue;
+
+        pending.push({ table, phase, cashout, myPayout });
+      }
+      return pending;
+    },
   };
 }

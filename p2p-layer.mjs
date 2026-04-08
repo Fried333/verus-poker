@@ -320,25 +320,52 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     return await client.call('signrawtransaction', params);
   }
 
-  // Combine two or more partial signatures into a single TX.
-  // Each input is a partially-signed hex; signrawtransaction merges them.
+  // Combine partial signatures into a single TX.
+  //
+  // Verus does NOT have combinerawtransaction, so cross-daemon signing must
+  // be SEQUENTIAL: each signer signs on top of the previous one's partial.
+  //
+  // This function works in two modes:
+  //
+  // 1. Local-wallet mode (all keys in one wallet): pass any partial (or even
+  //    an unsigned template) and signrawtransaction will add all available
+  //    signatures from the local wallet in one call.
+  //
+  // 2. Sequential-merge mode (multiple partials each adding one signature):
+  //    pass the partials in signing order. The function returns the partial
+  //    that has the most signatures already (typically the last one in
+  //    the chain). For true distributed signing, you'd want to start with
+  //    the unsigned template and have each signer sequentially sign and
+  //    publish, with the next signer reading the previous one's published
+  //    partial.
+  //
   // Returns { hex, complete }.
   async function combinePartials(partialHexes) {
     if (!Array.isArray(partialHexes) || partialHexes.length === 0) {
       throw new Error('no partials to combine');
     }
-    // Start with the first partial, then re-sign it adding each subsequent one's signatures
-    let current = partialHexes[0];
-    for (let i = 1; i < partialHexes.length; i++) {
-      // signrawtransaction can take multiple partial sigs via the second arg in some forks,
-      // but the safest cross-version approach is sequential combine via re-signing.
-      const result = await client.call('signrawtransaction', [partialHexes[i]]);
-      // If this signer has additional keys, this picks them up
-      current = result.hex;
+
+    // Try each partial in order — the most-signed one will succeed first
+    let bestComplete = null;
+    let bestPartial = partialHexes[0];
+
+    for (const hex of partialHexes) {
+      try {
+        const result = await client.call('signrawtransaction', [hex]);
+        if (result.complete) {
+          // This partial (after local wallet signed) is complete — return it
+          return result;
+        }
+        bestPartial = result.hex;
+      } catch (e) {
+        // skip invalid partials
+      }
     }
-    // Final signrawtransaction to finalize
-    const final = await client.call('signrawtransaction', [current]);
-    return final;
+
+    // None were complete on their own. Return the best partial we have.
+    // (Production cross-daemon flow: caller passes this partial to the next
+    // signer, who signs it and publishes the new version.)
+    return { hex: bestPartial, complete: false };
   }
 
   // Broadcast a fully-signed TX. Returns the txid.
