@@ -608,9 +608,14 @@ export function createP2PDealer(p2p, config, localNotify) {
         multisigAddr: ms.address,
         redeemScript: ms.redeemScript,
         threshold,
+        // Include pubkeys for the canonical signers list so other parties
+        // (players, observers) can independently compute the same multisig
+        // and call addmultisigaddress on their own wallets.
+        pubkeys,
         signers: sortedRoster.map(r => ({
           id: r.id,
           payAddr: r.payAddr,
+          pubkey: r.pubkey,
           expectedDeposit: r.expectedDeposit,
         })),
         timestamp: Date.now(),
@@ -834,21 +839,29 @@ export function createP2PDealer(p2p, config, localNotify) {
 
       while (Date.now() - start < timeoutMs) {
         const partials = await this.readCashoutPartials(phase);
-        const partialCount = Object.keys(partials).length;
+        const partialHexes = Object.values(partials).map(p => p.signedHex);
 
-        if (partialCount >= currentPhase.threshold) {
-          console.log('[DEALER] Got ' + partialCount + ' signatures, attempting to combine and broadcast');
-          // Combine the partials
-          const partialHexes = Object.values(partials).map(p => p.signedHex);
+        // With sequential signing (Verus has no combinerawtransaction), the
+        // LATEST partial is the one with the most signatures. Try each partial
+        // — the one that's complete is the assembled TX we want.
+        let completeHex = null;
+        for (const hex of partialHexes) {
           try {
-            const combined = await p2p.combinePartials(partialHexes);
-            if (!combined.complete) {
-              console.log('[DEALER] Combined sig not yet complete (have ' + partialCount + ', need ' + currentPhase.threshold + '), waiting');
-              await WAIT(3000);
-              continue;
+            const decoded = await p2p.decodeRawTx(hex);
+            // Quick check: try signing it locally — if signrawtransaction
+            // returns complete=true, this hex has all the sigs needed.
+            const trySign = await p2p.client.call('signrawtransaction', [hex]);
+            if (trySign.complete) {
+              completeHex = trySign.hex;
+              break;
             }
+          } catch {}
+        }
 
-            const txid = await p2p.broadcastSettlement(combined.hex);
+        if (completeHex) {
+          console.log('[DEALER] Found complete settlement signature, broadcasting');
+          try {
+            const txid = await p2p.broadcastSettlement(completeHex);
             console.log('[DEALER] Settlement broadcast: ' + txid);
 
             // Publish cashout_settled

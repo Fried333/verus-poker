@@ -893,6 +893,24 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
     },
 
     /**
+     * Add the phase multisig to the local wallet so signrawtransaction can
+     * correctly add signatures to partial multisig spends. Idempotent.
+     */
+    async ensureMultisigInWallet(manifest) {
+      if (!manifest.pubkeys || !manifest.threshold) {
+        console.log('[PLAYER ' + myId + '] manifest missing pubkeys/threshold; cannot import multisig');
+        return false;
+      }
+      try {
+        await p2p.client.call('addmultisigaddress', [manifest.threshold, manifest.pubkeys]);
+        return true;
+      } catch (e) {
+        // Already present or other recoverable error
+        return false;
+      }
+    },
+
+    /**
      * Deposit my expected stake to the phase multisig from one or more UTXOs
      * at the given pay address.
      *
@@ -910,6 +928,10 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
     async depositToPhase(manifest, payAddr) {
       const verify = this.verifyPhaseManifest(manifest, payAddr);
       if (!verify.ok) throw new Error('manifest verification failed: ' + verify.reason);
+
+      // Make sure the local wallet knows about this multisig so it can later
+      // contribute its key to partial signatures of the settlement TX.
+      await this.ensureMultisigInWallet(manifest);
 
       const amount = verify.myEntry.expectedDeposit;
       const fee = 0.0001;
@@ -1202,29 +1224,29 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
           const cashout = await this.readCashoutProposal(phase);
           if (!cashout || cashout.type !== 'cashout') continue;
 
-          // Already signed by me?
-          const sigKey = PHASE_KEYS.CASHOUT_SIG + '.' + phase;
-          const mySig = await p2p.read(myId, sigKey);
-          if (mySig && mySig.signedHex && mySig.cashoutTimestamp === cashout.timestamp) continue;
-
           // Already settled?
           const settled = await this.readCashoutSettled(phase);
           if (settled) continue;
+
+          const sigKey = PHASE_KEYS.CASHOUT_SIG + '.' + phase;
+          const mySig = await p2p.read(myId, sigKey);
+
+          // If I've already published a COMPLETE partial, I'm done
+          if (mySig && mySig.signedHex && mySig.cashoutTimestamp === cashout.timestamp && mySig.complete) {
+            continue;
+          }
 
           // Read the manifest so we can verify
           const manifest = await this.readPhaseManifest(phase);
           if (!manifest) continue;
 
+          // Make sure the wallet knows about this multisig so signing works
+          await this.ensureMultisigInWallet(manifest);
+
           // Find my entry to get my pay address
           const myEntry = manifest.signers.find(s => s.id === myId);
           if (!myEntry) continue;
 
-          // Build a stacks oracle from the cashout itself (since we don't have a
-          // separate betting state to verify against in the simple flow). The
-          // verification still catches structural issues (roster, addresses,
-          // sum invariant, tx-vs-json) — it just doesn't independently verify
-          // the AMOUNTS against an external truth source. Production code would
-          // pass the on-chain betting state as the oracle here.
           const stacksOracle = {};
           for (const p of cashout.payouts) stacksOracle[p.id] = p.amount;
 
@@ -1234,7 +1256,54 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             continue;
           }
 
-          await this.signAndPublishCashout(cashout);
+          // SEQUENTIAL SIGNING: look for an existing partial from another signer
+          // and sign on top of it. This is required because Verus has no
+          // combinerawtransaction — partial multisig signatures can only be
+          // combined by chaining signrawtransaction calls.
+          //
+          // Strategy: scan all OTHER signers' identities for a partial sig.
+          // If found, use the most-recent partial as the input to our sign.
+          // Otherwise sign the raw unsigned hex (we're the first signer).
+          let inputHex = cashout.unsignedTxHex;
+          let baseSigCount = 0;
+          for (const otherSigner of manifest.signers) {
+            if (otherSigner.id === myId) continue;
+            try {
+              const otherSig = await p2p.read(otherSigner.id, sigKey);
+              if (otherSig && otherSig.signedHex && otherSig.cashoutTimestamp === cashout.timestamp) {
+                inputHex = otherSig.signedHex;
+                baseSigCount++;
+                console.log('[PLAYER ' + myId + '] using partial from ' + otherSigner.id + ' as base for sequential signing');
+                break;
+              }
+            } catch {}
+          }
+
+          // Build prevtxs with the multisig's redeemScript so signrawtransaction
+          // knows how to add a partial signature for the multisig input.
+          // This is REQUIRED for partial multisig signing across daemons.
+          const msUtxos = await p2p.getAddressUtxos(cashout.multisigAddr);
+          const prevtxs = msUtxos.map(u => ({
+            txid: u.txid,
+            vout: u.vout,
+            scriptPubKey: u.script,
+            redeemScript: manifest.redeemScript,
+            amount: u.amount,
+          }));
+
+          const signed = await p2p.signSettlementTx(inputHex, prevtxs);
+          if (!signed.hex) throw new Error('signing returned no hex');
+
+          // Publish OUR resulting partial (which now has baseSigCount + 1 sigs)
+          await p2p.write(myId, sigKey, {
+            type: 'cashout_sig',
+            phase: cashout.phase,
+            cashoutTimestamp: cashout.timestamp,
+            signedHex: signed.hex,
+            complete: signed.complete,
+            timestamp: Date.now(),
+          });
+          console.log('[PLAYER ' + myId + '] Signed cashout for phase ' + cashout.phase + ' (complete=' + signed.complete + ', based on ' + baseSigCount + ' prior sigs)');
           justSigned.push(phase);
         } catch (e) {
           console.log('[PLAYER ' + myId + '] autoRespondToCashouts error for ' + phase + ': ' + e.message);

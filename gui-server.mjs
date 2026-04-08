@@ -33,6 +33,7 @@ const args = Object.fromEntries(
 const PORT = parseInt(args.port || '3000');
 const MY_ID = args.id || 'pc-player';
 const TABLE_ID = args.table || 'ptable2';
+const PHASE_MULTISIG = !!args['phase-multisig'];
 
 const MIME = {
   '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css',
@@ -66,7 +67,8 @@ function findRPC() {
 const rpc = findRPC();
 const p2p = createP2PLayer(rpc, MY_ID, TABLE_ID);
 let seatChoice = parseInt(args.seat) >= 0 ? parseInt(args.seat) : undefined;
-const backend = createPlayerBackend(p2p, MY_ID, TABLE_ID, { seat: seatChoice });
+const backend = createPlayerBackend(p2p, MY_ID, TABLE_ID, { seat: seatChoice, phaseMultisig: PHASE_MULTISIG });
+if (PHASE_MULTISIG) console.log('[GUI] phase-multisig mode ENABLED');
 
 // ══════════════════════════════════════
 // HTTP Server — serve static files from public/
