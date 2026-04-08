@@ -225,8 +225,172 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     return null;
   }
 
+  // ──────────────────────────────────────────────
+  // Multisig primitives — for phase-multisig funding
+  // (additive — does not affect existing code paths)
+  // ──────────────────────────────────────────────
+
+  function round8(n) {
+    return Math.round(n * 1e8) / 1e8;
+  }
+
+  // Compute (and add to wallet) a multisig address from pubkeys + threshold.
+  // Returns { address, redeemScript }.
+  async function computeMultisigAddress(pubkeys, threshold) {
+    if (!Array.isArray(pubkeys) || pubkeys.length < threshold) {
+      throw new Error('invalid pubkeys/threshold');
+    }
+    const ms = await client.call('createmultisig', [threshold, pubkeys]);
+    // Also add to local wallet so signrawtransaction knows about it
+    try {
+      await client.call('addmultisigaddress', [threshold, pubkeys]);
+    } catch (e) {
+      // May already be added — not fatal
+    }
+    return { address: ms.address, redeemScript: ms.redeemScript };
+  }
+
+  // Get all UTXOs at a given address using the address index (works for any
+  // address, including multisig addresses not in the local wallet).
+  // Returns: [{ txid, vout, amount, address, script, height }, ...]
+  async function getAddressUtxos(addr) {
+    const raw = await client.call('getaddressutxos', [{ addresses: [addr] }]);
+    return (raw || []).map(u => ({
+      txid: u.txid,
+      vout: u.outputIndex,
+      amount: u.satoshis / 1e8,
+      satoshis: u.satoshis,
+      address: u.address,
+      script: u.script,
+      height: u.height,
+      isspendable: u.isspendable,
+    }));
+  }
+
+  // Get total balance at an address (sum of UTXO amounts).
+  async function getAddressBalance(addr) {
+    const utxos = await getAddressUtxos(addr);
+    return utxos.reduce((s, u) => s + u.amount, 0);
+  }
+
+  // Wait until at least `expectedCount` UTXOs are visible at `addr` or timeout.
+  async function waitForAddressUtxos(addr, expectedCount, timeoutMs = 60000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const utxos = await getAddressUtxos(addr);
+      if (utxos.length >= expectedCount) return utxos;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    return await getAddressUtxos(addr);
+  }
+
+  // Compose an unsigned settlement TX that spends ALL UTXOs at the multisig
+  // address and creates one output per payout entry.
+  // payouts: [{ address, amount }, ...]
+  // Returns: unsigned hex string.
+  async function composeSettlementTx(msAddr, payouts, fee = 0.0001) {
+    const utxos = await getAddressUtxos(msAddr);
+    if (utxos.length === 0) throw new Error('no UTXOs at ' + msAddr);
+
+    const totalIn = utxos.reduce((s, u) => s + u.amount, 0);
+    const totalOut = payouts.reduce((s, p) => s + p.amount, 0);
+    const computedFee = round8(totalIn - totalOut);
+    if (computedFee < 0) throw new Error(`outputs (${totalOut}) exceed inputs (${totalIn})`);
+    if (Math.abs(computedFee - fee) > 0.00000001) {
+      // Allow caller to specify expected fee; warn if mismatch
+      console.log('[P2P] composeSettlement: caller fee=' + fee + ' actual fee=' + computedFee);
+    }
+
+    const inputs = utxos.map(u => ({ txid: u.txid, vout: u.vout }));
+    const outputs = {};
+    for (const p of payouts) {
+      if (outputs[p.address]) throw new Error('duplicate output address: ' + p.address);
+      outputs[p.address] = round8(p.amount);
+    }
+
+    return await client.call('createrawtransaction', [inputs, outputs]);
+  }
+
+  // Sign a multisig TX with the local wallet's available keys.
+  // Returns { hex, complete, errors? }.
+  // - If `prevTxs` is provided, uses signrawtransaction with explicit prevtxs
+  //   (useful when the wallet doesn't have full UTXO history).
+  async function signSettlementTx(unsignedHex, prevTxs = null) {
+    const params = prevTxs ? [unsignedHex, prevTxs] : [unsignedHex];
+    return await client.call('signrawtransaction', params);
+  }
+
+  // Combine two or more partial signatures into a single TX.
+  // Each input is a partially-signed hex; signrawtransaction merges them.
+  // Returns { hex, complete }.
+  async function combinePartials(partialHexes) {
+    if (!Array.isArray(partialHexes) || partialHexes.length === 0) {
+      throw new Error('no partials to combine');
+    }
+    // Start with the first partial, then re-sign it adding each subsequent one's signatures
+    let current = partialHexes[0];
+    for (let i = 1; i < partialHexes.length; i++) {
+      // signrawtransaction can take multiple partial sigs via the second arg in some forks,
+      // but the safest cross-version approach is sequential combine via re-signing.
+      const result = await client.call('signrawtransaction', [partialHexes[i]]);
+      // If this signer has additional keys, this picks them up
+      current = result.hex;
+    }
+    // Final signrawtransaction to finalize
+    const final = await client.call('signrawtransaction', [current]);
+    return final;
+  }
+
+  // Broadcast a fully-signed TX. Returns the txid.
+  async function broadcastSettlement(signedHex) {
+    return await client.call('sendrawtransaction', [signedHex]);
+  }
+
+  // Lock specific UTXOs so the wallet's coin selector won't pick them.
+  async function lockUtxos(utxos) {
+    if (!Array.isArray(utxos) || utxos.length === 0) return;
+    const list = utxos.map(u => ({ txid: u.txid, vout: u.vout }));
+    return await client.call('lockunspent', [false, list]);
+  }
+
+  // Unlock previously-locked UTXOs.
+  async function unlockUtxos(utxos) {
+    if (!Array.isArray(utxos) || utxos.length === 0) return;
+    const list = utxos.map(u => ({ txid: u.txid, vout: u.vout }));
+    return await client.call('lockunspent', [true, list]);
+  }
+
+  // Decode an unsigned (or signed) raw transaction. Returns the decoded structure.
+  async function decodeRawTx(hex) {
+    return await client.call('decoderawtransaction', [hex]);
+  }
+
+  // Validate an address and get its pubkey (only works if the wallet owns it).
+  async function getAddressPubkey(addr) {
+    const v = await client.call('validateaddress', [addr]);
+    if (!v.pubkey) throw new Error('no pubkey available for ' + addr + ' (not in wallet?)');
+    return v.pubkey;
+  }
+
   return {
     client, myId, tableId, writeBatch,
+
+    // ═══════════════════════════════════════
+    // MULTISIG primitives (phase-multisig funding)
+    // ═══════════════════════════════════════
+    computeMultisigAddress,
+    getAddressUtxos,
+    getAddressBalance,
+    waitForAddressUtxos,
+    composeSettlementTx,
+    signSettlementTx,
+    combinePartials,
+    broadcastSettlement,
+    lockUtxos,
+    unlockUtxos,
+    decodeRawTx,
+    getAddressPubkey,
+
 
     // ═══════════════════════════════════════
     // PLAYER writes to PLAYER'S OWN ID
