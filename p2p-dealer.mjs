@@ -28,6 +28,12 @@ export function createP2PDealer(p2p, config, localNotify) {
   const MAX_TIMEOUTS = 1; // Sit out after this many consecutive timeouts (industry standard)
   const useCashiers = cashiers && cashiers.length > 0;
 
+  // ──────────────────────────────────────────────
+  // Phase multisig state (additive — does not affect existing runHand flow yet)
+  // ──────────────────────────────────────────────
+  let phaseCount = 0;
+  let currentPhase = null; // { phase, multisigAddr, redeemScript, signers, threshold, ... }
+
   function notify(event, data) {
     if (localNotify) localNotify(event, data);
   }
@@ -548,6 +554,144 @@ export function createP2PDealer(p2p, config, localNotify) {
         return true;
       }
       return false;
-    }
+    },
+
+    // ══════════════════════════════════════
+    // PHASE MULTISIG FUNDING (additive — not yet wired into runHand)
+    // ══════════════════════════════════════
+
+    getCurrentPhase() {
+      return currentPhase;
+    },
+
+    /**
+     * Open a new phase: compose the multisig from the roster, publish the
+     * phase manifest to the table identity, return the phase descriptor.
+     *
+     * roster: [{ id, payAddr, pubkey, expectedDeposit }, ...]
+     * threshold: number of signatures required (typically N-1 of N for N≥3, or 2 of 2 for heads-up)
+     */
+    async openPhase(roster, threshold) {
+      if (!Array.isArray(roster) || roster.length < 2) {
+        throw new Error('roster must have at least 2 players');
+      }
+      if (threshold > roster.length) {
+        throw new Error('threshold cannot exceed roster size');
+      }
+
+      phaseCount++;
+      const phase = (gameId || 'g0') + '_p' + phaseCount;
+      console.log('[DEALER] Opening phase ' + phase + ' with ' + roster.length + ' players (threshold ' + threshold + ')');
+
+      // Sort pubkeys deterministically so the multisig address is reproducible
+      const sortedRoster = [...roster].sort((a, b) => a.pubkey.localeCompare(b.pubkey));
+      const pubkeys = sortedRoster.map(r => r.pubkey);
+
+      const ms = await p2p.computeMultisigAddress(pubkeys, threshold);
+      console.log('[DEALER] Phase ' + phase + ' multisig: ' + ms.address);
+
+      const manifest = {
+        type: 'phase_open',
+        phase,
+        table: p2p.tableId,
+        multisigAddr: ms.address,
+        redeemScript: ms.redeemScript,
+        threshold,
+        signers: sortedRoster.map(r => ({
+          id: r.id,
+          payAddr: r.payAddr,
+          expectedDeposit: r.expectedDeposit,
+        })),
+        timestamp: Date.now(),
+      };
+
+      const manifestKey = 'chips.vrsc::poker.sg777z.t_phase_open.' + phase;
+      await p2p.write(p2p.tableId, manifestKey, manifest);
+      console.log('[DEALER] Phase manifest published: ' + manifestKey);
+
+      currentPhase = {
+        ...manifest,
+        confirmed: false,
+        deposits: {},
+      };
+
+      return currentPhase;
+    },
+
+    /**
+     * Wait for all expected deposits to be visible at the multisig address.
+     * Polls the chain via getaddressutxos. When all deposits are confirmed,
+     * publishes phase_confirmed and updates currentPhase.confirmed.
+     *
+     * Returns true if all deposits arrived within the timeout, false otherwise.
+     */
+    async waitForPhaseDeposits(timeoutMs = 120000) {
+      if (!currentPhase) throw new Error('no current phase');
+
+      const expectedTotal = currentPhase.signers.reduce((s, r) => s + r.expectedDeposit, 0);
+      console.log('[DEALER] Waiting for deposits at ' + currentPhase.multisigAddr + ' (expecting ' + expectedTotal + ' CHIPS)');
+
+      const deposits = {};
+      const start = Date.now();
+
+      while (Date.now() - start < timeoutMs) {
+        const utxos = await p2p.getAddressUtxos(currentPhase.multisigAddr);
+
+        // Try to attribute each UTXO back to a player by walking the source TX
+        for (const utxo of utxos) {
+          if (deposits[utxo.txid]) continue; // already attributed
+          try {
+            const tx = await p2p.client.call('getrawtransaction', [utxo.txid, 1]);
+            // The source address is the first input's previous output
+            if (tx.vin && tx.vin.length > 0) {
+              const prev = await p2p.client.call('getrawtransaction', [tx.vin[0].txid, 1]);
+              const senderAddrs = prev.vout[tx.vin[0].vout].scriptPubKey.addresses || [];
+              const sender = senderAddrs[0];
+              const matchingSigner = currentPhase.signers.find(s => s.payAddr === sender);
+              if (matchingSigner) {
+                deposits[utxo.txid] = {
+                  player: matchingSigner.id,
+                  amount: utxo.amount,
+                  txid: utxo.txid,
+                  vout: utxo.vout,
+                };
+              }
+            }
+          } catch (e) {
+            // TX not yet available — try again next poll
+          }
+        }
+
+        // Check if all expected deposits are present
+        const playersWithDeposits = new Set(Object.values(deposits).map(d => d.player));
+        const allDeposited = currentPhase.signers.every(s => playersWithDeposits.has(s.id));
+
+        if (allDeposited) {
+          // Publish phase_confirmed
+          const totalBalance = utxos.reduce((s, u) => s + u.amount, 0);
+          const confirmedRecord = {
+            type: 'phase_confirmed',
+            phase: currentPhase.phase,
+            multisigAddr: currentPhase.multisigAddr,
+            deposits,
+            totalBalance,
+            timestamp: Date.now(),
+          };
+          const confirmedKey = 'chips.vrsc::poker.sg777z.t_phase_confirmed.' + currentPhase.phase;
+          await p2p.write(p2p.tableId, confirmedKey, confirmedRecord);
+          console.log('[DEALER] Phase confirmed: ' + Object.keys(deposits).length + ' deposits, total ' + totalBalance + ' CHIPS');
+
+          currentPhase.confirmed = true;
+          currentPhase.deposits = deposits;
+          currentPhase.totalBalance = totalBalance;
+          return true;
+        }
+
+        await WAIT(2000);
+      }
+
+      console.log('[DEALER] Phase deposits did not all arrive within timeout');
+      return false;
+    },
   };
 }
