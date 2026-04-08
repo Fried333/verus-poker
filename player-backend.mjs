@@ -259,6 +259,84 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
     async start() {
       log('Starting backend for ' + myId + ' on table ' + tableId);
 
+      // Phase-multisig tracking state. The polling loop calls
+      // _handlePhaseMultisig() each iteration to detect new phases and
+      // pending cashouts on the table identity, and respond automatically
+      // (deposit when a phase opens, sign when a cashout is proposed).
+      const trackedPhases = new Set();
+      const depositedPhases = new Set();
+      let myPayAddr = null;
+
+      // Resolve my own pay address from my identity (if present in this wallet)
+      try {
+        const idInfo = await p2p.client.call('getidentity', [myId + (myId.endsWith('@') ? '' : '.CHIPS@')]);
+        if (idInfo?.identity?.primaryaddresses?.[0]) {
+          myPayAddr = idInfo.identity.primaryaddresses[0];
+          log('My pay address: ' + myPayAddr);
+        }
+      } catch {}
+
+      // Helper called from the polling loop to handle phase events
+      const handlePhaseMultisig = async () => {
+        if (!myPayAddr) return; // skip if we don't know our pay address
+        if (!options.phaseMultisig) return; // opt-in flag
+
+        // Detect any new phase manifest the dealer has published
+        // We scan a few possible recent phase IDs based on the current session.
+        // For now, we trust the table identity to publish all phases under
+        // session_pN keys.
+        const sessionId = state.session;
+        if (!sessionId) return;
+
+        // Try a small range of phase numbers (1..10) for the current session
+        for (let i = 1; i <= 10; i++) {
+          const phaseId = sessionId + '_p' + i;
+          if (depositedPhases.has(phaseId)) continue;
+
+          const manifest = await this.readPhaseManifest(phaseId);
+          if (!manifest) continue;
+
+          // I'm in this phase?
+          const myEntry = manifest.signers.find(s => s.id === myId);
+          if (!myEntry) continue;
+
+          // Already confirmed by dealer?
+          const confirmed = await this.readPhaseConfirmed(phaseId);
+          if (confirmed) {
+            depositedPhases.add(phaseId);
+            trackedPhases.add(phaseId);
+            continue;
+          }
+
+          // Verify the manifest matches my pay address
+          const verify = this.verifyPhaseManifest(manifest, myPayAddr);
+          if (!verify.ok) {
+            log('Phase manifest verify failed: ' + verify.reason);
+            continue;
+          }
+
+          // Check we have the funds and try to deposit
+          try {
+            log('Auto-depositing ' + verify.myEntry.expectedDeposit + ' to phase ' + phaseId);
+            await this.depositToPhase(manifest, myPayAddr);
+            depositedPhases.add(phaseId);
+            trackedPhases.add(phaseId);
+          } catch (e) {
+            log('Auto-deposit failed for ' + phaseId + ': ' + e.message);
+          }
+        }
+
+        // Auto-sign any pending cashouts on tracked phases
+        if (trackedPhases.size > 0) {
+          try {
+            const signed = await this.autoRespondToCashouts(Array.from(trackedPhases));
+            if (signed.length > 0) log('Auto-signed cashouts: ' + signed.join(', '));
+          } catch (e) {
+            log('Auto-sign error: ' + e.message);
+          }
+        }
+      };
+
       // Verify chain connection
       try {
         const info = await p2p.client.getInfo();
@@ -360,6 +438,9 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
       // ── Poll loop ──
       while (true) {
         try {
+          // Phase multisig hook (opt-in via options.phaseMultisig)
+          await handlePhaseMultisig();
+
           // 0. Detect dealer session change (e.g., dealer was restarted)
           // The session is cached at startup and never refreshes otherwise; if the
           // dealer comes back with a new session our cached one is stale and the

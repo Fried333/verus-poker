@@ -34,6 +34,8 @@ const STATIC_DIR = '/root/pangea-poker/dist';
 const MAX_PLAYERS = 9;
 const MIN_PLAYERS = 2;      // Start hand when this many are seated
 const CASHIER_IDS = (process.argv.find(a => a.startsWith('--cashiers='))?.split('=')[1] || '').split(',').filter(Boolean);
+const PHASE_MULTISIG = process.argv.includes('--phase-multisig');
+const PHASE_BUYIN = parseFloat(process.argv.find(a => a.startsWith('--buyin='))?.split('=')[1] || '1.0');
 const CONFIG = { smallBlind: 1, bigBlind: 2, rake: 0, cashiers: CASHIER_IDS };
 
 const MIME = {
@@ -1186,6 +1188,27 @@ if (USE_LOCAL) {
         }
       }
 
+      // Phase-multisig state for the dealer
+      let phaseOpen = false;
+
+      // Build a roster from the dealer's players[] state, pulling payAddr/pubkey
+      // from each player's join_request on chain (already collected at sit-in time)
+      async function buildPhaseRoster(players) {
+        const roster = [];
+        for (const p of players) {
+          const req = await p2p.read(p.id, KEYS.JOIN_REQUEST);
+          if (!req || !req.payAddr || !req.pubkey) {
+            console.log('[P2P] [phase] missing payAddr/pubkey for ' + p.id);
+            return null;
+          }
+          roster.push({
+            id: p.id, payAddr: req.payAddr, pubkey: req.pubkey,
+            expectedDeposit: PHASE_BUYIN,
+          });
+        }
+        return roster;
+      }
+
       const gameLoop = async () => {
         while (true) {
           // Scan for new players + sat-out players wanting back in + active players sitting out
@@ -1205,6 +1228,35 @@ if (USE_LOCAL) {
             continue;
           }
 
+          // ── PHASE MULTISIG: open phase + wait for deposits before the hand ──
+          if (PHASE_MULTISIG && !phaseOpen) {
+            console.log('[P2P] [phase] Opening phase for ' + activePlayers.length + ' players (buyin ' + PHASE_BUYIN + ' CHIPS each)');
+            const roster = await buildPhaseRoster(activePlayers);
+            if (!roster) {
+              console.log('[P2P] [phase] roster incomplete — waiting for join requests with payAddr');
+              await new Promise(r => setTimeout(r, 3000));
+              continue;
+            }
+            try {
+              const threshold = roster.length;  // N-of-N requires all signers (heads-up: 2-of-2)
+              await p2pDealer.openPhase(roster, threshold);
+              const ok = await p2pDealer.waitForPhaseDeposits(180000);
+              if (!ok) {
+                console.log('[P2P] [phase] deposit timeout — retrying scan');
+                await new Promise(r => setTimeout(r, 3000));
+                continue;
+              }
+              // Reset each player's chip stack to their buy-in amount
+              for (const p of activePlayers) p.chips = PHASE_BUYIN;
+              phaseOpen = true;
+              console.log('[P2P] [phase] phase ready — starting hand');
+            } catch (e) {
+              console.log('[P2P] [phase] openPhase failed: ' + e.message);
+              await new Promise(r => setTimeout(r, 3000));
+              continue;
+            }
+          }
+
           console.log('[P2P] Starting hand with ' + activePlayers.length + ' players...');
           dLog('system', 'Starting hand...');
           await new Promise(r => setTimeout(r, 3000));
@@ -1213,6 +1265,24 @@ if (USE_LOCAL) {
           } catch (e) {
             console.log('[P2P] Hand error: ' + e.message);
             console.log(e.stack);
+          }
+
+          // ── PHASE MULTISIG: compose + finalize cashout after the hand ──
+          if (PHASE_MULTISIG && phaseOpen) {
+            try {
+              console.log('[P2P] [phase] Composing cashout from current chip stacks');
+              await p2pDealer.composeCashoutFromPlayers();
+              console.log('[P2P] [phase] Waiting for player signatures and broadcasting...');
+              const result = await p2pDealer.finalizeCashout(180000);
+              if (result.ok) {
+                console.log('[P2P] [phase] Settlement broadcast: ' + result.txid);
+              } else {
+                console.log('[P2P] [phase] Finalize failed: ' + result.reason);
+              }
+            } catch (e) {
+              console.log('[P2P] [phase] cashout error: ' + e.message);
+            }
+            phaseOpen = false;  // next hand opens a fresh phase
           }
 
           // Between hands — kick stale sit-outs, scan for joins/sit-out changes
