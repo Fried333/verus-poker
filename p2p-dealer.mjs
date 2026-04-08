@@ -846,6 +846,41 @@ export function createP2PDealer(p2p, config, localNotify) {
     },
 
     /**
+     * Compose a cashout for the current phase using the current player chip
+     * stacks from the dealer's in-memory players[] state.
+     *
+     * This is the convenience wrapper that ties the existing hand-play state
+     * (players[].chips) to the new cashout flow. Use it after a hand or
+     * sequence of hands has finished and you want to settle.
+     *
+     * Optional `feeAbsorber` is the player ID who absorbs the TX fee
+     * (subtracted from their stack). Defaults to the player with the smallest
+     * non-zero stack.
+     */
+    async composeCashoutFromPlayers(feeAbsorber = null) {
+      if (!currentPhase || !currentPhase.confirmed) {
+        throw new Error('no confirmed phase');
+      }
+      const fee = 0.0001;
+      const stacks = {};
+      for (const signer of currentPhase.signers) {
+        const p = players.find(x => x.id === signer.id);
+        stacks[signer.id] = p ? p.chips : 0;
+      }
+
+      // Determine fee absorber if not specified
+      if (!feeAbsorber) {
+        const candidates = currentPhase.signers
+          .filter(s => stacks[s.id] >= fee)
+          .sort((a, b) => stacks[a.id] - stacks[b.id]);
+        feeAbsorber = candidates.length ? candidates[0].id : currentPhase.signers[0].id;
+      }
+      stacks[feeAbsorber] = Math.round((stacks[feeAbsorber] - fee) * 1e8) / 1e8;
+
+      return await this.composeCashout(stacks);
+    },
+
+    /**
      * Trigger a phase rotation to a new roster.
      *
      * 1. Compose and publish a cashout for the current phase using `currentStacks`
