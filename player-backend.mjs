@@ -139,10 +139,24 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
         const tc = await p2p.read(tableId, KEYS.TABLE_CONFIG);
         if (tc && tc.session) state.session = tc.session;
         const joinData = { table: tableId, player: myId, session: state.session, ready: true, timestamp: Date.now() };
+        // Include payAddr for phase-multisig support: this is the player's
+        // identity primary R-address which the dealer uses to compute the
+        // multisig and to verify deposits.
+        try {
+          const idInfo = await p2p.client.call('getidentity', [myId + (myId.endsWith('@') ? '' : '.CHIPS@')]);
+          if (idInfo?.identity?.primaryaddresses?.[0]) {
+            joinData.payAddr = idInfo.identity.primaryaddresses[0];
+            // Also fetch the pubkey for the multisig setup
+            try {
+              const v = await p2p.client.call('validateaddress', [joinData.payAddr]);
+              if (v?.pubkey) joinData.pubkey = v.pubkey;
+            } catch {}
+          }
+        } catch {}
         if (seat !== undefined) joinData.seat = seat;
         else if (options.seat !== undefined) joinData.seat = options.seat;
         await p2p.write(myId, KEYS.JOIN_REQUEST, joinData);
-        log('Sit-in join written');
+        log('Sit-in join written' + (joinData.payAddr ? ' (payAddr=' + joinData.payAddr.slice(0, 8) + ')' : ''));
       } catch (e) {
         log('Sit-in write failed: ' + e.message);
       }
