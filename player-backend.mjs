@@ -24,6 +24,14 @@ const KEYS = {
   SETTLEMENT:    'chips.vrsc::poker.sg777z.t_settlement_info',
 };
 
+// Phase multisig keys (additive — used by the new funding flow)
+const PHASE_KEYS = {
+  PHASE_OPEN:      'chips.vrsc::poker.sg777z.t_phase_open',       // dealer publishes (per phase)
+  PHASE_CONFIRMED: 'chips.vrsc::poker.sg777z.t_phase_confirmed',  // dealer publishes (per phase)
+  CASHOUT:         'chips.vrsc::poker.sg777z.t_cashout',          // dealer publishes (per phase)
+  CASHOUT_SIG:     'chips.vrsc::poker.sg777z.p_cashout_sig',      // player publishes (per phase)
+};
+
 export function createPlayerBackend(p2p, myId, tableId, options = {}) {
   // ── State (single source of truth) ──
   const state = {
@@ -733,6 +741,131 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
         }
         await WAIT(500);
       }
-    }
+    },
+
+    // ══════════════════════════════════════
+    // PHASE MULTISIG FUNDING (additive — separate from existing flow)
+    // ══════════════════════════════════════
+
+    /**
+     * Read the phase manifest published by the dealer to the table identity.
+     * Returns null if no manifest exists for the given phase.
+     */
+    async readPhaseManifest(phase) {
+      const key = PHASE_KEYS.PHASE_OPEN + '.' + phase;
+      return await p2p.read(tableId, key);
+    },
+
+    /**
+     * Read the phase confirmed record (after dealer detected all deposits).
+     */
+    async readPhaseConfirmed(phase) {
+      const key = PHASE_KEYS.PHASE_CONFIRMED + '.' + phase;
+      return await p2p.read(tableId, key);
+    },
+
+    /**
+     * Verify a phase manifest contains my expected entry.
+     * Returns { ok: true } or { ok: false, reason: '...' }.
+     */
+    verifyPhaseManifest(manifest, expectedPayAddr) {
+      if (!manifest || manifest.type !== 'phase_open') {
+        return { ok: false, reason: 'not a phase_open manifest' };
+      }
+      if (!Array.isArray(manifest.signers) || manifest.signers.length < 2) {
+        return { ok: false, reason: 'invalid signers list' };
+      }
+      const myEntry = manifest.signers.find(s => s.id === myId);
+      if (!myEntry) {
+        return { ok: false, reason: `myId ${myId} not in signers list` };
+      }
+      if (myEntry.payAddr !== expectedPayAddr) {
+        return {
+          ok: false,
+          reason: `payAddr mismatch: manifest=${myEntry.payAddr} expected=${expectedPayAddr}`,
+        };
+      }
+      if (typeof myEntry.expectedDeposit !== 'number' || myEntry.expectedDeposit <= 0) {
+        return { ok: false, reason: 'invalid expectedDeposit' };
+      }
+      if (!manifest.multisigAddr) {
+        return { ok: false, reason: 'missing multisig address' };
+      }
+      if (typeof manifest.threshold !== 'number' || manifest.threshold < 2) {
+        return { ok: false, reason: 'invalid threshold' };
+      }
+      return { ok: true, myEntry };
+    },
+
+    /**
+     * Deposit my expected stake to the phase multisig from a specific source UTXO
+     * at the given pay address.
+     *
+     * Uses createrawtransaction with explicit input selection so the wallet's
+     * coin selector cannot raid funds from other addresses. The change goes
+     * back to the same pay address.
+     *
+     * Returns the deposit txid.
+     */
+    async depositToPhase(manifest, payAddr) {
+      const verify = this.verifyPhaseManifest(manifest, payAddr);
+      if (!verify.ok) throw new Error('manifest verification failed: ' + verify.reason);
+
+      const amount = verify.myEntry.expectedDeposit;
+      const fee = 0.0001;
+
+      // Find a spendable UTXO at the pay address that can cover amount + fee
+      const utxos = await p2p.getAddressUtxos(payAddr);
+      const candidates = utxos
+        .filter(u => u.amount >= amount + fee)
+        .sort((a, b) => a.amount - b.amount); // smallest sufficient UTXO
+
+      if (candidates.length === 0) {
+        const total = utxos.reduce((s, u) => s + u.amount, 0);
+        throw new Error(`no UTXO at ${payAddr} can cover ${amount} + ${fee} (have ${utxos.length} UTXOs totaling ${total})`);
+      }
+
+      const srcUtxo = candidates[0];
+
+      // Lock the source UTXO so the wallet's coin selector won't pick it for
+      // any other operation between now and broadcast
+      await p2p.lockUtxos([srcUtxo]);
+
+      try {
+        // Build the explicit raw TX
+        const change = Math.round((srcUtxo.amount - amount - fee) * 1e8) / 1e8;
+        const inputs = [{ txid: srcUtxo.txid, vout: srcUtxo.vout }];
+        const outputs = { [manifest.multisigAddr]: amount };
+        if (change > 0) outputs[payAddr] = change;
+
+        const rawTx = await p2p.client.call('createrawtransaction', [inputs, outputs]);
+        const signed = await p2p.client.call('signrawtransaction', [rawTx]);
+        if (!signed.complete) {
+          throw new Error('failed to sign deposit TX');
+        }
+        const txid = await p2p.client.call('sendrawtransaction', [signed.hex]);
+        console.log('[PLAYER ' + myId + '] Deposited ' + amount + ' CHIPS to ' + manifest.multisigAddr + ' (tx ' + txid.slice(0, 16) + ')');
+        return txid;
+      } finally {
+        // Unlock the source UTXO (it's been spent now, so this is just cleanup)
+        await p2p.unlockUtxos([srcUtxo]);
+      }
+    },
+
+    /**
+     * Wait for the dealer to publish phase_confirmed for the given phase.
+     * Returns the confirmed record, or null on timeout.
+     */
+    async waitForPhaseConfirmed(phase, timeoutMs = 120000) {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const confirmed = await this.readPhaseConfirmed(phase);
+        if (confirmed && confirmed.type === 'phase_confirmed') {
+          return confirmed;
+        }
+        await WAIT(2000);
+      }
+      return null;
+    },
   };
 }
