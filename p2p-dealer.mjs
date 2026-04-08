@@ -590,6 +590,17 @@ export function createP2PDealer(p2p, config, localNotify) {
       const ms = await p2p.computeMultisigAddress(pubkeys, threshold);
       console.log('[DEALER] Phase ' + phase + ' multisig: ' + ms.address);
 
+      // Snapshot existing UTXOs at the multisig address — these are PRE-EXISTING
+      // (from previous sessions or unexpected sources) and will be excluded
+      // from this phase's deposit attribution. Only NEW UTXOs created AFTER
+      // this snapshot will be considered legitimate phase deposits.
+      const preExistingUtxos = new Set(
+        (await p2p.getAddressUtxos(ms.address)).map(u => u.txid + ':' + u.vout)
+      );
+      if (preExistingUtxos.size > 0) {
+        console.log('[DEALER] ' + preExistingUtxos.size + ' pre-existing UTXOs at multisig address (excluded from attribution)');
+      }
+
       const manifest = {
         type: 'phase_open',
         phase,
@@ -613,6 +624,7 @@ export function createP2PDealer(p2p, config, localNotify) {
         ...manifest,
         confirmed: false,
         deposits: {},
+        preExistingUtxos,
       };
 
       return currentPhase;
@@ -637,8 +649,12 @@ export function createP2PDealer(p2p, config, localNotify) {
       while (Date.now() - start < timeoutMs) {
         const utxos = await p2p.getAddressUtxos(currentPhase.multisigAddr);
 
-        // Try to attribute each UTXO back to a player by walking the source TX
+        // Try to attribute each UTXO back to a player by walking the source TX.
+        // SKIP pre-existing UTXOs that were at the address before this phase
+        // opened — those are from previous sessions or unexpected sources.
         for (const utxo of utxos) {
+          const utxoKey = utxo.txid + ':' + utxo.vout;
+          if (currentPhase.preExistingUtxos.has(utxoKey)) continue;
           if (deposits[utxo.txid]) continue; // already attributed
           try {
             const tx = await p2p.client.call('getrawtransaction', [utxo.txid, 1]);
@@ -731,27 +747,42 @@ export function createP2PDealer(p2p, config, localNotify) {
         });
       }
 
-      // Sum invariant check (sum + fee should equal current multisig balance)
+      // Use only the attributed deposit UTXOs as inputs (not all UTXOs at the
+      // multisig address). This avoids spending orphan UTXOs from previous
+      // sessions or unexpected sources. Orphans stay at the multisig address
+      // and can be recovered separately.
+      const explicitUtxos = Object.values(currentPhase.deposits).map(d => ({
+        txid: d.txid,
+        vout: d.vout,
+        amount: d.amount,
+      }));
+      const attributedTotal = explicitUtxos.reduce((s, u) => s + u.amount, 0);
+      const attributedRounded = Math.round(attributedTotal * 1e8) / 1e8;
+
+      // Sum invariant: payouts + fee == sum of attributed deposits (NOT raw multisig balance)
       const totalPayout = payouts.reduce((s, p) => s + p.amount, 0);
-      const currentBalance = await p2p.getAddressBalance(currentPhase.multisigAddr);
       const expectedTotal = Math.round((totalPayout + fee) * 1e8) / 1e8;
-      const balanceRounded = Math.round(currentBalance * 1e8) / 1e8;
-      if (Math.abs(expectedTotal - balanceRounded) > 0.0001) {
-        throw new Error(`sum invariant violated: payouts (${totalPayout}) + fee (${fee}) = ${expectedTotal} != balance (${balanceRounded})`);
+      if (Math.abs(expectedTotal - attributedRounded) > 0.0001) {
+        throw new Error(`sum invariant violated: payouts (${totalPayout}) + fee (${fee}) = ${expectedTotal} != attributed deposits (${attributedRounded})`);
       }
 
-      // Compose the unsigned settlement TX
+      // Compose the unsigned settlement TX using ONLY the attributed UTXOs
       const txPayouts = payouts
-        .filter(p => p.amount > 0)  // skip zero-amount outputs (some chains reject dust)
+        .filter(p => p.amount > 0)
         .map(p => ({ address: p.payAddr, amount: p.amount }));
-      const unsignedHex = await p2p.composeSettlementTx(currentPhase.multisigAddr, txPayouts, fee);
+      const unsignedHex = await p2p.composeSettlementTx(
+        currentPhase.multisigAddr,
+        txPayouts,
+        fee,
+        explicitUtxos
+      );
 
       const cashout = {
         type: 'cashout',
         phase: currentPhase.phase,
         table: p2p.tableId,
         multisigAddr: currentPhase.multisigAddr,
-        multisigBalance: balanceRounded,
+        multisigBalance: attributedRounded,
         bettingStateRef,
         payouts,
         fee,

@@ -284,12 +284,19 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     return await getAddressUtxos(addr);
   }
 
-  // Compose an unsigned settlement TX that spends ALL UTXOs at the multisig
-  // address and creates one output per payout entry.
+  // Compose an unsigned settlement TX that spends specific UTXOs (or ALL if
+  // no list given) at the multisig address and creates one output per payout.
+  //
   // payouts: [{ address, amount }, ...]
+  // explicitUtxos: optional [{ txid, vout, amount }, ...] — if provided, only
+  //   these UTXOs are spent; otherwise all UTXOs at msAddr are spent.
+  //   This lets the dealer spend only attributed deposits, leaving orphan
+  //   UTXOs (e.g., from old test runs or unexpected sources) at the multisig
+  //   address for separate recovery.
+  //
   // Returns: unsigned hex string.
-  async function composeSettlementTx(msAddr, payouts, fee = 0.0001) {
-    const utxos = await getAddressUtxos(msAddr);
+  async function composeSettlementTx(msAddr, payouts, fee = 0.0001, explicitUtxos = null) {
+    const utxos = explicitUtxos || await getAddressUtxos(msAddr);
     if (utxos.length === 0) throw new Error('no UTXOs at ' + msAddr);
 
     const totalIn = utxos.reduce((s, u) => s + u.amount, 0);
@@ -297,7 +304,6 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     const computedFee = round8(totalIn - totalOut);
     if (computedFee < 0) throw new Error(`outputs (${totalOut}) exceed inputs (${totalIn})`);
     if (Math.abs(computedFee - fee) > 0.00000001) {
-      // Allow caller to specify expected fee; warn if mismatch
       console.log('[P2P] composeSettlement: caller fee=' + fee + ' actual fee=' + computedFee);
     }
 

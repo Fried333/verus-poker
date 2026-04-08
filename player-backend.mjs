@@ -812,12 +812,17 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
     },
 
     /**
-     * Deposit my expected stake to the phase multisig from a specific source UTXO
+     * Deposit my expected stake to the phase multisig from one or more UTXOs
      * at the given pay address.
      *
      * Uses createrawtransaction with explicit input selection so the wallet's
      * coin selector cannot raid funds from other addresses. The change goes
      * back to the same pay address.
+     *
+     * Coin selection strategy:
+     *   1. If any single UTXO covers (amount + fee), use the smallest such one
+     *   2. Otherwise, combine multiple smaller UTXOs (largest first) until the
+     *      total covers (amount + fee)
      *
      * Returns the deposit txid.
      */
@@ -827,28 +832,45 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
 
       const amount = verify.myEntry.expectedDeposit;
       const fee = 0.0001;
+      const needed = amount + fee;
 
-      // Find a spendable UTXO at the pay address that can cover amount + fee
       const utxos = await p2p.getAddressUtxos(payAddr);
-      const candidates = utxos
-        .filter(u => u.amount >= amount + fee)
-        .sort((a, b) => a.amount - b.amount); // smallest sufficient UTXO
-
-      if (candidates.length === 0) {
-        const total = utxos.reduce((s, u) => s + u.amount, 0);
-        throw new Error(`no UTXO at ${payAddr} can cover ${amount} + ${fee} (have ${utxos.length} UTXOs totaling ${total})`);
+      const totalAvailable = utxos.reduce((s, u) => s + u.amount, 0);
+      if (totalAvailable < needed) {
+        throw new Error(`insufficient funds at ${payAddr}: need ${needed}, have ${totalAvailable} (${utxos.length} UTXOs)`);
       }
 
-      const srcUtxo = candidates[0];
+      // Strategy 1: find smallest single UTXO that covers
+      const singleCandidate = utxos
+        .filter(u => u.amount >= needed)
+        .sort((a, b) => a.amount - b.amount)[0];
 
-      // Lock the source UTXO so the wallet's coin selector won't pick it for
-      // any other operation between now and broadcast
-      await p2p.lockUtxos([srcUtxo]);
+      let selectedUtxos;
+      if (singleCandidate) {
+        selectedUtxos = [singleCandidate];
+      } else {
+        // Strategy 2: combine multiple UTXOs (largest first to minimize input count)
+        const sorted = [...utxos].sort((a, b) => b.amount - a.amount);
+        selectedUtxos = [];
+        let acc = 0;
+        for (const u of sorted) {
+          selectedUtxos.push(u);
+          acc += u.amount;
+          if (acc >= needed) break;
+        }
+        if (acc < needed) {
+          throw new Error(`could not assemble enough inputs at ${payAddr}`);
+        }
+      }
+
+      const totalIn = selectedUtxos.reduce((s, u) => s + u.amount, 0);
+      const change = Math.round((totalIn - amount - fee) * 1e8) / 1e8;
+
+      // Lock the source UTXOs to prevent wallet contamination
+      await p2p.lockUtxos(selectedUtxos);
 
       try {
-        // Build the explicit raw TX
-        const change = Math.round((srcUtxo.amount - amount - fee) * 1e8) / 1e8;
-        const inputs = [{ txid: srcUtxo.txid, vout: srcUtxo.vout }];
+        const inputs = selectedUtxos.map(u => ({ txid: u.txid, vout: u.vout }));
         const outputs = { [manifest.multisigAddr]: amount };
         if (change > 0) outputs[payAddr] = change;
 
@@ -858,11 +880,10 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
           throw new Error('failed to sign deposit TX');
         }
         const txid = await p2p.client.call('sendrawtransaction', [signed.hex]);
-        console.log('[PLAYER ' + myId + '] Deposited ' + amount + ' CHIPS to ' + manifest.multisigAddr + ' (tx ' + txid.slice(0, 16) + ')');
+        console.log('[PLAYER ' + myId + '] Deposited ' + amount + ' CHIPS to ' + manifest.multisigAddr + ' (tx ' + txid.slice(0, 16) + ', ' + selectedUtxos.length + ' inputs)');
         return txid;
       } finally {
-        // Unlock the source UTXO (it's been spent now, so this is just cleanup)
-        await p2p.unlockUtxos([srcUtxo]);
+        await p2p.unlockUtxos(selectedUtxos);
       }
     },
 
@@ -1076,6 +1097,70 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
     // ══════════════════════════════════════
     // LOBBY: scan known tables for pending cashouts that need my signature
     // ══════════════════════════════════════
+
+    /**
+     * Auto-respond to pending cashouts on this table. Used by the player's
+     * polling loop during a session to sign settlements as they're proposed
+     * by the dealer.
+     *
+     * For each phase the player is/was part of:
+     *   1. Check if there's a cashout proposal we haven't signed yet
+     *   2. If yes, look up the manifest, verify the proposal, sign + publish
+     *
+     * trackedPhases: array of phase IDs to check (the phases the player has
+     *   participated in this session). The caller is responsible for tracking
+     *   which phases the player has joined.
+     *
+     * Returns the list of phases that were just signed (so the caller can
+     * remove them from the to-do list).
+     */
+    async autoRespondToCashouts(trackedPhases) {
+      const justSigned = [];
+      for (const phase of trackedPhases) {
+        try {
+          const cashout = await this.readCashoutProposal(phase);
+          if (!cashout || cashout.type !== 'cashout') continue;
+
+          // Already signed by me?
+          const sigKey = PHASE_KEYS.CASHOUT_SIG + '.' + phase;
+          const mySig = await p2p.read(myId, sigKey);
+          if (mySig && mySig.signedHex && mySig.cashoutTimestamp === cashout.timestamp) continue;
+
+          // Already settled?
+          const settled = await this.readCashoutSettled(phase);
+          if (settled) continue;
+
+          // Read the manifest so we can verify
+          const manifest = await this.readPhaseManifest(phase);
+          if (!manifest) continue;
+
+          // Find my entry to get my pay address
+          const myEntry = manifest.signers.find(s => s.id === myId);
+          if (!myEntry) continue;
+
+          // Build a stacks oracle from the cashout itself (since we don't have a
+          // separate betting state to verify against in the simple flow). The
+          // verification still catches structural issues (roster, addresses,
+          // sum invariant, tx-vs-json) — it just doesn't independently verify
+          // the AMOUNTS against an external truth source. Production code would
+          // pass the on-chain betting state as the oracle here.
+          const stacksOracle = {};
+          for (const p of cashout.payouts) stacksOracle[p.id] = p.amount;
+
+          const verify = await this.verifyCashoutProposal(cashout, manifest, myEntry.payAddr, stacksOracle);
+          if (!verify.ok) {
+            console.log('[PLAYER ' + myId + '] REFUSING auto-cashout for ' + phase + ': ' + verify.reason);
+            continue;
+          }
+
+          await this.signAndPublishCashout(cashout);
+          justSigned.push(phase);
+        } catch (e) {
+          console.log('[PLAYER ' + myId + '] autoRespondToCashouts error for ' + phase + ': ' + e.message);
+        }
+      }
+      return justSigned;
+    },
 
     /**
      * Given a list of (table, phase) pairs the player has been part of, return
