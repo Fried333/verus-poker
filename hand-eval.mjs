@@ -7,7 +7,12 @@
 const RANKS = '23456789TJQKA';
 const SUITS = 'cdhs';
 
-export const cardToString = (c) => RANKS[c % 13] + SUITS[Math.floor(c / 13)];
+export const cardToString = (c) => {
+  // Defensive: out-of-range cards (e.g. failed decode) render as ?? instead
+  // of "Qundefined" so the user sees something obviously wrong, not garbage.
+  if (typeof c !== 'number' || !Number.isFinite(c) || c < 0 || c >= 52) return '??';
+  return RANKS[c % 13] + SUITS[Math.floor(c / 13)];
+};
 export const stringToCard = (s) => SUITS.indexOf(s[1]) * 13 + RANKS.indexOf(s[0]);
 
 function evaluate5(cards) {

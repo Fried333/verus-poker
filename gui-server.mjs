@@ -156,6 +156,7 @@ function buildClientState() {
     table: TABLE_ID,
     myId: MY_ID,
     mode: 'p2p',
+    phaseMultisig: PHASE_MULTISIG,
     smallBlind: 1,
     bigBlind: 2,
     phase: s.phase,

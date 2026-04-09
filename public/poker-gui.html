@@ -542,11 +542,18 @@ function renderControls() {
   const el = document.getElementById('controls');
   if (!st) return;
 
-  // Busted — show reload button
+  // Busted — in phase-multisig mode there's no auto-reload, you must leave or
+  // wait for a phase rotation. In legacy mode, show the Reload 200 button.
   if (st.busted) {
-    el.innerHTML =
-      '<span class="wait-text" style="color:#ef5350">Out of chips!</span>' +
-      '<button class="btn-call" onclick="doReload()" style="margin-left:10px">Reload 200</button>';
+    if (st.phaseMultisig) {
+      el.innerHTML =
+        '<span class="wait-text" style="color:#ef5350">Out of chips — phase locked</span>' +
+        '<button class="btn-fold" onclick="doLeave()" style="margin-left:10px" title="Cash out and leave the table">Leave</button>';
+    } else {
+      el.innerHTML =
+        '<span class="wait-text" style="color:#ef5350">Out of chips!</span>' +
+        '<button class="btn-call" onclick="doReload()" style="margin-left:10px">Reload 200</button>';
+    }
     return;
   }
 

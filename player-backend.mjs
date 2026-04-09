@@ -196,6 +196,12 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
         log('Knock sent (tx ' + txid.slice(0, 16) + ')');
       } catch (e) {
         log('Knock failed: ' + e.message);
+        // Surface fund / setup errors so the user understands why Sit In
+        // appeared to do nothing. Other transient errors stay quiet.
+        if (e.message && (e.message.includes('insufficient funds at i-addr') || e.message.includes('no primary address'))) {
+          state.message = 'Cannot join: ' + e.message;
+          notify();
+        }
       }
     },
 
@@ -452,8 +458,21 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             await this.depositToPhase(manifest, myPayAddr);
             depositedPhases.add(phaseId);
             trackedPhases.add(phaseId);
+            // Clear any prior funding-error message on success
+            if (state.message && state.message.startsWith('Insufficient funds')) {
+              state.message = '';
+              notify();
+            }
           } catch (e) {
             log('Auto-deposit failed for ' + phaseId + ': ' + e.message);
+            // Surface insufficient-funds errors to the GUI so the user knows
+            // why the table is stuck. Other errors are transient and should
+            // not block the user.
+            if (e.message && e.message.toLowerCase().includes('insufficient funds')) {
+              const need = verify.myEntry.expectedDeposit;
+              state.message = 'Insufficient funds at ' + myPayAddr.slice(0, 12) + '… — need ' + need + ' CHIPS to join phase. Fund this address and click Sit In again.';
+              notify();
+            }
           }
         }
 

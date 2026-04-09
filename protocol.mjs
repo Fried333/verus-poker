@@ -260,8 +260,12 @@ export function decodeCard(encryptedCard, b_ij, e_i, d, p_i, initialDeck) {
     }
   }
 
-  // Fallback: try getCardIndex
-  return getCardIndex(point);
+  // Fallback: try the byte-30 hint, but ONLY accept if it's a valid card
+  // index (0..51). Returning a raw byte (0..255) here was producing nonsense
+  // values like 134/180 that propagated through the dealer as garbage cards.
+  const hint = getCardIndex(point);
+  if (Number.isInteger(hint) && hint >= 0 && hint < 52) return hint;
+  return -1;
 }
 
 /**
