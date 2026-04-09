@@ -1398,31 +1398,33 @@ if (USE_LOCAL) {
           const oldSignerIds = new Set((p2pDealer.getCurrentPhase()?.signers || []).map(s => s.id));
           const hasNewJoiners = newRoster.some(r => !oldSignerIds.has(r.id));
 
+          // Build joiner intents: for each new player not in the old phase,
+          // read their UTXOs and select enough to cover the deposit.
+          const joinerIntents = [];
           if (hasNewJoiners) {
-            // Joiner case: fall back to old sequential rotation for now.
-            // Atomic rotation with joiners requires the joiner to publish
-            // deposit_intent + UTXOs, which is a bigger change. Coming in
-            // the next iteration.
-            console.log('[P2P] [phase] New joiners detected — using sequential rotation');
-            await p2pDealer.composeCashoutFromPlayers();
-            const result = await p2pDealer.finalizeCashout(180000);
-            if (!result.ok) {
-              console.log('[P2P] [phase] Rotation cashout failed: ' + result.reason);
-              return false;
+            for (const r of newRoster) {
+              if (oldSignerIds.has(r.id)) continue; // continuing, not joining
+              try {
+                const utxos = await p2p.getAddressUtxos(r.payAddr);
+                const needed = PHASE_BUYIN + 0.0001; // deposit + fee contribution
+                const sorted = [...utxos].filter(u => u.amount > 0).sort((a, b) => b.amount - a.amount);
+                let selected = []; let acc = 0;
+                for (const u of sorted) { selected.push(u); acc += u.amount; if (acc >= needed) break; }
+                if (acc < needed) {
+                  console.log('[P2P] [phase] Joiner ' + r.id + ' has insufficient funds (' + acc + ' < ' + needed + ') — excluding');
+                  continue;
+                }
+                joinerIntents.push({ id: r.id, payAddr: r.payAddr, utxos: selected, depositAmount: PHASE_BUYIN });
+                console.log('[P2P] [phase] Joiner ' + r.id + ': ' + selected.length + ' UTXOs, ' + acc + ' CHIPS');
+              } catch (e) {
+                console.log('[P2P] [phase] Failed to read joiner ' + r.id + ' UTXOs: ' + e.message);
+              }
             }
-            console.log('[P2P] [phase] Rotation settlement broadcast: ' + result.txid);
-            for (const id of leavingPlayers) {
-              p2pDealer.removePlayer(id); seatedPlayers.delete(id);
-              console.log('[P2P] [phase] Removed ' + id + ' from table');
-            }
-            leavingPlayers.clear();
-            phaseOpen = false; currentPhaseRoster = null;
-            return true;
           }
 
-          // ATOMIC ROTATION: no new joiners, just leavers + continuing
-          // One TX settles old multisig → pays leavers + funds new multisig
-          await p2pDealer.composeAtomicRotation(newRoster, newThreshold, []);
+          // ATOMIC ROTATION: one TX settles old multisig → pays leavers + funds new multisig
+          // Joiner inputs (if any) are included so their deposit is part of the same TX.
+          await p2pDealer.composeAtomicRotation(newRoster, newThreshold, joinerIntents);
           const result = await p2pDealer.finalizeCashout(180000);
           if (!result.ok) {
             console.log('[P2P] [phase] Atomic rotation failed: ' + result.reason);
@@ -1442,12 +1444,14 @@ if (USE_LOCAL) {
 
           // Phase stays OPEN — no gap
           currentPhaseRoster = new Set(newRoster.map(r => r.id));
-          // Reset chips to carry-over amounts from the atomic rotation
+          // Set joiner chips to their buy-in; continuing players keep their stacks
+          for (const ji of joinerIntents) {
+            const p = p2pDealer.getPlayers().find(x => x.id === ji.id);
+            if (p) p.chips = ji.depositAmount;
+            else p2pDealer.addPlayer(ji.id, ji.depositAmount);
+          }
           for (const p of p2pDealer.getPlayers()) {
-            if (currentPhaseRoster.has(p.id)) {
-              // chips are already correct from the dealer's in-memory state
-              p._loggedBust = false;
-            }
+            if (currentPhaseRoster.has(p.id)) p._loggedBust = false;
           }
           return true;
         } catch (e) {

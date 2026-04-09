@@ -572,8 +572,8 @@ export function createP2PDealer(p2p, config, localNotify) {
      * threshold: number of signatures required (typically N-1 of N for N≥3, or 2 of 2 for heads-up)
      */
     async openPhase(roster, threshold) {
-      if (!Array.isArray(roster) || roster.length < 2) {
-        throw new Error('roster must have at least 2 players');
+      if (!Array.isArray(roster) || roster.length < 1) {
+        throw new Error('roster must have at least 1 player');
       }
       if (threshold > roster.length) {
         throw new Error('threshold cannot exceed roster size');
