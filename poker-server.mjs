@@ -1167,6 +1167,10 @@ if (USE_LOCAL) {
         }));
         for (const [pid, req] of reads) {
           if (seatedPlayers.has(pid)) continue;
+          // Skip join_requests with leaving:true — that's a leave marker, not a join
+          if (req && req.leaving === true) continue;
+          // Skip explicit ready:false (sit-out marker)
+          if (req && req.ready === false && !req.leaving) continue;
           const hasSession = req && req.session === sessionId;
           const isRecent = req && req.timestamp && req.timestamp > tableOpenTime && (Date.now() - req.timestamp) < 300000;
           const isCorrectTable = req && req.table === TABLE_ID;
