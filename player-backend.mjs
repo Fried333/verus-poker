@@ -1188,20 +1188,9 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
       if (!cashout || (cashout.type !== 'cashout' && cashout.type !== 'atomic_rotation')) {
         return { ok: false, reason: 'wrong type: ' + (cashout?.type || 'null') };
       }
-      if (cashout.phase !== manifest.phase) {
-        return { ok: false, reason: `phase mismatch: cashout=${cashout.phase} manifest=${manifest.phase}` };
-      }
-      if (cashout.multisigAddr !== manifest.multisigAddr) {
-        return { ok: false, reason: 'multisig address mismatch' };
-      }
-      if (!Array.isArray(cashout.payouts)) {
-        return { ok: false, reason: 'missing payouts array' };
-      }
 
-      // For atomic rotations: lighter verification. Continuing players'
-      // stacks go to the NEW multisig output, not to their R-addr. Only
-      // leavers get R-addr payouts. The unsigned TX is the authority —
-      // any signer can refuse to sign if they disagree.
+      // For atomic rotations: lighter verification FIRST — the tx structure
+      // is different from regular cashouts (no payouts array, uses oldMultisigAddr).
       if (cashout.type === 'atomic_rotation') {
         if (cashout.phase !== manifest.phase) {
           return { ok: false, reason: 'phase mismatch' };
@@ -1221,6 +1210,15 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
       }
 
       // ── Regular cashout verification below ──
+      if (cashout.phase !== manifest.phase) {
+        return { ok: false, reason: `phase mismatch: cashout=${cashout.phase} manifest=${manifest.phase}` };
+      }
+      if (cashout.multisigAddr !== manifest.multisigAddr) {
+        return { ok: false, reason: 'multisig address mismatch' };
+      }
+      if (!Array.isArray(cashout.payouts)) {
+        return { ok: false, reason: 'missing payouts array' };
+      }
 
       // 2. ROSTER CHECK: cashout payouts must match manifest signers exactly
       const manifestIds = new Set(manifest.signers.map(s => s.id));

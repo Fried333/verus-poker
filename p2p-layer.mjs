@@ -252,10 +252,12 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
 
   // Get all UTXOs at a given address using the address index (works for any
   // address, including multisig addresses not in the local wallet).
+  // Filters out UTXOs already consumed by mempool transactions to prevent
+  // "bad-txns-inputs-spent" errors from double-spending.
   // Returns: [{ txid, vout, amount, address, script, height }, ...]
   async function getAddressUtxos(addr) {
     const raw = await client.call('getaddressutxos', [{ addresses: [addr] }]);
-    return (raw || []).map(u => ({
+    const utxos = (raw || []).map(u => ({
       txid: u.txid,
       vout: u.outputIndex,
       amount: u.satoshis / 1e8,
@@ -265,6 +267,20 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
       height: u.height,
       isspendable: u.isspendable,
     }));
+    // Filter out UTXOs already spent in mempool (negative satoshis = spend)
+    try {
+      const mp = await client.call('getaddressmempool', [{ addresses: [addr] }]);
+      if (Array.isArray(mp)) {
+        const spentInMempool = new Set();
+        for (const m of mp) {
+          if (m.satoshis < 0) spentInMempool.add(m.prevtxid + ':' + m.prevout);
+        }
+        if (spentInMempool.size > 0) {
+          return utxos.filter(u => !spentInMempool.has(u.txid + ':' + u.vout));
+        }
+      }
+    } catch {} // getaddressmempool may not be available
+    return utxos;
   }
 
   // Get total balance at an address (sum of UTXO amounts).
