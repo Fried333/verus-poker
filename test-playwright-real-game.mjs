@@ -105,26 +105,41 @@ async function main() {
   await snap(pageA, '02-pcA-seated');
   await snap(pageB, '02-ppB-seated');
 
-  console.log('\n--- Step 3: wait for phase + hand to start (up to 240s) ---');
+  console.log('\n--- Step 3: wait for phase + hand, click actions as they appear ---');
+  // Poll fast (1s) so we don't miss the brief action-button window. On every
+  // iteration, also try to click any action buttons that are visible — this
+  // is what step 4 used to do separately, but combining them avoids the
+  // timing race where the hand has already settled by step 4.
   let handStarted = false;
-  for (let i = 0; i < 80; i++) {
-    const sA = await getState(pageA);
-    const sB = await getState(pageB);
-    const buttonsA = await pageA.evaluate(() => {
-      const c = document.getElementById('controls');
-      return !!c && (c.querySelector('button.btn-check') || c.querySelector('button.btn-call') || c.querySelector('button.btn-fold:not([onclick*="SitOut"]):not([onclick*="Leave"])'));
-    });
-    const buttonsB = await pageB.evaluate(() => {
-      const c = document.getElementById('controls');
-      return !!c && (c.querySelector('button.btn-check') || c.querySelector('button.btn-call') || c.querySelector('button.btn-fold:not([onclick*="SitOut"]):not([onclick*="Leave"])'));
-    });
-    if (buttonsA || buttonsB) {
-      handStarted = true;
-      console.log('    hand started after ' + (i * 3) + 's (pcA=' + buttonsA + ' ppB=' + buttonsB + ')');
-      break;
+  let actionsClicked = 0;
+  for (let i = 0; i < 240; i++) {
+    for (const [page, label] of [[pageA, 'pcA'], [pageB, 'ppB']]) {
+      const has = await page.evaluate(() => {
+        const c = document.getElementById('controls');
+        if (!c) return { check: false, call: false, fold: false };
+        return {
+          check: !!c.querySelector('button.btn-check'),
+          // call/raise live in the action panel (exclude the sit-out and leave fold buttons)
+          call: !!c.querySelector('button.btn-call'),
+          rais: !!c.querySelector('button.btn-raise')
+        };
+      });
+      if (has.check || has.call || has.rais) {
+        if (!handStarted) {
+          handStarted = true;
+          console.log('    hand started — buttons appeared at ' + i + 's');
+        }
+        if (has.check) { await clickIfVisible(page, 'button.btn-check', label + ' Check'); actionsClicked++; }
+        else if (has.call) { await clickIfVisible(page, 'button.btn-call', label + ' Call'); actionsClicked++; }
+      }
     }
-    if (i % 10 === 0) console.log('    still waiting... (' + (i * 3) + 's) pcA=' + sA.controlsText.slice(0, 50) + ' | ppB=' + sB.controlsText.slice(0, 50));
-    await WAIT(3000);
+    if (i % 30 === 0) {
+      const sA = await getState(pageA);
+      const sB = await getState(pageB);
+      console.log('    poll ' + i + 's: pcA=' + sA.controlsText.slice(0, 50) + ' | ppB=' + sB.controlsText.slice(0, 50));
+    }
+    if (handStarted && i > 30 && actionsClicked >= 4) break; // hand played enough
+    await WAIT(1000);
   }
   record('hand started + buttons visible', handStarted ? 'PASS' : 'FAIL');
   await snap(pageA, '03-pcA-hand-start');
@@ -144,23 +159,7 @@ async function main() {
   record('no "undefined" mid-hand pcA', undefAMid ? 'FAIL' : 'PASS');
   record('no "undefined" mid-hand ppB', undefBMid ? 'FAIL' : 'PASS');
 
-  console.log('\n--- Step 4: play through the hand (check/call loop, 8 rounds) ---');
-  for (let round = 0; round < 8; round++) {
-    await WAIT(3000);
-    for (const [page, label] of [[pageA, 'pcA'], [pageB, 'ppB']]) {
-      const has = await page.evaluate(() => {
-        const c = document.getElementById('controls');
-        if (!c) return { check: false, call: false, fold: false };
-        return {
-          check: !!c.querySelector('button.btn-check'),
-          call: !!c.querySelector('button.btn-call'),
-          fold: !!c.querySelector('button.btn-fold')
-        };
-      });
-      if (has.check) await clickIfVisible(page, 'button.btn-check', label + ' Check');
-      else if (has.call) await clickIfVisible(page, 'button.btn-call', label + ' Call');
-    }
-  }
+  console.log('\n--- Step 4: actions clicked in step 3, total: ' + actionsClicked + ' ---');
   await snap(pageA, '04-pcA-after-actions');
   await snap(pageB, '04-ppB-after-actions');
 
@@ -179,10 +178,35 @@ async function main() {
   record('no "undefined" after hand pcA', undefAEnd ? 'FAIL' : 'PASS');
   record('no "undefined" after hand ppB', undefBEnd ? 'FAIL' : 'PASS');
 
-  console.log('\n--- Step 6: pcA clicks Leave ---');
+  console.log('\n--- Step 6: pcA folds (if mid-hand) then clicks Leave ---');
   // Set up dialog handler before clicking (Leave triggers a confirm())
   pageA.on('dialog', async dialog => { console.log('    dialog:', dialog.message().slice(0,60)); await dialog.accept(); });
-  const clickedLeave = await clickIfVisible(pageA, 'button:has-text("Leave")', 'pcA Leave');
+  // If pcA still has action buttons (mid-hand), fold first
+  const stillInHand = await pageA.evaluate(() => {
+    const c = document.getElementById('controls');
+    return !!c?.querySelector('button.btn-fold[onclick*="act"]');
+  });
+  if (stillInHand) {
+    await clickIfVisible(pageA, 'button.btn-fold', 'pcA Fold (to end hand)');
+    await WAIT(8000);
+  }
+  // Wait for the between-hands state where Leave is visible
+  let canLeave = false;
+  for (let i = 0; i < 30; i++) {
+    canLeave = await pageA.evaluate(() => {
+      const c = document.getElementById('controls');
+      return !!c?.querySelector('button[onclick*="doLeave"]');
+    });
+    if (canLeave) break;
+    await WAIT(1000);
+  }
+  const clickedLeave = canLeave && await pageA.evaluate(() => {
+    const c = document.getElementById('controls');
+    const btn = c?.querySelector('button[onclick*="doLeave"]');
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+  if (clickedLeave) console.log('    clicked: pcA Leave (via DOM)');
   record('clicked Leave button', clickedLeave ? 'PASS' : 'FAIL');
   await WAIT(20000);
   await snap(pageA, '06-pcA-after-leave');

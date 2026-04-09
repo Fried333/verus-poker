@@ -36,7 +36,13 @@ const MIN_PLAYERS = 2;      // Start hand when this many are seated
 const CASHIER_IDS = (process.argv.find(a => a.startsWith('--cashiers='))?.split('=')[1] || '').split(',').filter(Boolean);
 const PHASE_MULTISIG = process.argv.includes('--phase-multisig');
 const PHASE_BUYIN = parseFloat(process.argv.find(a => a.startsWith('--buyin='))?.split('=')[1] || '1.0');
-const CONFIG = { smallBlind: 1, bigBlind: 2, rake: 0, cashiers: CASHIER_IDS };
+// Scale blinds to the buy-in: standard 100bb stack means bigBlind = buyin/100,
+// smallBlind = buyin/200. With the default buyin of 1.0 CHIPS that's 0.005/0.01.
+// In legacy (non-phase) mode, fall back to the original 1/2 chip values so the
+// existing tests keep working.
+const CONFIG = process.argv.includes('--phase-multisig')
+  ? { smallBlind: PHASE_BUYIN / 200, bigBlind: PHASE_BUYIN / 100, rake: 0, cashiers: CASHIER_IDS }
+  : { smallBlind: 1, bigBlind: 2, rake: 0, cashiers: CASHIER_IDS };
 
 const MIME = {
   '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css',

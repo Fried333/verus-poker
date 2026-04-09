@@ -714,7 +714,13 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             state.winner = null; state.verified = null;
             state.showdownCards = {}; state.handNames = {};
             state.message = 'Hand #' + state.handCount + ' — shuffling...';
-            state.busted = false; // If we're dealt in, we have chips
+            // Only clear busted if we actually have chips now. Previously this
+            // was unconditional and produced blank GUI for busted players when
+            // the dealer announced a hand they weren't in.
+            {
+              const meChk = state.players.find(p => p.id === myId);
+              if (meChk && meChk.chips > 0) state.busted = false;
+            }
             state.players.forEach(p => { p.bet = 0; p.folded = false; });
             lastBSSeq = -1; lastActedSeq = -1; acted = false; actionPending = false;
             notify();

@@ -542,9 +542,12 @@ function renderControls() {
   const el = document.getElementById('controls');
   if (!st) return;
 
-  // Busted — in phase-multisig mode there's no auto-reload, you must leave or
-  // wait for a phase rotation. In legacy mode, show the Reload 200 button.
-  if (st.busted) {
+  // Busted — either the explicit busted flag from the backend, or a seated
+  // player with 0 chips (defense in depth: backend may have cleared the flag
+  // prematurely on a hand-id advance, but if chips==0 the user is still bust).
+  const meEarly = st.players ? st.players.find(p => p.id === myId) : null;
+  const looksBusted = st.busted || (meEarly && meEarly.chips === 0);
+  if (looksBusted) {
     if (st.phaseMultisig) {
       el.innerHTML =
         '<span class="wait-text" style="color:#ef5350">Out of chips — phase locked</span>' +
@@ -559,7 +562,7 @@ function renderControls() {
 
   // Sit-in button — only show if I am EXPLICITLY sitting out (clicked Sit Out
   // or am not yet seated). Between-hands "waiting" state does NOT show this.
-  const me = st.players.find(p => p.id === myId);
+  const me = meEarly;
   const inHand = st.myCards && st.myCards.length > 0;
   const myTurn = !!st.actions;
   if (st.sittingOut && me && me.chips > 0) {
@@ -612,9 +615,20 @@ function renderControls() {
     el.innerHTML =
       '<button class="btn-fold" onclick="doSitOut()" style="opacity:0.6;font-size:11px" title="Skip future hands until you click Sit In">Sit Out</button>' +
       '<button class="btn-fold" onclick="doLeave()" style="opacity:0.6;font-size:11px;margin-left:6px" title="Cash out and leave the table">Leave</button>';
+  } else if (me) {
+    // Seated but no chips and busted flag wasn't set — fall back to busted UI
+    if (st.phaseMultisig) {
+      el.innerHTML =
+        '<span class="wait-text" style="color:#ef5350">Out of chips — phase locked</span>' +
+        '<button class="btn-fold" onclick="doLeave()" style="margin-left:10px" title="Cash out and leave the table">Leave</button>';
+    } else {
+      el.innerHTML =
+        '<span class="wait-text" style="color:#ef5350">Out of chips!</span>' +
+        '<button class="btn-call" onclick="doReload()" style="margin-left:10px">Reload 200</button>';
+    }
   } else {
-    // No chips and not busted — nothing actionable
-    el.innerHTML = '';
+    // Not seated and no state — show a hint instead of empty
+    el.innerHTML = '<span class="wait-text" style="opacity:0.6">Connecting…</span>';
   }
 }
 
