@@ -441,6 +441,14 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             continue;
           }
 
+          // Always track phases we're a signer on, even if we haven't
+          // deposited yet. This is needed for atomic rotations: the dealer
+          // may publish a cashout/rotation proposal on a phase where our
+          // deposit was handled atomically (included in the rotation TX).
+          if (!trackedPhases.has(phaseId)) {
+            trackedPhases.add(phaseId);
+          }
+
           // Verify the manifest matches my pay address
           const verify = this.verifyPhaseManifest(manifest, myPayAddr);
           if (!verify.ok) {
@@ -483,6 +491,38 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             if (signed.length > 0) log('Auto-signed cashouts: ' + signed.join(', '));
           } catch (e) {
             log('Auto-sign error: ' + e.message);
+          }
+        }
+
+        // JOINER SIGNING: scan recent phases for atomic_rotation proposals
+        // where we're listed as a joiner. This handles the case where we're
+        // being added to a new phase via atomic rotation — our P2PKH input
+        // is in the TX but we don't have the old phase in trackedPhases.
+        const joinerSessionId = state.session;
+        if (joinerSessionId) {
+          for (let i = 1; i <= 10; i++) {
+            const phaseId = joinerSessionId + '_p' + i;
+            if (trackedPhases.has(phaseId)) continue; // already handled above
+            try {
+              const cashout = await this.readCashoutProposal(phaseId);
+              if (!cashout || cashout.type !== 'atomic_rotation') continue;
+              const imJoiner = (cashout.joinerDeposits || []).some(j => j.id === myId);
+              if (!imJoiner) continue;
+              // Check if already signed
+              const sigKey = PHASE_KEYS.CASHOUT_SIG + '.' + phaseId;
+              const mySig = await p2p.read(myId, sigKey);
+              if (mySig && mySig.signedHex && mySig.cashoutTimestamp === cashout.timestamp) continue;
+              // Sign! Our wallet will sign our P2PKH input and skip the multisig inputs.
+              log('Signing atomic rotation as joiner for phase ' + phaseId);
+              const signed = await p2p.signSettlementTx(cashout.unsignedTxHex);
+              await p2p.write(myId, sigKey, {
+                type: 'cashout_sig', phase: phaseId,
+                cashoutTimestamp: cashout.timestamp,
+                signedHex: signed.hex, complete: signed.complete,
+                timestamp: Date.now(),
+              });
+              log('Joiner sig published for ' + phaseId + ' (complete=' + signed.complete + ')');
+            } catch {}
           }
         }
       };

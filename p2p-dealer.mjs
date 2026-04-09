@@ -810,6 +810,7 @@ export function createP2PDealer(p2p, config, localNotify) {
     async readCashoutPartials(phase) {
       if (!currentPhase) throw new Error('no current phase');
       const partials = {};
+      // Read from old phase signers
       for (const signer of currentPhase.signers) {
         const key = 'chips.vrsc::poker.sg777z.p_cashout_sig.' + phase;
         try {
@@ -817,8 +818,18 @@ export function createP2PDealer(p2p, config, localNotify) {
           if (sig && sig.signedHex) {
             partials[signer.id] = sig;
           }
-        } catch (e) {
-          // Player hasn't signed yet or doesn't have the key
+        } catch {}
+      }
+      // ALSO read from joiners (atomic rotation) — they sign their P2PKH inputs
+      if (currentPhase._atomicNext) {
+        const newSignerIds = new Set(currentPhase._atomicNext.signers.map(s => s.id));
+        for (const signer of currentPhase._atomicNext.signers) {
+          if (partials[signer.id]) continue; // already read from old signers
+          const key = 'chips.vrsc::poker.sg777z.p_cashout_sig.' + phase;
+          try {
+            const sig = await p2p.read(signer.id, key);
+            if (sig && sig.signedHex) partials[signer.id] = sig;
+          } catch {}
         }
       }
       return partials;
