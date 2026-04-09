@@ -854,6 +854,11 @@ if (USE_LOCAL) {
     }
 
     if (method === 'reload') {
+      if (PHASE_MULTISIG) {
+        // Phase multisig: reloads must go through phase rotation, not free chips
+        sendTo(ws, { method: 'error', message: 'reload disabled in phase-multisig mode' });
+        return;
+      }
       const info = clients.get(ws);
       if (info) info.chips = 200;
       // Update dealer's player list
@@ -1282,10 +1287,19 @@ if (USE_LOCAL) {
                 dLog('system', p.id + ' is back in');
               }
               if (p.chips <= 0) {
-                p.chips = CONFIG.bigBlind * 100; // Reload to 200 (100 BB)
-                bustTimestamps.delete(p.id);
-                console.log('[P2P] ' + p.id + ' reloaded to ' + p.chips);
-                dLog('system', p.id + ' reloaded to ' + p.chips);
+                if (PHASE_MULTISIG) {
+                  // In phase-multisig mode we can't auto-reload — every chip
+                  // in a player's stack must be backed by a real on-chain
+                  // deposit at the multisig. A bust means they're out for
+                  // this phase. They can leave (triggering payout) or wait
+                  // for a phase rotation and rejoin with a new deposit.
+                  console.log('[P2P] ' + p.id + ' busted (phase multisig — no auto-reload)');
+                } else {
+                  p.chips = CONFIG.bigBlind * 100; // Reload to 200 (100 BB)
+                  bustTimestamps.delete(p.id);
+                  console.log('[P2P] ' + p.id + ' reloaded to ' + p.chips);
+                  dLog('system', p.id + ' reloaded to ' + p.chips);
+                }
               }
             }
           } catch {}
@@ -1370,6 +1384,19 @@ if (USE_LOCAL) {
           await scanForSitBackIn();
           await scanForSitOut();
           if (PHASE_MULTISIG) await scanForLeaving();
+
+          // ── PHASE MULTISIG: any pending leave triggers an immediate rotation,
+          // BEFORE we gate on activePlayers >= 2. This ensures the leaving player
+          // gets paid out even if the remaining roster can't continue.
+          if (PHASE_MULTISIG && phaseOpen && leavingPlayers.size > 0) {
+            console.log('[P2P] [phase] Leave pending — forcing immediate rotation');
+            const ok = await rotatePhaseToNewRoster();
+            if (!ok) {
+              await new Promise(r => setTimeout(r, 3000));
+              continue;
+            }
+            continue;
+          }
 
           // Need at least 2 active players (not sitting out, with chips, not leaving)
           const activePlayers = p2pDealer.getPlayers().filter(p =>

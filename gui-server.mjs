@@ -203,6 +203,8 @@ wss.on('connection', ws => {
         backend.sitIn(msg.seat);
       } else if (msg.action === 'sitout') {
         backend.sitOut();
+      } else if (msg.action === 'leave') {
+        backend.leaveTable();
       }
     } catch {}
   });
