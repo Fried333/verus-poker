@@ -126,6 +126,78 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
     },
 
     /** Sit back in after reload or sitting out — optional seat preference */
+    /**
+     * Knock the table — send a tiny tx from this player's identity to the
+     * table identity's pay address. The dealer scans incoming UTXOs at the
+     * table address and resolves the input back to the sending identity, so
+     * this is how an unknown player announces themselves without needing to
+     * be in any allowlist.
+     *
+     * Idempotent within a session — only knocks once per (session, table).
+     */
+    async knockTable() {
+      try {
+        if (state._knockedSession === state.session) return; // already knocked this session
+        // Resolve the table's pay address
+        const tableIdInfo = await p2p.client.call('getidentity', [tableId + (tableId.endsWith('@') ? '' : '.CHIPS@')]);
+        const tableAddr = tableIdInfo?.identity?.primaryaddresses?.[0];
+        if (!tableAddr) {
+          log('Knock skipped: table identity has no primary address');
+          return;
+        }
+        // Send the knock from our own i-address. The i-addr is canonical:
+        // when the dealer sees it as the input, it can call getidentity(i-addr)
+        // and get our name back directly — no OP_RETURN, no allowlist, and no
+        // -idindex required on the daemon.
+        //
+        // sendcurrency can't spend i-addr UTXOs in this build, so we build the
+        // raw tx by hand with createrawtransaction + signrawtransaction.
+        const myIdInfo = await p2p.client.call('getidentity', [myId + (myId.endsWith('@') ? '' : '.CHIPS@')]);
+        const myIAddr = myIdInfo?.identity?.identityaddress;
+        if (!myIAddr) {
+          log('Knock skipped: my identity has no identityaddress');
+          return;
+        }
+
+        const knockAmt = 0.0001;
+        const fee = 0.0001;
+        const needed = knockAmt + fee;
+        const allUtxos = await p2p.getAddressUtxos(myIAddr);
+        // Only spendable UTXOs with positive value (currency UTXOs, not name reservations)
+        const utxos = allUtxos.filter(u => u.amount > 0 && u.isspendable !== 0);
+        const totalAvailable = utxos.reduce((s, u) => s + u.amount, 0);
+        if (totalAvailable < needed) {
+          throw new Error('insufficient funds at i-addr ' + myIAddr + ': need ' + needed + ', have ' + totalAvailable + ' (fund the i-address with at least ' + needed + ' CHIPS)');
+        }
+        // Pick smallest single UTXO that covers, else combine largest-first
+        const single = utxos.filter(u => u.amount >= needed).sort((a, b) => a.amount - b.amount)[0];
+        let selected;
+        if (single) selected = [single];
+        else {
+          const sorted = [...utxos].sort((a, b) => b.amount - a.amount);
+          selected = []; let acc = 0;
+          for (const u of sorted) { selected.push(u); acc += u.amount; if (acc >= needed) break; }
+          if (acc < needed) throw new Error('could not assemble knock inputs');
+        }
+        const totalIn = selected.reduce((s, u) => s + u.amount, 0);
+        const change = Math.round((totalIn - knockAmt - fee) * 1e8) / 1e8;
+
+        const inputs = selected.map(u => ({ txid: u.txid, vout: u.vout }));
+        const outputs = { [tableAddr]: knockAmt };
+        if (change > 0) outputs[myIAddr] = change;
+
+        log('Knocking table at ' + tableAddr.slice(0, 12) + '... (from i-addr ' + myIAddr.slice(0, 12) + ')');
+        const rawTx = await p2p.client.call('createrawtransaction', [inputs, outputs]);
+        const signed = await p2p.client.call('signrawtransaction', [rawTx]);
+        if (!signed.complete) throw new Error('failed to sign knock tx');
+        const txid = await p2p.client.call('sendrawtransaction', [signed.hex]);
+        state._knockedSession = state.session;
+        log('Knock sent (tx ' + txid.slice(0, 16) + ')');
+      } catch (e) {
+        log('Knock failed: ' + e.message);
+      }
+    },
+
     async sitIn(seat) {
       state.busted = false;
       state.sittingOut = false;
@@ -133,6 +205,8 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
       state.message = seat !== undefined ? ('Joining seat ' + (seat + 1) + '...') : 'Sitting back in — next hand';
       addActionLog(myId + ' sat back in' + (seat !== undefined ? ' (seat ' + (seat + 1) + ')' : ''));
       log('Sitting back in' + (seat !== undefined ? ' at seat ' + seat : ''));
+      // Knock the table so the dealer discovers this identity (no allowlist needed)
+      await this.knockTable();
       // Write a new join request so dealer sees we're back
       try {
         // Re-read the table config to make sure we have the freshest session
@@ -159,6 +233,47 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
         log('Sit-in join written' + (joinData.payAddr ? ' (payAddr=' + joinData.payAddr.slice(0, 8) + ')' : ''));
       } catch (e) {
         log('Sit-in write failed: ' + e.message);
+      }
+      notify();
+    },
+
+    /**
+     * Explicit leave — different from sit-out. The player wants to fully exit
+     * the table and get their stack paid out via the next phase rotation.
+     *
+     * Writes a join_request with leaving:true. The dealer detects this on its
+     * scan loop and triggers a phase rotation that pays the leaving player out
+     * and removes them from the new phase. The player's polling loop keeps
+     * running so they can sign the rotation cashout when it's published.
+     */
+    async leaveTable() {
+      state.message = 'Leaving table...';
+      addActionLog(myId + ' leaving table');
+      log('Leaving table');
+      // If it's currently our turn → fold immediately so we're not blocking
+      if (state.turn === myId && state.validActions && state.validActions.length > 0) {
+        try {
+          await this.submitAction({ action: 'fold', amount: 0 });
+        } catch (e) {
+          log('Auto-fold on leave failed: ' + e.message);
+        }
+      }
+      try {
+        const leaveData = {
+          table: tableId, player: myId, session: state.session,
+          ready: false, leaving: true, timestamp: Date.now()
+        };
+        // Include payAddr so the dealer can compute payouts even if it lost state
+        try {
+          const idInfo = await p2p.client.call('getidentity', [myId + (myId.endsWith('@') ? '' : '.CHIPS@')]);
+          if (idInfo?.identity?.primaryaddresses?.[0]) {
+            leaveData.payAddr = idInfo.identity.primaryaddresses[0];
+          }
+        } catch {}
+        await p2p.write(myId, KEYS.JOIN_REQUEST, leaveData);
+        log('Leave marker written to chain');
+      } catch (e) {
+        log('Leave marker write failed: ' + e.message);
       }
       notify();
     },

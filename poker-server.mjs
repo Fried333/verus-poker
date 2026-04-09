@@ -1068,10 +1068,92 @@ if (USE_LOCAL) {
       console.log('[P2P] Dealer (DCV) started. Waiting for players to join...');
       console.log('[P2P] Session: ' + sessionId + ' | Table opened at: ' + new Date(tableOpenTime).toISOString());
 
-      // Scan for join requests from ANY player identity on chain
+      // ── Knock-based player discovery ──
+      // Players announce themselves by sending a tiny tx from their identity
+      // to the TABLE identity's pay address. The dealer scans incoming UTXOs,
+      // resolves the source address back to a VerusID, and adds them to the
+      // candidate list. Then it reads <playerId>.p_join_request as before.
+      //
+      // No allowlist needed — anyone with a CHIPS identity can knock.
+      let cachedTablePayAddr = null;
+      const knownIds = new Set();           // identities we've ever discovered (knock OR --players seed)
+      const seenKnockTxids = new Set();     // knock txids already processed
+      // Pre-seed from --players for back-compat (so explicit list still works)
+      for (const pid of otherIds) knownIds.add(pid);
+
+      async function getTablePayAddr() {
+        if (cachedTablePayAddr) return cachedTablePayAddr;
+        try {
+          const tIdName = TABLE_ID.endsWith('@') ? TABLE_ID : (TABLE_ID + '.CHIPS@');
+          const idInfo = await p2p.client.call('getidentity', [tIdName]);
+          cachedTablePayAddr = idInfo?.identity?.primaryaddresses?.[0] || null;
+          if (cachedTablePayAddr) {
+            console.log('[P2P] Table pay address: ' + cachedTablePayAddr);
+          }
+        } catch (e) {
+          console.log('[P2P] getTablePayAddr failed: ' + e.message);
+        }
+        return cachedTablePayAddr;
+      }
+
+      async function discoverIdsFromKnocks() {
+        const tableAddr = await getTablePayAddr();
+        if (!tableAddr) return;
+        // Pull both confirmed and mempool entries so newly-knocked players
+        // are detected without waiting a block
+        let entries = [];
+        try {
+          const u = await p2p.client.call('getaddressutxos', [{ addresses: [tableAddr] }]);
+          if (Array.isArray(u)) entries = entries.concat(u);
+        } catch {}
+        try {
+          const mp = await p2p.client.call('getaddressmempool', [{ addresses: [tableAddr] }]);
+          if (Array.isArray(mp)) {
+            entries = entries.concat(mp.filter(m => m.satoshis > 0).map(m => ({ txid: m.txid })));
+          }
+        } catch {}
+        if (entries.length === 0) return;
+        for (const u of entries) {
+          if (seenKnockTxids.has(u.txid)) continue;
+          seenKnockTxids.add(u.txid);
+          try {
+            const tx = await p2p.client.call('getrawtransaction', [u.txid, 1]);
+            if (!tx?.vin || tx.vin.length === 0) continue;
+            // Walk vin[0] back to its source address
+            const prevTxid = tx.vin[0].txid;
+            const prevVout = tx.vin[0].vout;
+            if (!prevTxid) continue; // coinbase
+            const prev = await p2p.client.call('getrawtransaction', [prevTxid, 1]);
+            const senderAddrs = prev.vout[prevVout]?.scriptPubKey?.addresses || [];
+            const sender = senderAddrs[0];
+            if (!sender || sender === tableAddr) continue;
+            // Knocks are sent from the player's i-address. The i-addr starts
+            // with 'i' (Verus identity addresses). Resolve it to a friendly
+            // name via getidentity — proof of identity is implicit because
+            // only the identity controller could have signed the input.
+            if (!sender.startsWith('i')) continue; // not an identity input — ignore
+            let idName = null;
+            try {
+              const idInfo = await p2p.client.call('getidentity', [sender]);
+              idName = idInfo?.identity?.name || null;
+            } catch (e) {
+              continue; // not a registered identity
+            }
+            if (!idName) continue;
+            if (!knownIds.has(idName)) {
+              knownIds.add(idName);
+              console.log('[P2P] Knock discovered new identity: ' + idName + ' (i-addr ' + sender + ' tx ' + u.txid.slice(0, 12) + ')');
+            }
+          } catch {
+            seenKnockTxids.delete(u.txid);
+          }
+        }
+      }
+
+      // Scan for join requests from any discovered identity (knocks + --players seed)
       async function scanForJoins() {
-        // Check all known players from --players arg, in PARALLEL for fast sit-in detection
-        const toCheck = (otherIds.length > 0 ? [...otherIds] : []).filter(pid => !seatedPlayers.has(pid));
+        await discoverIdsFromKnocks();
+        const toCheck = [...knownIds].filter(pid => !seatedPlayers.has(pid));
         if (toCheck.length === 0) return;
         let anyNew = false;
         const reads = await Promise.all(toCheck.map(async pid => {
@@ -1126,6 +1208,28 @@ if (USE_LOCAL) {
           if (req.sitOut === true && req.session === sessionId) {
             p2pDealer.sitOut(pid);
             dLog('system', pid + ' sat out (chain marker)');
+          }
+        }
+      }
+
+      // Track players who have requested to leave the table.
+      // Their leave gets processed at the next inter-hand boundary, where we
+      // trigger a phase rotation that pays them out.
+      const leavingPlayers = new Set();
+      async function scanForLeaving() {
+        if (!p2pDealer) return;
+        const players = p2pDealer.getPlayers();
+        if (players.length === 0) return;
+        const reads = await Promise.all(players.map(async p => {
+          try { return [p.id, await p2p.read(p.id, KEYS.JOIN_REQUEST)]; }
+          catch { return [p.id, null]; }
+        }));
+        for (const [pid, req] of reads) {
+          if (!req) continue;
+          if (req.leaving === true && req.session === sessionId && !leavingPlayers.has(pid)) {
+            leavingPlayers.add(pid);
+            console.log('[P2P] ' + pid + ' requested to leave table');
+            dLog('system', pid + ' leaving table');
           }
         }
       }
@@ -1190,9 +1294,10 @@ if (USE_LOCAL) {
 
       // Phase-multisig state for the dealer
       let phaseOpen = false;
+      let currentPhaseRoster = null; // Set<playerId> currently in the active phase
 
-      // Build a roster from the dealer's players[] state, pulling payAddr/pubkey
-      // from each player's join_request on chain (already collected at sit-in time)
+      // Build a roster from the given player ids, pulling payAddr/pubkey
+      // from each player's join_request on chain.
       async function buildPhaseRoster(players) {
         const roster = [];
         for (const p of players) {
@@ -1209,26 +1314,93 @@ if (USE_LOCAL) {
         return roster;
       }
 
+      // Detect if the current set of active players differs from the phase roster.
+      // Returns true if a roster change has happened (someone joined who wasn't
+      // in the phase, OR someone is in leavingPlayers).
+      function detectRosterChange(activePlayers) {
+        if (!phaseOpen || !currentPhaseRoster) return false;
+        // New player not in current roster?
+        for (const p of activePlayers) {
+          if (!currentPhaseRoster.has(p.id)) return true;
+        }
+        // Player in current roster wanting to leave?
+        for (const id of currentPhaseRoster) {
+          if (leavingPlayers.has(id)) return true;
+        }
+        return false;
+      }
+
+      // Trigger a phase rotation: settle current phase, open new phase with the
+      // new roster (excludes leavingPlayers, includes any new joiners).
+      async function rotatePhaseToNewRoster() {
+        if (!phaseOpen) return false;
+        try {
+          console.log('[P2P] [phase] Roster change detected — rotating phase');
+
+          // Compose + finalize cashout for the current phase
+          await p2pDealer.composeCashoutFromPlayers();
+          const result = await p2pDealer.finalizeCashout(180000);
+          if (!result.ok) {
+            console.log('[P2P] [phase] Rotation cashout failed: ' + result.reason);
+            return false;
+          }
+          console.log('[P2P] [phase] Rotation settlement broadcast: ' + result.txid);
+
+          // Remove leaving players from the dealer's in-memory state
+          for (const id of leavingPlayers) {
+            p2pDealer.removePlayer(id);
+            seatedPlayers.delete(id);
+            console.log('[P2P] [phase] Removed ' + id + ' from table');
+          }
+          leavingPlayers.clear();
+
+          phaseOpen = false;
+          currentPhaseRoster = null;
+          return true;
+        } catch (e) {
+          console.log('[P2P] [phase] rotation error: ' + e.message);
+          return false;
+        }
+      }
+
       const gameLoop = async () => {
         while (true) {
-          // Scan for new players + sat-out players wanting back in + active players sitting out
+          // Scan for new players + sat-out players wanting back in + active players sitting out + leaving
           await scanForJoins();
           await scanForSitBackIn();
           await scanForSitOut();
+          if (PHASE_MULTISIG) await scanForLeaving();
 
-          // Need at least 2 active players (not sitting out, with chips)
-          const activePlayers = p2pDealer.getPlayers().filter(p => p.chips > 0 && !p.sittingOut);
+          // Need at least 2 active players (not sitting out, with chips, not leaving)
+          const activePlayers = p2pDealer.getPlayers().filter(p =>
+            p.chips > 0 && !p.sittingOut && !leavingPlayers.has(p.id));
           if (activePlayers.length < 2) {
             const sittingOut = p2pDealer.getPlayers().filter(p => p.sittingOut);
             if (sittingOut.length > 0) {
               console.log('[P2P] Waiting — ' + sittingOut.map(p => p.id).join(', ') + ' sitting out');
             }
-            // Short poll while waiting for players — same cadence as action polling
+            // If we have an open phase but only 1 active player left, we can't
+            // continue. The remaining player must wait for someone else to join
+            // OR for an explicit leave that triggers final settlement.
             await new Promise(r => setTimeout(r, 1000));
             continue;
           }
 
-          // ── PHASE MULTISIG: open phase + wait for deposits before the hand ──
+          // ── PHASE MULTISIG: detect roster change and rotate if needed ──
+          if (PHASE_MULTISIG && phaseOpen) {
+            const rosterChanged = detectRosterChange(activePlayers);
+            if (rosterChanged) {
+              const ok = await rotatePhaseToNewRoster();
+              if (!ok) {
+                await new Promise(r => setTimeout(r, 3000));
+                continue;
+              }
+              // Loop back to re-scan and open the new phase
+              continue;
+            }
+          }
+
+          // ── PHASE MULTISIG: open phase + wait for deposits if no active phase ──
           if (PHASE_MULTISIG && !phaseOpen) {
             console.log('[P2P] [phase] Opening phase for ' + activePlayers.length + ' players (buyin ' + PHASE_BUYIN + ' CHIPS each)');
             const roster = await buildPhaseRoster(activePlayers);
@@ -1238,7 +1410,9 @@ if (USE_LOCAL) {
               continue;
             }
             try {
-              const threshold = roster.length;  // N-of-N requires all signers (heads-up: 2-of-2)
+              // For 3+ players use (N-1)-of-N threshold tolerance.
+              // For 2-player heads-up use 2-of-2 (no tolerance possible).
+              const threshold = roster.length === 2 ? 2 : roster.length - 1;
               await p2pDealer.openPhase(roster, threshold);
               const ok = await p2pDealer.waitForPhaseDeposits(180000);
               if (!ok) {
@@ -1249,6 +1423,7 @@ if (USE_LOCAL) {
               // Reset each player's chip stack to their buy-in amount
               for (const p of activePlayers) p.chips = PHASE_BUYIN;
               phaseOpen = true;
+              currentPhaseRoster = new Set(activePlayers.map(p => p.id));
               console.log('[P2P] [phase] phase ready — starting hand');
             } catch (e) {
               console.log('[P2P] [phase] openPhase failed: ' + e.message);
@@ -1267,29 +1442,11 @@ if (USE_LOCAL) {
             console.log(e.stack);
           }
 
-          // ── PHASE MULTISIG: compose + finalize cashout after the hand ──
-          if (PHASE_MULTISIG && phaseOpen) {
-            try {
-              console.log('[P2P] [phase] Composing cashout from current chip stacks');
-              await p2pDealer.composeCashoutFromPlayers();
-              console.log('[P2P] [phase] Waiting for player signatures and broadcasting...');
-              const result = await p2pDealer.finalizeCashout(180000);
-              if (result.ok) {
-                console.log('[P2P] [phase] Settlement broadcast: ' + result.txid);
-              } else {
-                console.log('[P2P] [phase] Finalize failed: ' + result.reason);
-              }
-            } catch (e) {
-              console.log('[P2P] [phase] cashout error: ' + e.message);
-            }
-            phaseOpen = false;  // next hand opens a fresh phase
-          }
-
-          // Between hands — kick stale sit-outs, scan for joins/sit-out changes
-          kickStaleSitOuts();
+          // Between hands — scan for joins/sit-out/leave changes (no auto-kick)
           await scanForJoins();
           await scanForSitBackIn();
           await scanForSitOut();
+          if (PHASE_MULTISIG) await scanForLeaving();
           await new Promise(r => setTimeout(r, 3000));
         }
       };
