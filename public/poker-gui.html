@@ -558,7 +558,8 @@ function renderControls() {
   if (st.sittingOut && me && me.chips > 0) {
     el.innerHTML =
       '<span class="wait-text">' + me.chips + ' chips — sitting out</span>' +
-      '<button class="btn-check" onclick="doSitIn()" style="margin-left:10px">Sit In</button>';
+      '<button class="btn-check" onclick="doSitIn()" style="margin-left:10px">Sit In</button>' +
+      '<button class="btn-fold" onclick="doLeave()" style="margin-left:6px;opacity:0.85" title="Cash out and leave the table">Leave</button>';
     return;
   }
 
@@ -601,7 +602,9 @@ function renderControls() {
     // Not my turn (or between hands) — show a small Sit Out button so the
     // user can preemptively sit out the next hand. (Sit In is handled above
     // by the sittingOut branch.)
-    el.innerHTML = '<button class="btn-fold" onclick="doSitOut()" style="opacity:0.6;font-size:11px" title="Skip future hands until you click Sit In">Sit Out</button>';
+    el.innerHTML =
+      '<button class="btn-fold" onclick="doSitOut()" style="opacity:0.6;font-size:11px" title="Skip future hands until you click Sit In">Sit Out</button>' +
+      '<button class="btn-fold" onclick="doLeave()" style="opacity:0.6;font-size:11px;margin-left:6px" title="Cash out and leave the table">Leave</button>';
   } else {
     // No chips and not busted — nothing actionable
     el.innerHTML = '';
@@ -673,6 +676,11 @@ function pickSeat(seatNum) {
 
 function doSitOut() {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'sitout' }));
+}
+
+function doLeave() {
+  if (!confirm('Leave the table? Your remaining chips will be paid out to your wallet on the next phase rotation.')) return;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: 'leave' }));
 }
 
 // ══════════════════════════════════════

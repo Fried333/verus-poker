@@ -137,6 +137,7 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
      */
     async knockTable() {
       try {
+        if (state._leftTable) return; // user explicitly left — don't auto-rejoin
         if (state._knockedSession === state.session) return; // already knocked this session
         // Resolve the table's pay address
         const tableIdInfo = await p2p.client.call('getidentity', [tableId + (tableId.endsWith('@') ? '' : '.CHIPS@')]);
@@ -199,6 +200,8 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
     },
 
     async sitIn(seat) {
+      // Explicit Sit In always clears the local left-table flag set by leaveTable()
+      state._leftTable = false;
       state.busted = false;
       state.sittingOut = false;
       state.sitOutAtHand = null;
@@ -247,6 +250,11 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
      * running so they can sign the rotation cashout when it's published.
      */
     async leaveTable() {
+      // Local flag — the polling loop checks this to avoid re-knocking,
+      // re-sitting-in, or re-depositing after a leave. Cleared only by an
+      // explicit sitIn() (i.e. the user clicking Sit In again).
+      state._leftTable = true;
+      state.sittingOut = true;
       state.message = 'Leaving table...';
       addActionLog(myId + ' leaving table');
       log('Leaving table');
@@ -395,6 +403,10 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
       const handlePhaseMultisig = async () => {
         if (!myPayAddr) return; // skip if we don't know our pay address
         if (!options.phaseMultisig) return; // opt-in flag
+        // After leaveTable() we don't auto-deposit into new phases — but we
+        // still let the auto-sign branch run below so we can co-sign the
+        // rotation cashout that pays us out.
+        const skipDeposit = state._leftTable === true;
 
         // Detect any new phase manifest the dealer has published
         // We scan a few possible recent phase IDs based on the current session.
@@ -430,6 +442,10 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
             continue;
           }
 
+          if (skipDeposit) {
+            // We left the table — do not deposit into any new phase
+            continue;
+          }
           // Check we have the funds and try to deposit
           try {
             log('Auto-depositing ' + verify.myEntry.expectedDeposit + ' to phase ' + phaseId);
@@ -651,8 +667,9 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
               }
             }
 
-            // If we had a hand but never got cards, we might be sat out
-            if (state.handId && state.myCards.length === 0) {
+            // If we had a hand but never got cards, we might be sat out.
+            // Skip auto-rejoin if we explicitly left the table.
+            if (state.handId && state.myCards.length === 0 && !state._leftTable) {
               handsWithoutCards++;
               if (handsWithoutCards >= 2) {
                 log('Skipped ' + handsWithoutCards + ' hands — writing rejoin');

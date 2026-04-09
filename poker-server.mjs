@@ -1293,7 +1293,10 @@ if (USE_LOCAL) {
                   // deposit at the multisig. A bust means they're out for
                   // this phase. They can leave (triggering payout) or wait
                   // for a phase rotation and rejoin with a new deposit.
-                  console.log('[P2P] ' + p.id + ' busted (phase multisig — no auto-reload)');
+                  if (!p._loggedBust) {
+                    console.log('[P2P] ' + p.id + ' busted (phase multisig — no auto-reload)');
+                    p._loggedBust = true;
+                  }
                 } else {
                   p.chips = CONFIG.bigBlind * 100; // Reload to 200 (100 BB)
                   bustTimestamps.delete(p.id);
@@ -1448,7 +1451,7 @@ if (USE_LOCAL) {
                 continue;
               }
               // Reset each player's chip stack to their buy-in amount
-              for (const p of activePlayers) p.chips = PHASE_BUYIN;
+              for (const p of activePlayers) { p.chips = PHASE_BUYIN; p._loggedBust = false; }
               phaseOpen = true;
               currentPhaseRoster = new Set(activePlayers.map(p => p.id));
               console.log('[P2P] [phase] phase ready — starting hand');
