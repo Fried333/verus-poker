@@ -109,8 +109,36 @@ async function main() {
   const info = await p2p.client.getInfo();
   console.log('[CASHIER ' + MY_ID + '] Chain: block ' + info.blocks);
 
-  // Reload any in-flight hands from disk (crash recovery)
-  const activeHands = loadAllHands();
+  // Determine the current dealer session. If state on disk belongs to an
+  // older session, wipe it — stale b[] from a different session can't decode
+  // current cards and just produces "??" garbage.
+  const currentSession = await (async () => {
+    try {
+      const tc = await p2p.read(TABLE_ID, 'chips.vrsc::poker.sg777z.t_table_info');
+      return tc?.session || null;
+    } catch { return null; }
+  })();
+
+  // Reload any in-flight hands from disk (crash recovery), but only KEEP
+  // hands belonging to the current session. Hands from older sessions are
+  // garbage — their blindings cannot decode the current deck.
+  const allLoaded = loadAllHands();
+  const activeHands = new Map();
+  let purgedStale = 0;
+  for (const [handId, data] of allLoaded) {
+    // handId format: <sessionId>_h<n>. Extract the session prefix.
+    const m = handId.match(/^(.+)_h\d+$/);
+    const handSession = m ? m[1] : null;
+    if (currentSession && handSession && handSession === currentSession) {
+      activeHands.set(handId, data);
+    } else {
+      deleteHand(handId);
+      purgedStale++;
+    }
+  }
+  if (purgedStale > 0) {
+    console.log('[CASHIER ' + MY_ID + '] Purged ' + purgedStale + ' stale hand(s) from previous sessions');
+  }
   let lastProcessedHand = null;
   let lastSession = null;
   if (activeHands.size > 0) {
