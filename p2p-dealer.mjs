@@ -971,5 +971,177 @@ export function createP2PDealer(p2p, config, localNotify) {
       console.log('[DEALER] Phase rotation complete: ' + oldPhase + ' -> ' + newPhase.phase);
       return newPhase;
     },
+
+    /**
+     * Atomic phase rotation — settles old multisig AND funds new multisig in
+     * a SINGLE transaction. Eliminates the separate deposit cycle that adds
+     * ~40-50s of chain confirmation time.
+     *
+     * The rotation TX has mixed inputs:
+     *   - Old multisig UTXOs (signed by M-of-N old signers)
+     *   - New joiner personal UTXOs (signed by each joiner, if any)
+     *
+     * And mixed outputs:
+     *   - Leaving players → their R-addresses
+     *   - New multisig ← continuing stacks + joiner deposits
+     *
+     * newRoster: [{ id, payAddr, pubkey, expectedDeposit }]
+     * joinerIntents: [{ id, payAddr, utxos: [{txid,vout,amount}], depositAmount }]
+     *   — published by joiners; empty array if no new joiners
+     * feeAbsorber: player id who pays the fee (default: smallest non-zero stack)
+     *
+     * Returns { ok, txid, newPhase } on success.
+     */
+    async composeAtomicRotation(newRoster, newThreshold, joinerIntents = [], feeAbsorber = null) {
+      if (!currentPhase || !currentPhase.confirmed) {
+        throw new Error('no confirmed current phase to rotate from');
+      }
+      const fee = 0.0001;
+      const oldSigners = currentPhase.signers;
+      const oldSignerIds = new Set(oldSigners.map(s => s.id));
+      const newSignerIds = new Set(newRoster.map(r => r.id));
+
+      // Classify players
+      const leavers = oldSigners.filter(s => !newSignerIds.has(s.id));
+      const continuing = oldSigners.filter(s => newSignerIds.has(s.id));
+      const joiners = newRoster.filter(r => !oldSignerIds.has(r.id));
+
+      // Get current chip stacks for old players
+      const stacks = {};
+      for (const signer of oldSigners) {
+        const p = players.find(x => x.id === signer.id);
+        stacks[signer.id] = p ? p.chips : 0;
+      }
+
+      // Fee absorber
+      if (!feeAbsorber) {
+        const candidates = continuing.filter(s => stacks[s.id] >= fee).sort((a, b) => stacks[a.id] - stacks[b.id]);
+        feeAbsorber = candidates.length ? candidates[0].id : (continuing[0] || leavers[0]).id;
+      }
+      stacks[feeAbsorber] = Math.round((stacks[feeAbsorber] - fee) * 1e8) / 1e8;
+
+      // Leaver payouts — they get their stack paid to R-addr
+      const leaverPayouts = leavers
+        .filter(s => stacks[s.id] > 0)
+        .map(s => ({ address: s.payAddr, amount: stacks[s.id] }));
+
+      // New multisig amount = continuing stacks + joiner deposits
+      const continuingTotal = continuing.reduce((s, c) => s + (stacks[c.id] || 0), 0);
+      const joinerTotal = joinerIntents.reduce((s, j) => s + j.depositAmount, 0);
+      const newMultisigAmount = Math.round((continuingTotal + joinerTotal) * 1e8) / 1e8;
+
+      // Compute new multisig address
+      const newPubkeys = newRoster.map(r => r.pubkey).sort();
+      const newMs = await p2p.computeMultisigAddress(newPubkeys, newThreshold);
+
+      // Build joiner inputs + change
+      const joinerUtxos = [];
+      const joinerChange = [];
+      for (const ji of joinerIntents) {
+        for (const u of ji.utxos) joinerUtxos.push(u);
+        const joinerIn = ji.utxos.reduce((s, u) => s + u.amount, 0);
+        const change = Math.round((joinerIn - ji.depositAmount) * 1e8) / 1e8;
+        if (change > 0.00001) {
+          joinerChange.push({ address: ji.payAddr, amount: change });
+        }
+      }
+
+      // Old multisig inputs
+      const oldUtxos = Object.values(currentPhase.deposits).map(d => ({
+        txid: d.txid, vout: d.vout, amount: d.amount,
+      }));
+
+      // Sum invariant
+      const totalIn = Math.round((oldUtxos.reduce((s, u) => s + u.amount, 0) + joinerUtxos.reduce((s, u) => s + u.amount, 0)) * 1e8) / 1e8;
+      const totalOut = Math.round((leaverPayouts.reduce((s, p) => s + p.amount, 0) + newMultisigAmount + joinerChange.reduce((s, c) => s + c.amount, 0) + fee) * 1e8) / 1e8;
+      if (Math.abs(totalIn - totalOut) > 0.0001) {
+        throw new Error('atomic rotation sum invariant: in=' + totalIn + ' out=' + totalOut + ' diff=' + (totalIn - totalOut));
+      }
+
+      const unsignedHex = await p2p.composeAtomicRotationTx({
+        oldMultisigUtxos: oldUtxos,
+        leaverPayouts,
+        newMultisigAddr: newMs.address,
+        newMultisigAmount,
+        joinerUtxos,
+        joinerChange,
+        fee,
+      });
+
+      // Increment phase number
+      phaseCount++;
+      const newPhaseId = gameId + '_p' + phaseCount;
+
+      // Publish the atomic rotation proposal
+      const proposal = {
+        type: 'atomic_rotation',
+        phase: currentPhase.phase,
+        newPhase: newPhaseId,
+        table: p2p.tableId,
+        oldMultisigAddr: currentPhase.multisigAddr,
+        oldRedeemScript: currentPhase.redeemScript,
+        newMultisigAddr: newMs.address,
+        newRedeemScript: newMs.redeemScript,
+        newThreshold,
+        newPubkeys,
+        newSigners: newRoster.map(r => ({ id: r.id, payAddr: r.payAddr, pubkey: r.pubkey })),
+        leavers: leavers.map(l => ({ id: l.id, payAddr: l.payAddr, amount: stacks[l.id] || 0 })),
+        continuing: continuing.map(c => ({ id: c.id, stackCarryOver: stacks[c.id] || 0 })),
+        joinerDeposits: joinerIntents.map(j => ({ id: j.id, payAddr: j.payAddr, depositAmount: j.depositAmount })),
+        fee,
+        unsignedTxHex: unsignedHex,
+        timestamp: Date.now(),
+      };
+
+      // Use the same cashout key as regular cashouts so the existing
+      // player polling loop (autoRespondToCashouts) picks it up
+      const cashoutKey = 'chips.vrsc::poker.sg777z.t_cashout.' + currentPhase.phase;
+      await p2p.write(p2p.tableId, cashoutKey, proposal);
+
+      console.log('[DEALER] Atomic rotation published: ' + currentPhase.phase + ' → ' + newPhaseId);
+      console.log('[DEALER]   leavers: ' + leavers.map(l => l.id).join(', ') || 'none');
+      console.log('[DEALER]   continuing: ' + continuing.map(c => c.id + '(' + (stacks[c.id] || 0) + ')').join(', '));
+      console.log('[DEALER]   joiners: ' + joiners.map(j => j.id).join(', ') || 'none');
+      console.log('[DEALER]   new multisig: ' + newMs.address + ' (' + newThreshold + '-of-' + newRoster.length + ')');
+
+      // Store the new phase descriptor so finalizeCashout can transition
+      currentPhase._atomicNext = {
+        phaseId: newPhaseId,
+        multisigAddr: newMs.address,
+        redeemScript: newMs.redeemScript,
+        threshold: newThreshold,
+        signers: newRoster.map(r => ({ id: r.id, payAddr: r.payAddr, pubkey: r.pubkey })),
+        newMultisigAmount,
+      };
+
+      return proposal;
+    },
+
+    /**
+     * After atomic rotation is finalized (settlement broadcast), transition
+     * the dealer's internal state to the new phase. Called after finalizeCashout.
+     */
+    activateAtomicPhase() {
+      if (!currentPhase || !currentPhase._atomicNext) return;
+      const next = currentPhase._atomicNext;
+
+      currentPhase = {
+        phase: next.phaseId,
+        multisigAddr: next.multisigAddr,
+        redeemScript: next.redeemScript,
+        threshold: next.threshold,
+        signers: next.signers,
+        confirmed: true,
+        deposits: { _atomic: { txid: currentPhase.settlementTxId, vout: 0, amount: next.newMultisigAmount } },
+        preExistingUtxos: new Set(),
+      };
+
+      // Update the deposit attribution: find the actual UTXO at the new multisig
+      // after the rotation tx confirms. For now we use a placeholder that gets
+      // refreshed on the next deposit scan.
+
+      console.log('[DEALER] Phase activated: ' + next.phaseId + ' (' + next.threshold + '-of-' + next.signers.length + ')');
+      console.log('[DEALER]   multisig: ' + next.multisigAddr + ' balance: ' + next.newMultisigAmount);
+    },
   };
 }

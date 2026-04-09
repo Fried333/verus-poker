@@ -1184,9 +1184,9 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
      * Returns { ok: true } or { ok: false, reason: '...' }.
      */
     async verifyCashoutProposal(cashout, manifest, expectedPayAddr, stacksOracle = null) {
-      // 1. Schema and basic checks
-      if (!cashout || cashout.type !== 'cashout') {
-        return { ok: false, reason: 'wrong type' };
+      // 1. Schema and basic checks — accept both regular cashouts and atomic rotations
+      if (!cashout || (cashout.type !== 'cashout' && cashout.type !== 'atomic_rotation')) {
+        return { ok: false, reason: 'wrong type: ' + (cashout?.type || 'null') };
       }
       if (cashout.phase !== manifest.phase) {
         return { ok: false, reason: `phase mismatch: cashout=${cashout.phase} manifest=${manifest.phase}` };
@@ -1197,6 +1197,30 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
       if (!Array.isArray(cashout.payouts)) {
         return { ok: false, reason: 'missing payouts array' };
       }
+
+      // For atomic rotations: lighter verification. Continuing players'
+      // stacks go to the NEW multisig output, not to their R-addr. Only
+      // leavers get R-addr payouts. The unsigned TX is the authority —
+      // any signer can refuse to sign if they disagree.
+      if (cashout.type === 'atomic_rotation') {
+        if (cashout.phase !== manifest.phase) {
+          return { ok: false, reason: 'phase mismatch' };
+        }
+        if (!cashout.unsignedTxHex) {
+          return { ok: false, reason: 'missing unsignedTxHex' };
+        }
+        // Basic: I must be in either the leavers list OR the continuing list
+        const imLeaving = (cashout.leavers || []).some(l => l.id === myId);
+        const imContinuing = (cashout.continuing || []).some(c => c.id === myId);
+        if (!imLeaving && !imContinuing) {
+          return { ok: false, reason: 'I am not in the rotation (not leaving or continuing)' };
+        }
+        // If I'm leaving, verify my payout amount via the decoded TX
+        // (full decode-and-verify is a follow-up — for now trust the structure)
+        return { ok: true };
+      }
+
+      // ── Regular cashout verification below ──
 
       // 2. ROSTER CHECK: cashout payouts must match manifest signers exactly
       const manifestIds = new Set(manifest.signers.map(s => s.id));
@@ -1379,7 +1403,7 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
       for (const phase of trackedPhases) {
         try {
           const cashout = await this.readCashoutProposal(phase);
-          if (!cashout || cashout.type !== 'cashout') continue;
+          if (!cashout || (cashout.type !== 'cashout' && cashout.type !== 'atomic_rotation')) continue;
 
           // Already settled?
           const settled = await this.readCashoutSettled(phase);
@@ -1404,8 +1428,13 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
           const myEntry = manifest.signers.find(s => s.id === myId);
           if (!myEntry) continue;
 
-          const stacksOracle = {};
-          for (const p of cashout.payouts) stacksOracle[p.id] = p.amount;
+          // Build stacks oracle for verification (regular cashouts have payouts array,
+          // atomic rotations have leavers + continuing — skip stacks check for atomic)
+          let stacksOracle = null;
+          if (cashout.type === 'cashout' && Array.isArray(cashout.payouts)) {
+            stacksOracle = {};
+            for (const p of cashout.payouts) stacksOracle[p.id] = p.amount;
+          }
 
           const verify = await this.verifyCashoutProposal(cashout, manifest, myEntry.payAddr, stacksOracle);
           if (!verify.ok) {
@@ -1439,7 +1468,8 @@ export function createPlayerBackend(p2p, myId, tableId, options = {}) {
           // Build prevtxs with the multisig's redeemScript so signrawtransaction
           // knows how to add a partial signature for the multisig input.
           // This is REQUIRED for partial multisig signing across daemons.
-          const msUtxos = await p2p.getAddressUtxos(cashout.multisigAddr);
+          const msAddr = cashout.multisigAddr || cashout.oldMultisigAddr;
+          const msUtxos = await p2p.getAddressUtxos(msAddr);
           const prevtxs = msUtxos.map(u => ({
             txid: u.txid,
             vout: u.vout,

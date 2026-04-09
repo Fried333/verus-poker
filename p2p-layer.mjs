@@ -317,6 +317,58 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     return await client.call('createrawtransaction', [inputs, outputs]);
   }
 
+  /**
+   * Compose an atomic rotation TX that settles the old multisig AND funds
+   * the new multisig in a single transaction.
+   *
+   * INPUTS:  old multisig UTXOs (M-of-N) + optional new joiner P2PKH UTXOs
+   * OUTPUTS: leaver payouts (R-addrs) + new multisig funding
+   *
+   * Returns: unsigned hex string.
+   */
+  async function composeAtomicRotationTx({
+    oldMultisigUtxos,   // [{txid, vout, amount}]
+    leaverPayouts,      // [{address, amount}] — leaving players get paid out
+    newMultisigAddr,    // string — the new M'-of-N' address
+    newMultisigAmount,  // number — total going into the new multisig
+    joinerUtxos,        // [{txid, vout, amount}] — new joiner's P2PKH UTXOs (may be [])
+    joinerChange,       // [{address, amount}] — change back to joiners (may be [])
+    fee,                // number
+  }) {
+    const allInputs = [
+      ...oldMultisigUtxos.map(u => ({ txid: u.txid, vout: u.vout })),
+      ...joinerUtxos.map(u => ({ txid: u.txid, vout: u.vout })),
+    ];
+    const totalIn = round8(
+      oldMultisigUtxos.reduce((s, u) => s + u.amount, 0) +
+      joinerUtxos.reduce((s, u) => s + u.amount, 0)
+    );
+    const totalOut = round8(
+      leaverPayouts.reduce((s, p) => s + p.amount, 0) +
+      newMultisigAmount +
+      joinerChange.reduce((s, c) => s + c.amount, 0)
+    );
+    const computedFee = round8(totalIn - totalOut);
+    if (computedFee < 0) throw new Error('atomic rotation: outputs (' + totalOut + ') exceed inputs (' + totalIn + ')');
+    if (Math.abs(computedFee - fee) > 0.001) {
+      console.log('[P2P] atomicRotation: expected fee=' + fee + ' actual fee=' + computedFee);
+    }
+
+    const outputs = {};
+    for (const p of leaverPayouts) {
+      if (p.amount <= 0) continue; // skip 0-chip leavers
+      outputs[p.address] = round8(p.amount);
+    }
+    outputs[newMultisigAddr] = round8(newMultisigAmount);
+    for (const c of joinerChange) {
+      if (c.amount <= 0) continue;
+      if (outputs[c.address]) outputs[c.address] = round8(outputs[c.address] + c.amount);
+      else outputs[c.address] = round8(c.amount);
+    }
+
+    return await client.call('createrawtransaction', [allInputs, outputs]);
+  }
+
   // Sign a multisig TX with the local wallet's available keys.
   // Returns { hex, complete, errors? }.
   // - If `prevTxs` is provided, uses signrawtransaction with explicit prevtxs
@@ -416,6 +468,7 @@ export function createP2PLayer(rpcConfig, myId, tableId) {
     getAddressBalance,
     waitForAddressUtxos,
     composeSettlementTx,
+    composeAtomicRotationTx,
     signSettlementTx,
     combinePartials,
     broadcastSettlement,

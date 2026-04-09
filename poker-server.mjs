@@ -1357,32 +1357,98 @@ if (USE_LOCAL) {
         return false;
       }
 
-      // Trigger a phase rotation: settle current phase, open new phase with the
-      // new roster (excludes leavingPlayers, includes any new joiners).
+      // Trigger a phase rotation: settle current phase AND fund new phase in
+      // a single atomic tx (no separate deposit cycle).
       async function rotatePhaseToNewRoster() {
         if (!phaseOpen) return false;
         try {
           console.log('[P2P] [phase] Roster change detected — rotating phase');
 
-          // Compose + finalize cashout for the current phase
-          await p2pDealer.composeCashoutFromPlayers();
+          // Build the new roster: exclude leavers, include new joiners
+          const newActivePlayers = p2pDealer.getPlayers().filter(p =>
+            p.chips >= 0 && !leavingPlayers.has(p.id));
+          const newRoster = await buildPhaseRoster(newActivePlayers);
+          if (!newRoster || newRoster.length < 1) {
+            console.log('[P2P] [phase] new roster incomplete, falling back to simple cashout');
+            // Fall back to simple cashout (no new phase)
+            await p2pDealer.composeCashoutFromPlayers();
+            const result = await p2pDealer.finalizeCashout(180000);
+            if (!result.ok) {
+              console.log('[P2P] [phase] Cashout failed: ' + result.reason);
+              return false;
+            }
+            console.log('[P2P] [phase] Settlement broadcast: ' + result.txid);
+            for (const id of leavingPlayers) {
+              p2pDealer.removePlayer(id); seatedPlayers.delete(id);
+              console.log('[P2P] [phase] Removed ' + id + ' from table');
+            }
+            leavingPlayers.clear();
+            phaseOpen = false; currentPhaseRoster = null;
+            return true;
+          }
+
+          const newThreshold = newRoster.length <= 3
+            ? Math.min(2, newRoster.length)
+            : Math.max(3, Math.ceil(newRoster.length / 2));
+
+          // TODO: collect joiner deposit intents from new players not in
+          // old phase. For now, we support atomic rotation WITHOUT new
+          // joiners (leavers-only case, which is the most common). Joiners
+          // fall back to the old sequential flow.
+          const oldSignerIds = new Set((p2pDealer.getCurrentPhase()?.signers || []).map(s => s.id));
+          const hasNewJoiners = newRoster.some(r => !oldSignerIds.has(r.id));
+
+          if (hasNewJoiners) {
+            // Joiner case: fall back to old sequential rotation for now.
+            // Atomic rotation with joiners requires the joiner to publish
+            // deposit_intent + UTXOs, which is a bigger change. Coming in
+            // the next iteration.
+            console.log('[P2P] [phase] New joiners detected — using sequential rotation');
+            await p2pDealer.composeCashoutFromPlayers();
+            const result = await p2pDealer.finalizeCashout(180000);
+            if (!result.ok) {
+              console.log('[P2P] [phase] Rotation cashout failed: ' + result.reason);
+              return false;
+            }
+            console.log('[P2P] [phase] Rotation settlement broadcast: ' + result.txid);
+            for (const id of leavingPlayers) {
+              p2pDealer.removePlayer(id); seatedPlayers.delete(id);
+              console.log('[P2P] [phase] Removed ' + id + ' from table');
+            }
+            leavingPlayers.clear();
+            phaseOpen = false; currentPhaseRoster = null;
+            return true;
+          }
+
+          // ATOMIC ROTATION: no new joiners, just leavers + continuing
+          // One TX settles old multisig → pays leavers + funds new multisig
+          await p2pDealer.composeAtomicRotation(newRoster, newThreshold, []);
           const result = await p2pDealer.finalizeCashout(180000);
           if (!result.ok) {
-            console.log('[P2P] [phase] Rotation cashout failed: ' + result.reason);
+            console.log('[P2P] [phase] Atomic rotation failed: ' + result.reason);
             return false;
           }
-          console.log('[P2P] [phase] Rotation settlement broadcast: ' + result.txid);
+          console.log('[P2P] [phase] Atomic rotation broadcast: ' + result.txid);
 
-          // Remove leaving players from the dealer's in-memory state
+          // Activate the new phase immediately — no deposit wait needed
+          p2pDealer.activateAtomicPhase();
+
+          // Remove leaving players
           for (const id of leavingPlayers) {
-            p2pDealer.removePlayer(id);
-            seatedPlayers.delete(id);
+            p2pDealer.removePlayer(id); seatedPlayers.delete(id);
             console.log('[P2P] [phase] Removed ' + id + ' from table');
           }
           leavingPlayers.clear();
 
-          phaseOpen = false;
-          currentPhaseRoster = null;
+          // Phase stays OPEN — no gap
+          currentPhaseRoster = new Set(newRoster.map(r => r.id));
+          // Reset chips to carry-over amounts from the atomic rotation
+          for (const p of p2pDealer.getPlayers()) {
+            if (currentPhaseRoster.has(p.id)) {
+              // chips are already correct from the dealer's in-memory state
+              p._loggedBust = false;
+            }
+          }
           return true;
         } catch (e) {
           console.log('[P2P] [phase] rotation error: ' + e.message);
