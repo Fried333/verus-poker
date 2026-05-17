@@ -1,16 +1,46 @@
 # Verus Poker
 
-Decentralized mental-poker on the CHIPS PBaaS chain. Implements the BCRA 2026 mental-poker shuffle protocol on top of Verus identities, with the chain itself acting as the consensus layer for game state.
+Decentralized mental-poker on the CHIPS PBaaS chain. Implements the BCRA 2026 mental-poker shuffle protocol on top of Verus identities, with the chain itself acting as the consensus layer for game state. **No central poker server.** All game messages — player actions, deck shuffles, betting state, settlement — flow through Verus identity content-multimap updates. Anyone running a CHIPS daemon can host a table or join one.
 
-There is no central poker server. All game messages — player actions, deck shuffles, betting state, settlement — flow through Verus identity content-multimap updates. Anyone running a CHIPS daemon can host a table or join one.
+## Table of contents
 
----
+- [What you get](#what-you-get)
+- [What you provide](#what-you-provide)
+- [How it works](#how-it-works)
+  - [Roles](#roles)
+  - [Crypto protocol](#crypto-protocol-summary)
+  - [Optimizations](#optimizations)
+- [Quick start](#quick-start)
+  - [Creating the VerusIDs](#creating-the-verusids-youll-need)
+  - [Running a table](#running-a-table)
+- [Architecture overview](#architecture-overview)
+- [CHIPS chain characteristics](#known-characteristics-of-chips-for-game-design)
+- [Test scripts](#test-scripts)
+- [Operating in production](#operating-in-production)
+- [License](#license)
+- [Disclaimer](#disclaimer)
+
+## What you get
+
+- A fully decentralized Texas Hold'em poker table — no central server, no operator who can see hole cards
+- Cryptographic shuffle proof — at hand-end, the dealer publishes all blindings + permutations; any observer can verify the hand was honest
+- Identity-based seats — each player owns their own VerusID and controls their own actions
+- Multi-machine, multi-jurisdiction by design — dealer/cashier/players can be on separate boxes anywhere in the world
+- One-block read latency for actions (~4-9 s end-to-end) via mempool-aware reads
+
+## What you provide
+
+- A running **Verus daemon** with the CHIPS PBaaS chain enabled
+- One **VerusID per role** (dealer / player / cashier), funded with a small amount of CHIPS for TX fees
+- **Node.js 18+** (uses ES modules)
+- Each daemon controls the private key for the identity its process represents
+- A modest amount of patience for CHIPS chain stalls (see [chain characteristics](#known-characteristics-of-chips-for-game-design))
 
 ## How it works
 
 ### Roles
 
-- **Dealer (DCV)** — *Dealer / Computer / Verifier*. Pure orchestrator: deals cards, advances betting rounds, validates the cryptographic proofs at the end of each hand. The dealer never plays in the hand and never sees private cards before showdown.
+- **Dealer (DCV)** — *Dealer / Computer / Verifier*. Pure orchestrator: deals cards, advances betting rounds, validates the cryptographic proofs at hand-end. The dealer **never plays** and **never sees private cards before showdown**.
 - **Players** — Each player runs their own backend that owns a Verus identity. They submit actions (call/raise/fold/all-in) by writing to their own identity on chain.
 - **Cashier** — Independent process that performs the *Stage III* shuffle (final blinding) and reveals card blinding values when asked. The cashier holds the blinding factors so it can produce reveals on demand without seeing the underlying card values.
 
@@ -29,7 +59,7 @@ To reveal a card:
 - Cashier returns the values without learning what cards they decode to.
 - Dealer combines the player's blinding (from on-chain commit) with the cashier's blinding to recover the card index.
 
-At hand end the dealer publishes the full proof (all blindings + permutations) so any observer can verify the hand was honest.
+At hand-end the dealer publishes the full proof (all blindings + permutations) so any observer can verify the hand was honest.
 
 ### Optimizations
 
@@ -40,30 +70,19 @@ At hand end the dealer publishes the full proof (all blindings + permutations) s
 
 Result: ~25 second hand setup (was ~70 seconds), ~2-8 second action latency.
 
----
-
-## Prerequisites
-
-- A running **Verus daemon** with the CHIPS PBaaS chain enabled
-- One **VerusID per role** (dealer/player/cashier), funded with a small amount of CHIPS for TX fees
-- Node.js 18+ (uses ES modules)
-- The wallet must control the private key for whichever identity each process represents
-
-To find the CHIPS chain conf, the code checks:
-- `~/.verus/pbaas/f315367528394674d45277e369629605a1c3ce9f/f315367528394674d45277e369629605a1c3ce9f.conf`
-- `~/.komodo/CHIPS/CHIPS.conf`
-
-If your chain config is elsewhere, edit the `findRPC()` function in `poker-server.mjs`, `cashier-runner.mjs` and `gui-server.mjs`.
-
----
-
-## Setup
+## Quick start
 
 ```bash
 git clone https://github.com/Fried333/verus-poker
 cd verus-poker
 npm install
 ```
+
+CHIPS chain config — the code checks (in order):
+- `~/.verus/pbaas/f315367528394674d45277e369629605a1c3ce9f/f315367528394674d45277e369629605a1c3ce9f.conf`
+- `~/.komodo/CHIPS/CHIPS.conf`
+
+If your chain config is elsewhere, edit the `findRPC()` function in `poker-server.mjs`, `cashier-runner.mjs`, and `gui-server.mjs`.
 
 ### Creating the VerusIDs you'll need
 
@@ -78,7 +97,7 @@ Every role in the game needs its own VerusID on the CHIPS chain:
 
 A VerusID can only be updated by the wallet holding its primary spending key. So whichever machine will be writing to a given identity must be the one that registers it (or you must transfer it there).
 
-#### Step 1 — Get a CHIPS wallet address with funds
+**Step 1 — Get a CHIPS wallet address with funds**
 
 ```bash
 # On each machine
@@ -86,7 +105,7 @@ verus -chain=CHIPS getnewaddress
 # Send a small amount of CHIPS to this address (a few coins is enough for many hands)
 ```
 
-#### Step 2 — Register an identity
+**Step 2 — Register an identity**
 
 ```bash
 verus -chain=CHIPS registeridentity '{
@@ -113,13 +132,11 @@ Substitute these names everywhere `--id`, `--table`, `--players`, or `--cashiers
 
 > **Recovery / backup**: VerusIDs are controlled by their primary signing keys. If you lose the wallet that registered an identity, you lose the ability to update it — unless you set a separate **revocation/recovery authority** at registration time (an existing identity that can revoke or recover yours). For test play this isn't critical; for serious use, always set a recovery identity and `backupwallet` after registration. Restoring `wallet.dat` to a fresh daemon restores full control.
 
----
-
-## Running a table
+### Running a table
 
 A full game requires three processes (or more, depending on how many players you want):
 
-### 1. Dealer
+**1. Dealer**
 
 ```bash
 node poker-server.mjs --local --role=dealer \
@@ -129,17 +146,18 @@ node poker-server.mjs --local --role=dealer \
   --port=3000
 ```
 
-Flags:
-- `--local` — use the local CHIPS daemon for chain RPC
-- `--role=dealer` — run as dealer (DCV), no betting participation
-- `--table=<id>` — VerusID of the poker table
-- `--players=<csv>` — pre-known player identities (auto-joined when seen on chain)
-- `--cashiers=<csv>` — cashier identities the dealer should request shuffles from
-- `--port=3000` — HTTP/WS port
+| Flag | What |
+|---|---|
+| `--local` | Use the local CHIPS daemon for chain RPC |
+| `--role=dealer` | Run as dealer (DCV), no betting participation |
+| `--table=<id>` | VerusID of the poker table |
+| `--players=<csv>` | Pre-known player identities (auto-joined when seen on chain) |
+| `--cashiers=<csv>` | Cashier identities the dealer requests shuffles from |
+| `--port=3000` | HTTP/WS port |
 
 The dealer writes a `t_table_info` record to the table identity, opens a session, and waits for joins.
 
-### 2. Cashier
+**2. Cashier**
 
 ```bash
 node cashier-runner.mjs --id=mycashier --table=mytable
@@ -147,30 +165,18 @@ node cashier-runner.mjs --id=mycashier --table=mytable
 
 Polls the table identity for shuffle requests, runs Stage III, writes the result back, and serves card-reveal blindings on demand. Persists in-flight state to disk in `~/.verus-poker/cashier-<id>-<table>/` so it can recover from crashes mid-hand.
 
-### 3. Player GUI
-
-Each player runs their own GUI server, owning their own identity:
+**3. Player GUI** (one per player)
 
 ```bash
-# Player 1's machine
 node gui-server.mjs --id=myplayer1 --table=mytable --port=3001
-
-# Player 2's machine
-node gui-server.mjs --id=myplayer2 --table=mytable --port=3001
-
-# Player 3's machine
-node gui-server.mjs --id=myplayer3 --table=mytable --port=3001
+# … and on the other player machines with --id=myplayer2 etc.
 ```
 
-Then open the URL printed by each GUI server in a browser. Click an empty seat to sit in, the dealer will pick up the join from chain and start a hand once it has enough players.
+Open the URL printed by each GUI server in a browser. Click an empty seat to sit in; the dealer picks up the join from chain and starts a hand once it has enough players.
 
-### Convenience start scripts
+**Convenience start scripts** — `start-cashier.sh`, `start-pdealer2.sh`, `start-gui-28.sh`, `start-all.sh` wrap the above commands for the dev setup. Adjust them for your own identity names and SSH targets.
 
-`start-cashier.sh`, `start-pdealer2.sh`, `start-gui-28.sh`, `start-all.sh` are shell wrappers around the above commands for the dev setup. Adjust them for your own identity names and SSH targets.
-
----
-
-## Playing
+### Playing
 
 The GUI is a single-page felt-style interface. The current player's UI shows:
 
@@ -183,48 +189,6 @@ The GUI is a single-page felt-style interface. The current player's UI shows:
 - Sit Out / Sit In toggle
 
 Between hands you can sit out without leaving the table. After several consecutive timeouts the dealer will auto-kick a sat-out player; they can sit back in any time by clicking the seat.
-
----
-
-## Test scripts
-
-A handful of utilities for benchmarking and reliability testing:
-
-### Mempool propagation
-
-```bash
-# Single-daemon round trip
-node test-mempool-read.mjs --id=mycashier
-
-# Cross-daemon (run write on one host, read on another)
-node test-mempool-cross.mjs --mode=write --id=myplayer1
-# copy the printed nonce, then on another host:
-node test-mempool-cross.mjs --mode=read --id=myplayer1 --nonce=<nonce>
-
-# Full 3-host matrix (writer × reader for all 6 directions)
-# Edit the host paths/identities at the top of run-mempool-matrix.sh first
-./run-mempool-matrix.sh
-```
-
-These were used to characterise CHIPS mempool propagation under fully un-peered conditions. Typical end-to-end latency: 4-9 seconds. Long tail driven by chain block-stall events, not by P2P propagation.
-
-### Crash recovery
-
-```bash
-node verify-persist.mjs           # round-trip persisted cashier state
-node test-persist-roundtrip.mjs   # BigInt-safe JSON
-node test-recovered-reveal.mjs    # reveal cards using persisted b[]
-./timed-crash-test.sh             # kill cashier mid-hand, verify recovery
-```
-
-### Reliability runs
-
-```bash
-./test-cashier-reliability.sh     # repeat cashier shuffles, count failures
-./watch-10-hands.sh               # play 10 hands and check chip totals
-```
-
----
 
 ## Architecture overview
 
@@ -249,9 +213,8 @@ node test-recovered-reveal.mjs    # reveal cards using persisted b[]
                       │   results   │
                       └─────────────┘
 
-Each box runs on its own machine with its own
-CHIPS daemon. Communication is via on-chain
-identity content-multimap updates only.
+Each box runs on its own machine with its own CHIPS daemon.
+Communication is via on-chain identity content-multimap updates only.
 ```
 
 ### Key files
@@ -270,8 +233,6 @@ identity content-multimap updates only.
 | `gui-server.mjs` | Top-level player process, HTTP/WS for browser |
 | `public/poker-gui.html` | The poker table UI |
 
----
-
 ## Known characteristics of CHIPS for game design
 
 The CHIPS chain is hybrid PoW + PoS (Verus PoP) but currently runs at ~76% of nominal block rate, with one PoW miner producing ~87% of work blocks and a small staker pool. This means:
@@ -282,8 +243,87 @@ The CHIPS chain is hybrid PoW + PoS (Verus PoP) but currently runs at ~76% of no
 
 The dealer's hard timeout should be set well above the chain's worst-case stall (current default: 90s; recommended: 180-240s). Player display timer is independent of dealer timeout.
 
----
+## Test scripts
+
+A handful of utilities for benchmarking + reliability testing:
+
+### Mempool propagation
+
+```bash
+node test-mempool-read.mjs --id=mycashier                            # single-daemon round trip
+
+# Cross-daemon — run write on one host, read on another
+node test-mempool-cross.mjs --mode=write --id=myplayer1
+# (copy the printed nonce, then on another host:)
+node test-mempool-cross.mjs --mode=read --id=myplayer1 --nonce=<n>
+
+./run-mempool-matrix.sh                                              # 3-host matrix (edit hosts at top)
+```
+
+Used to characterise CHIPS mempool propagation under fully un-peered conditions. Typical end-to-end latency: 4-9 s. Long tail driven by chain block-stall events, not by P2P propagation.
+
+### Crash recovery
+
+```bash
+node verify-persist.mjs           # round-trip persisted cashier state
+node test-persist-roundtrip.mjs   # BigInt-safe JSON
+node test-recovered-reveal.mjs    # reveal cards using persisted b[]
+./timed-crash-test.sh             # kill cashier mid-hand, verify recovery
+```
+
+### Reliability runs
+
+```bash
+./test-cashier-reliability.sh     # repeat cashier shuffles, count failures
+./watch-10-hands.sh               # play 10 hands and check chip totals
+```
+
+## Operating in production
+
+### Logs
+
+Each process logs to stdout. Run under `systemd` or `tmux` per role:
+```bash
+journalctl -u verus-poker-dealer -f
+journalctl -u verus-poker-cashier -f
+```
+
+### Common errors
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `findRPC failed` | CHIPS conf in non-standard location | Edit `findRPC()` in the affected `*.mjs` file |
+| Dealer waiting indefinitely for cashier | Cashier process not running or wrong `--table` | Check cashier logs; ensure `--table` matches dealer's |
+| `wallet does not contain valid signing keys for <id>@` | Identity's primary R-address WIF not in the daemon's wallet | `verus -chain=CHIPS importprivkey "<wif>" "" false` |
+| Players stuck at "waiting for hand to start" | Dealer hasn't seen the join; chain stall | Wait — usually recovers within 1-2 blocks |
+| Cashier in `~/.verus-poker/.../` has stale state | Killed mid-hand and never resumed cleanly | Delete the cashier state dir before next start; new hand will reinit |
+| `nLockTime`-related signing failures | Daemon clock skewed | `chronyc tracking` or `timedatectl status` on the affected box |
+
+### Backup considerations
+
+- **`wallet.dat`** on every daemon — losing it = losing identity control (unless revoke/recovery is set on the identity). Back up wallet.dat per-machine.
+- **`~/.verus-poker/cashier-<id>-<table>/`** on the cashier machine — contains in-flight shuffle state. Safe to delete between hands; **must NOT** be deleted mid-hand or the hand is unrecoverable (players can't reveal cards).
+- **No central audit log** — every hand's full proof is written to the table VerusID's content-multimap and is recoverable from chain.
+
+### Upgrading
+
+```bash
+cd verus-poker
+git pull
+npm install        # if deps changed
+# Restart dealer/cashier/players (in any order; new hand picks up new code)
+```
+
+No on-chain schema migrations — the protocol is fixed by the code that signs hand proofs. Mixing versions across roles will fail at proof-verify time, so coordinate restarts during a sit-out.
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE) if present, or the standard MIT terms.
+
+## Disclaimer
+
+This software is provided **"AS IS"**, without warranty of any kind, express or implied. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability arising from the use of this software.
+
+Mental-poker cryptography is subtle and the implementation has not undergone an independent audit. The shuffle proof published at hand-end is verifiable by any observer, but **do not play this for funds you can't afford to lose** until you've satisfied yourself with the cryptographic implementation. Treat this as a working reference for the BCRA mental-poker pattern on Verus, not a production gambling platform.
+
+Stakes-play also exposes you to **off-chain coercion and collusion risks** that no protocol can solve — two players whispering on the same Discord channel can sandwich the rest of the table. Run with people whose game integrity you trust, or only at amounts where collusion isn't worth the effort.
